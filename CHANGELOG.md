@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.7.0
+
+- Core servers: GOD, HELP and HOLY get their own cards at the top of Overview and Uptime (ping, Proxmox :8006,
+  PBS :8007, SSH :22, 24-hour bar, uptime). Both agents check all three from the LAN, so a dead host is still
+  reported by the agent on the other one. A server counts as DOWN only when no agent can reach it.
+  Down, degraded and recovered all send alerts.
+- Agent 1.9.1: when the backup storage is offline, the last-known backup data is kept and marked stale,
+  instead of claiming every container has "no backup yet". The Backups page shows a banner.
+
 ## 2.6.0
 
 - Agent 1.8: snapshot cleanup, about every 30 minutes. Only the agents' own snapshots are deleted:

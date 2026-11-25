@@ -730,7 +730,7 @@ async function handleApi(req, res, url) {
   // it names hosts, containers and IPs, and lets you send the agents work.
   if (p === '/api/infra' && method === 'GET') {
     if (needAuth()) return;
-    return send(res, 200, { agents: infra.summary(), services: infra.services(), chats: infra.chatList(), serverTime: Date.now() });
+    return send(res, 200, { agents: infra.summary(), services: infra.services(), core: infra.coreSummary(), chats: infra.chatList(), serverTime: Date.now() });
   }
 
   // ---- chats with the agents

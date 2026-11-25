@@ -91,6 +91,7 @@ const Dash = (() => {
     return out;
   }
   const services = () => (st.data ? st.data.services || [] : []);
+  const coreServers = () => (st.data ? st.data.core || [] : []);
   const svcFor = (agent, vmid) => services().filter(s => s.agent === agent && s.vmid === vmid);
   const HOUR = 3600e3;
   const backupAge = c => (c.backup && c.backup.last ? Date.now() - c.backup.last.t : null);
@@ -119,6 +120,10 @@ const Dash = (() => {
       const failed = ((r.backups && r.backups.tasks) || []).filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR);
       if (failed.length) push('err', `${failed.length} backup run${failed.length > 1 ? 's' : ''} failed on ${hostOf(a)} in the last 24 h`, 'backups');
     }
+    for (const c of coreServers()) {
+      if (c.status === 'down') push('err', `${c.name} (${c.role || 'server'}) is DOWN — no ping, no ports — since ${ago(c.since).replace(' ago', '')}`, 'overview');
+      else if (c.status === 'degraded') push('err', `${c.name}: answers ping but its main service (${/PBS|backup/i.test(c.role || '') ? 'PBS :8007' : 'Proxmox :8006'}) does not`, 'overview');
+    }
     for (const p of pbsServers()) {
       if (!p.reachable) push('err', `Backup server ${p.storage} (${p.server}) is not reachable`, 'backups');
       if (p.verifyFailed) push('err', `${p.verifyFailed} backup(s) on ${p.storage} failed verification`, 'backups');
@@ -131,10 +136,12 @@ const Dash = (() => {
     }
     for (const c of containers()) {
       if (c.onboot && c.status !== 'running') push('err', `${c.name} (${c.vmid}) on ${c.host} is ${c.status}`, 'containers');
+      const agentRep = (agents().find(x => x.name === c.agent) || {}).report || {};
+      const bstale = agentRep.backups && (agentRep.backups.backupStale || (agentRep.backups.unreachableStorage || []).length);
       const lu = c.lastUpdate;
       if (lu && (lu.result === 'rolled-back' || lu.result === 'failed') && Date.now() - lu.t < 48 * HOUR) push('err', `${c.name}: last update ${lu.result}`, 'updates');
       const bs = backupState(c);
-      if (bs === 'missing' || bs === 'stale') push('warn', `${c.name}: ${bs === 'missing' ? 'no backup yet' : `last backup ${ago(c.backup.last.t)}`}`, 'backups');
+      if (!bstale && (bs === 'missing' || bs === 'stale')) push('warn', `${c.name}: ${bs === 'missing' ? 'no backup yet' : `last backup ${ago(c.backup.last.t)}`}`, 'backups');
       if (c.maxdisk && c.disk / c.maxdisk >= 0.9) push('warn', `${c.name} disk is ${Math.round(c.disk / c.maxdisk * 100)}% full`, 'containers');
     }
     const mDown = ((d && d.monitors) || []).filter(m => m.status === 'down');
@@ -289,10 +296,34 @@ const Dash = (() => {
     events.sort((x, y) => y.t - x.t);
     const recent = events.slice(0, 8).map(e => `<li><time>${esc(ago(e.t))}</time>${levelTag(e.level)}<span><b>${esc(e.host)}</b> ${esc(e.msg)}</span></li>`).join('');
     return `${pageHead('Overview', '')}
-      ${attHtml}${kpis}
+      ${attHtml}
+      <h3 class="sec-title">Core servers</h3>${coreCards()}
+      ${kpis}
       <h3 class="sec-title">Proxmox hosts</h3>${hosts}
       <div class="card pad"><div class="att-head"><h3>Recent activity</h3><a href="#activity">All activity →</a></div>
         ${recent ? `<ul class="events">${recent}</ul>` : '<p class="muted">Nothing yet.</p>'}</div>`;
+  }
+
+  // Core servers: both Proxmox hosts and the backup server, checked from the LAN by every agent.
+  function coreCards() {
+    const cs = coreServers();
+    if (!cs.length) return '';
+    return `<div class="core-row">${cs.map(c => {
+      const cls = c.status === 'up' ? 'up' : c.status === 'unknown' ? 'pending' : 'down';
+      const by = Object.entries(c.by || {}).filter(([, x]) => x.fresh);
+      const ms = by.map(([, x]) => x.ms).filter(v => v != null);
+      const ports = {};
+      for (const [, x] of by) for (const [p, v] of Object.entries(x.ports || {})) if (v != null || !(p in ports)) ports[p] = v;
+      return `<div class="card core ${cls}">
+        <div class="core-head">${dot(cls)}<div><b>${esc(c.name)}</b> <span class="muted">${esc(c.ip || '')}</span><div class="muted core-role">${esc(c.role || '')}</div></div>
+          <span class="core-state ${cls}">${c.status === 'up' ? 'Up' : c.status === 'down' ? 'DOWN' : c.status === 'degraded' ? 'Degraded' : 'Unknown'}</span></div>
+        <div class="core-ports">${Object.entries(ports).map(([p, v]) => `<span class="${v != null ? 'pct-good' : 'pct-bad'}">:${esc(p)} ${v != null ? '✓' : '✗'}</span>`).join('')}
+          ${ms.length ? `<span class="muted">${Math.min(...ms).toFixed(1)} ms</span>` : ''}
+          <span class="muted">${c.status === 'up' ? 'up' : 'state'} for ${esc(ago(c.since).replace(' ago', ''))}</span></div>
+        ${recentBars(c.recent || [], 48)}
+        <div class="core-foot"><span>24 h ${pct(c.uptime24h)}</span><span class="muted">checked by ${by.length ? esc(by.map(([a]) => a).join(' + ')) : 'no agent right now'}</span></div>
+      </div>`;
+    }).join('')}</div>`;
   }
 
   // Backup servers (PBS) as the agents see them; both agents see the same one, keep the freshest.
@@ -590,7 +621,9 @@ const Dash = (() => {
       <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${t.status !== 'OK' && t.status !== 'running' ? ` — <span class="pct-bad">${esc(t.status)}</span>` : ''}</span></li>`).join('');
 
     const servers = pbsServers();
+    const offline = [...new Set(agents().flatMap(a => (a.report && a.report.backups && a.report.backups.unreachableStorage) || []))];
     return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent snapshots clean themselves up: update snapshots keep the newest 2, fix snapshots go after 7 days, dashboard snapshots after 30. Snapshots you make in Proxmox are never touched.')}
+      ${offline.length ? `<div class="card attention"><ul class="att-list"><li class="att err"><span class="att-ico">●</span><span>Backup storage ${esc(offline.join(', '))} is unreachable right now. Backups can't run, and the figures below are the last known ones.</span></li></ul></div>` : ''}
       ${kpis}
       ${servers.length ? `<div class="hosts">${servers.map(pbsCard).join('')}</div>` : ''}
       <h3 class="sec-title">Containers</h3>
@@ -607,8 +640,9 @@ const Dash = (() => {
 
   // ------------------------------------------------------------ Uptime: internal services
   function viewServices() {
+    const core = coreCards();
     const sv = services();
-    if (!sv.length) return '';
+    if (!sv.length) return core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent</span></h3></div>${core}` : '';
     const groups = new Map();
     for (const s of sv) {
       const k = `${s.agent}:${s.vmid}`;
@@ -629,7 +663,8 @@ const Dash = (() => {
       </div>`;
     }).join('');
     const down = sv.filter(s => s.status === 'down' && !s.stale).length;
-    return `<div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every 5 min</span></h3>
+    return `${core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent, every 5 min</span></h3></div>${core}` : ''}
+      <div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every 5 min</span></h3>
       <span class="${down ? 'pct-bad' : 'pct-good'}">${down ? `${down} down` : `all ${sv.length} answering`}</span></div>
       <div class="svc-grid">${cards}</div>`;
   }
@@ -786,7 +821,7 @@ const Dash = (() => {
     set('containers', containers().filter(c => c.onboot && c.status !== 'running').length, 'bad');
     set('updates', agents().reduce((n, a) => n + ((a.report && a.report.pending) || []).filter(p => !a.decisions[p.id]).length, 0), 'warn');
     set('backups', att.filter(i => i.view === 'backups').length, 'warn');
-    set('uptime', ((d.monitors || []).filter(m => m.status === 'down').length) + services().filter(s => s.status === 'down' && !s.stale).length, 'bad');
+    set('uptime', ((d.monitors || []).filter(m => m.status === 'down').length) + services().filter(s => s.status === 'down' && !s.stale).length + coreServers().filter(c => c.status === 'down' || c.status === 'degraded').length, 'bad');
     set('ask', agents().reduce((n, a) => n + (a.tasks || []).filter(t => t.status === 'queued' || t.status === 'running').length, 0), '');
     const errs = att.filter(i => i.level === 'err').length;
     const hs = $('#headStatus');

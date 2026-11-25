@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.8.0"
+VERSION = "1.9.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -341,13 +341,16 @@ def collect_slow(s, node, host, containers, force=False):
         log(f"backup jobs: {e}")
     backups = {}
     pbs = []
-    storages = [x for x in ssh_json(f"pvesh get /nodes/{node}/storage --output-format json")
-                if x.get("active") and "backup" in str(x.get("content", ""))]
+    all_backup_storages = [x for x in ssh_json(f"pvesh get /nodes/{node}/storage --output-format json")
+                           if "backup" in str(x.get("content", "")) and x.get("enabled", 1)]
+    storages = [x for x in all_backup_storages if x.get("active")]
+    unreachable = [x["storage"] for x in all_backup_storages if not x.get("active")]
     for st in storages:
         try:
             items = ssh_json(f"pvesh get /nodes/{node}/storage/{st['storage']}/content --content backup --output-format json", 120)
         except Exception as e:
             log(f"backup list {st['storage']}: {e}")
+            unreachable.append(st["storage"])
             continue
         if st.get("type") == "pbs":
             pbs.append(pbs_summary(st, items))
@@ -401,7 +404,17 @@ def collect_slow(s, node, host, containers, force=False):
             snaps[v] = [x for x in snaps[v] if x["name"] not in removed]
     for j in jobs:
         j.pop("_raw", None)
+    prev = s.get("slow") or {}
+    stale = False
+    if unreachable and prev.get("backups"):
+        # A backup storage is offline: keep what we last knew instead of claiming there are no backups.
+        for k, v in prev["backups"].items():
+            backups.setdefault(int(k), v)
+        known = {p.get("storage") for p in pbs}
+        pbs += [dict(p, reachable=False, stale=True) for p in (prev.get("pbs") or []) if p.get("storage") not in known]
+        stale = True
     slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40], "pbs": pbs,
+            "backupStale": stale, "unreachableStorage": unreachable,
             "snapshots": {str(k): v for k, v in snaps.items()},
             "services": discover_services(containers), "public": discover_public()}
     slow["webmanager"] = discover_webmanager(containers)
@@ -659,6 +672,36 @@ def check_services(services):
         return list(ex.map(one, services))
 
 
+def check_core():
+    """Ping + key ports of the core servers (both Proxmox hosts and the backup server). Every agent checks all
+    of them, so a dead host is still reported by the agent on the other host."""
+    targets = CFG.get("core") or []
+    def one(t):
+        r = {"name": t["name"], "ip": t["ip"], "role": t.get("role"), "ports": {}, "t": now_ms()}
+        try:
+            p = subprocess.run(["ping", "-c", "2", "-W", "2", t["ip"]], capture_output=True, text=True, timeout=8)
+            m = re.search(r"= [\d.]+/([\d.]+)/", p.stdout)
+            r["ping"] = p.returncode == 0
+            r["ms"] = float(m.group(1)) if m else None
+        except (OSError, subprocess.TimeoutExpired):
+            r["ping"] = False
+        for port in t.get("ports", []):
+            t0 = time.time()
+            try:
+                with socket.create_connection((t["ip"], port), timeout=4):
+                    r["ports"][str(port)] = round((time.time() - t0) * 1000, 1)
+            except OSError:
+                r["ports"][str(port)] = None
+        main = t.get("ports", [None])[0]
+        r["ok"] = r["ping"] or any(v is not None for v in r["ports"].values())
+        r["serviceOk"] = (r["ports"].get(str(main)) is not None) if main else r["ok"]
+        return r
+    if not targets:
+        return []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return list(ex.map(one, targets))
+
+
 def autofix(s, host, containers):
     """Cheap, safe fixes done without Claude. Anything harder goes to Claude, at most every few hours."""
     for c in containers:
@@ -708,8 +751,9 @@ def build_report(s, host, containers):
         "agent": CFG["name"], "agentVersion": VERSION, "generatedAt": now_ms(),
         "host": host, "containers": containers, "pending": pending,
         "events": events, "updateRuns": s["updateRuns"][-20:],
-        "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t", "pbs")},
+        "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t", "pbs", "backupStale", "unreachableStorage")},
         "services": s.get("serviceChecks", []),
+        "core": check_core(),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
         "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300},

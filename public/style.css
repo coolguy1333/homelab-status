@@ -570,3 +570,19 @@ label.pkg .muted { text-align: right; }
 /* page content wrappers (#v-overview, #v-containers, ...) lay their sections out with even spacing */
 .view > [id^="v-"] { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; }
 .view > [id^="v-"]:empty { display: none; }
+/* core servers */
+.core-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.core { padding: 12px 14px; display: grid; gap: 8px; border-left: 4px solid var(--up); }
+.core.down { border-left-color: var(--down); background: color-mix(in srgb, var(--down) 6%, var(--panel)); }
+.core.pending { border-left-color: var(--paused); }
+.core-head { display: flex; gap: 10px; align-items: center; }
+.core-head > div { flex: 1; min-width: 0; }
+.core-head b { font-size: 15px; }
+.core-role { font-size: 12px; }
+.core-state { font-size: 12px; font-weight: 700; padding: 2px 10px; border-radius: 999px; }
+.core-state.up { background: var(--up-soft); color: var(--up); }
+.core-state.down { background: var(--down); color: #fff; }
+.core-state.pending { background: var(--panel-2); color: var(--muted); }
+.core-ports { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.core-foot { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; flex-wrap: wrap; }
+.core .bars.small { height: 16px; }

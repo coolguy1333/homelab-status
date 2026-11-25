@@ -31,6 +31,11 @@ if sites:
     cfg["site_urls"] = sites
 cfg.setdefault("keep_snapshots", 3)
 cfg.setdefault("exclude_vmids", [])
+cfg.setdefault("core", [
+    {"name": "GOD", "ip": "192.168.10.23", "role": "Proxmox host", "ports": [8006, 22]},
+    {"name": "HELP", "ip": "192.168.10.81", "role": "Proxmox host", "ports": [8006, 22]},
+    {"name": "HOLY", "ip": "192.168.10.245", "role": "PBS backup server", "ports": [8007, 22]},
+])
 fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump(cfg, f, indent=2)
