@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# wm-ha: automatic failover between two WebManager servers (one primary, one
+# replica). Runs every 10 s from wm-ha.timer on BOTH servers.
+#
+# - Replica: if the primary's /healthz has failed for FAIL_LIMIT checks in a
+#   row (and this server can still reach the gateway, so it isn't the one
+#   that is cut off), run webmanager-promote --yes.
+# - Primary: if the peer is also primary and was promoted more recently, this
+#   server is the stale old primary: stop its apps and rejoin the peer as a
+#   replica.
+# - Publishes its role for HAProxy on the connectors through nginx
+#   (Host: wm-ha.internal on :8080): /role = "<role> <epoch>", /active = 200
+#   only when this server is the primary that should get traffic.
+#
+# Config: /etc/wm-ha.conf (SELF_IP, PEER_IP, GATEWAY, FAIL_LIMIT)
+# Log:    journalctl -u wm-ha
+set -u
+exec 9>/run/wm-ha.lock
+flock -n 9 || exit 0
+
+. /etc/wm-ha.conf
+FAIL_LIMIT=${FAIL_LIMIT:-18}
+REJOIN_BACKOFF=${REJOIN_BACKOFF:-600}
+ENV_FILE=/etc/webmanager/webmanager.env
+DATA_DIR=/var/lib/webmanager
+STATE=/var/lib/wm-ha
+WEB=/srv/wm-ha
+SRC=/root/webmanager
+mkdir -p "$STATE" "$WEB"
+
+replica_of=$(sed -n 's/^WEBMANAGER_REPLICA_OF=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+if [[ -z $replica_of || -e $DATA_DIR/promoted ]]; then
+    role=primary
+else
+    role=replica
+fi
+# Epoch: when this server became primary. 0 = original primary (never promoted).
+epoch=0
+[[ -e $DATA_DIR/promoted ]] && epoch=$(stat -c %Y "$DATA_DIR/promoted")
+
+peer=$(curl -s -m 4 -H 'Host: wm-ha.internal' "http://$PEER_IP:8080/role" 2>/dev/null)
+peer_role=${peer%% *}
+peer_epoch=${peer##* }
+[[ $peer_epoch =~ ^[0-9]+$ ]] || peer_epoch=0
+
+publish() {
+    printf '%s %s\n' "$role" "$epoch" >"$WEB/role.tmp" && mv "$WEB/role.tmp" "$WEB/role"
+    if [[ $1 == yes ]]; then
+        echo yes >"$WEB/active"
+    else
+        rm -f "$WEB/active"
+    fi
+}
+
+if [[ $role == replica ]]; then
+    publish no
+    if curl -fs -m 5 -o /dev/null -H 'Host: 127.0.0.1' "$replica_of/healthz"; then
+        echo 0 >"$STATE/fails"
+        exit 0
+    fi
+    if ! ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1; then
+        echo "primary unreachable but so is the gateway $GATEWAY: not promoting (this server is probably the one cut off)"
+        echo 0 >"$STATE/fails"
+        exit 0
+    fi
+    fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
+    echo "$fails" >"$STATE/fails"
+    echo "primary $replica_of failed health check ($fails/$FAIL_LIMIT)"
+    if (( fails >= FAIL_LIMIT )); then
+        echo "PROMOTING this server to primary"
+        echo 0 >"$STATE/fails"
+        webmanager-promote --yes
+        role=primary
+        epoch=$(stat -c %Y "$DATA_DIR/promoted" 2>/dev/null || date +%s)
+        publish yes
+    fi
+    exit 0
+fi
+
+# Primary.
+echo 0 >"$STATE/fails"
+if [[ $peer_role == primary ]] && (( peer_epoch > epoch )); then
+    publish no
+    last=$(cat "$STATE/last-rejoin" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if (( now - last < REJOIN_BACKOFF )); then
+        exit 0
+    fi
+    echo "$now" >"$STATE/last-rejoin"
+    echo "peer $PEER_IP was promoted after this server (epoch $peer_epoch > $epoch): rejoining it as a replica"
+    token=$(sed -n 's/^WEBMANAGER_PEER_TOKEN=//p' "$ENV_FILE" | tail -n 1)
+    [[ -n $token ]] || token=$(tr -d '\n' <"$DATA_DIR/peer-token" 2>/dev/null)
+    if [[ -z $token ]]; then
+        echo "no peer token found; cannot rejoin"
+        exit 1
+    fi
+    # A replica never runs apps; stop the ones this old primary still has up.
+    docker ps -q --filter name=webmanager-app- 2>/dev/null | xargs -r docker stop >/dev/null
+    (cd "$SRC" && git pull -q --ff-only) || true
+    if (cd "$SRC" && bash setup.sh --replica-of "http://$PEER_IP:8080" --peer-token "$token" \
+            --announce-url "http://$SELF_IP:8080" </dev/null >>"$STATE/rejoin.log" 2>&1); then
+        echo "rejoined $PEER_IP as a replica"
+    else
+        echo "rejoin failed; see $STATE/rejoin.log (retrying in ${REJOIN_BACKOFF}s)"
+    fi
+    exit 0
+fi
+publish yes
