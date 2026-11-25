@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -173,16 +173,17 @@ def cx(vmid, cmd, timeout=300):
 
 
 LAST_USAGE = {}
+LAST_SESSION = None
 
 
-def claude(prompt, timeout=1800, kind="task", label=""):
+def claude(prompt, timeout=1800, kind="task", label="", resume=None):
     """Run Claude non-interactively in ~/agent (where CLAUDE.md describes the setup).
     Returns (rc, text). Token usage of the run is recorded (see record_usage) and left in LAST_USAGE."""
-    global LAST_USAGE
-    LAST_USAGE = {}
+    global LAST_USAGE, LAST_SESSION
+    LAST_USAGE, LAST_SESSION = {}, None
+    args = [CLAUDE, "-p", prompt, "--output-format", "json"] + (["--resume", resume] if resume else [])
     try:
-        p = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "json"], cwd=BASE,
-                           capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(args, cwd=BASE, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 124, f"Claude did not finish within {timeout // 60} minutes."
     except FileNotFoundError:
@@ -193,7 +194,10 @@ def claude(prompt, timeout=1800, kind="task", label=""):
     except ValueError:
         d = {}
     if not d:
+        if resume:  # the old session is gone (pruned, reinstalled…): start fresh instead of failing
+            return claude(prompt, timeout, kind, label, resume=None)
         return p.returncode or 1, (raw + "\n" + (p.stderr or "")).strip() or "no output"
+    LAST_SESSION = d.get("session_id")
     u = d.get("usage") or {}
     models = list((d.get("modelUsage") or {}).keys())
     LAST_USAGE = {
@@ -852,7 +856,8 @@ def handle_replies(replies):
             if tid in s["tasks"]:
                 continue
             s["tasks"][tid] = {"id": tid, "text": t["text"], "by": t.get("by"), "status": "running", "output": "",
-                               "t": now_ms(), "u": now_ms(), **({"action": t["action"]} if t.get("action") else {})}
+                               "t": now_ms(), "u": now_ms(), **({"action": t["action"]} if t.get("action") else {}),
+                               **({"chat": t["chat"]} if t.get("chat") else {})}
             spawn("ctaction" if t.get("action") else "task", tid)
 
 
@@ -864,6 +869,8 @@ def cmd_task(tid):
         if not t:
             return
         text, by, internal = t["text"], t.get("by"), t.get("internal")
+        chat = t.get("chat")
+        session = (s.get("chatSessions") or {}).get(chat) if chat else None
     who = "this agent's own monitoring" if internal else f"{by} via the status dashboard"
     prompt = (f"Request from {who}:\n\n{text}\n\n"
               "You are this Proxmox host's homelab agent (see CLAUDE.md for the setup and rules). "
@@ -879,8 +886,19 @@ def cmd_task(tid):
               "Proxmox hosts as root. Include: the problem and the evidence you found; numbered steps with the exact "
               "commands and which machine each runs on; risks, and how to undo each step; how to verify it worked. "
               "Never include passwords, tokens or keys. Leave the section out if you fixed everything.")
-    rc, out = claude(prompt, kind="autofix" if internal else "task", label=text[:120])
+    if session:  # follow-up in an existing chat: Claude already has the context and the rules
+        prompt = (f"Follow-up from {who} in the same conversation:\n\n{text}\n\n"
+                  "Same rules and format as before (Markdown; end with what you changed; add a "
+                  "`## Handoff plan for Claude Code` section only if you could not solve it).")
+    rc, out = claude(prompt, kind="autofix" if internal else "task", label=text[:120], resume=session)
     usage = dict(LAST_USAGE)
+    if chat and LAST_SESSION:
+        with state() as s:
+            cs = s.setdefault("chatSessions", {})
+            cs[chat] = LAST_SESSION
+            if len(cs) > 300:
+                for k in list(cs)[:-300]:
+                    cs.pop(k)
     with state() as s:
         t = s["tasks"].get(tid)
         if t:

@@ -730,8 +730,26 @@ async function handleApi(req, res, url) {
   // it names hosts, containers and IPs, and lets you send the agents work.
   if (p === '/api/infra' && method === 'GET') {
     if (needAuth()) return;
-    return send(res, 200, { agents: infra.summary(), services: infra.services(), serverTime: Date.now() });
+    return send(res, 200, { agents: infra.summary(), services: infra.services(), chats: infra.chatList(), serverTime: Date.now() });
   }
+
+  // ---- chats with the agents
+  if (p === '/api/infra/chats' && method === 'POST') {
+    if (needAuth() || needJson()) return;
+    const body = await readBody(req, 16 * 1024);
+    return send(res, 201, infra.createChat(String(body.scope || ''), body.title, user.email || user.name || 'admin'));
+  }
+  const cm = p.match(/^\/api\/infra\/chats\/([a-z0-9_-]{1,40})(\/rename)?$/i);
+  if (cm) {
+    if (needAuth()) return;
+    if (method === 'DELETE' && !cm[2]) { infra.deleteChat(cm[1]); return send(res, 200, { ok: true }); }
+    if (method === 'POST' && cm[2]) { if (needJson()) return; const body = await readBody(req, 16 * 1024); return send(res, 200, infra.renameChat(cm[1], body.title)); }
+    return send(res, 405, { error: 'Method not allowed' });
+  }
+  const gm = p.match(/^\/api\/infra\/_all\/groups\/(g[a-f0-9]{10})$/);
+  if (gm && method === 'DELETE') { if (needAuth()) return; infra.deleteGroup(gm[1]); return send(res, 200, { ok: true }); }
+  const dm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/tasks\/([a-f0-9]{12})$/);
+  if (dm && method === 'DELETE') { if (needAuth()) return; infra.deleteMessage(dm[1], dm[2]); return send(res, 200, { ok: true }); }
 
   const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions)(?:\/([a-f0-9]{12})\/cancel)?$/);
   if (im) {
@@ -745,8 +763,12 @@ async function handleApi(req, res, url) {
     }
     if (im[3]) { infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
     if (im[2] === 'actions') return send(res, 201, infra.addAction(im[1], String(body.type || ''), body.vmid, who));
-    if (im[1] === '_all') return send(res, 201, { tasks: infra.addGroupTask(body.text, who) });
-    return send(res, 201, infra.addTask(im[1], body.text, who));
+    if (!String(body.text || '').trim()) return send(res, 400, { error: 'Write a message first' });
+    const chatId = body.chat ? String(body.chat).slice(0, 40) : null;
+    if (im[1] === '_all') return send(res, 201, { tasks: infra.addGroupTask(body.text, who, chatId) });
+    if (!infra.tokens.has(im[1])) return send(res, 404, { error: 'Unknown agent' });
+    const chat = infra.chatFor(im[1], chatId, String(body.text || ''), who);
+    return send(res, 201, infra.addTask(im[1], body.text, who, null, null, chat.id));
   }
 
   return send(res, 404, { error: 'Not found' });

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.4.0
+
+- Chats: each agent and the Datacenter box have their own list of conversations. "+ New chat" starts one,
+  and it is titled from its first message (you can rename it). Follow-ups continue the same Claude session
+  on the agent, so it remembers the conversation.
+- Delete a single message (and its answer), or a whole chat.
+- Messages from before chats existed move into an "Earlier messages" chat.
+
 ## 2.3.0
 
 - Approve only part of an update: tick individual packages, or use the "Security only", "All" and "None"

@@ -8,7 +8,7 @@ const Dash = (() => {
   const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity'];
   const st = {
     data: null, error: null, loading: false,
-    open: new Set(), expanded: new Set(), sel: new Map(),
+    open: new Set(), expanded: new Set(), sel: new Map(), chatSel: {},
     drafts: {}, askAgent: null,
     filters: { host: '', status: '', q: '', level: '', ahost: '' },
   };
@@ -567,34 +567,90 @@ const Dash = (() => {
       <div class="svc-grid">${cards}</div>`;
   }
 
-  // ------------------------------------------------------------ Ask
+  // ------------------------------------------------------------ Ask (chats)
+  const chatsFor = scope => ((st.data && st.data.chats) || []).filter(c => c.scope === scope);
+  function currentChat(scope) {
+    const list = chatsFor(scope);
+    const sel = st.chatSel[scope];
+    if (sel === 'new') return null;
+    return list.find(c => c.id === sel) || list[0] || null;
+  }
+  const pendingText = (a, t) => (t.status === 'queued' ? (a.live ? 'Sending to the agent…' : 'Waiting for the agent to come online…')
+    : t.status === 'running' ? `Working on it${t.startedAt ? ` (${duration((Date.now() - t.startedAt) / 1000)})` : ''}… answers usually take 1–3 minutes` : t.status);
+
   function viewAsk() {
     const ag = agents().filter(a => a.configured);
     if (!ag.length) return empty('No agents configured.');
     if (!st.askAgent || (st.askAgent !== '_all' && !ag.some(a => a.name === st.askAgent))) st.askAgent = '_all';
+    const scope = st.askAgent;
     const picker = `<div class="seg big" data-askpick>
-      <button class="${st.askAgent === '_all' ? 'on' : ''}" data-val="_all">◎ Datacenter <span class="muted">all agents</span></button>
-      ${ag.map(x => `<button class="${x.name === st.askAgent ? 'on' : ''}" data-val="${esc(x.name)}">${dot(x.online ? 'up' : 'down')}${esc(hostOf(x))} <span class="muted">${esc(x.name)}</span></button>`).join('')}</div>`;
-    if (st.askAgent === '_all') return viewAskAll(ag, picker) + usagePanel(ag);
-    const a = ag.find(x => x.name === st.askAgent);
-    const tasks = (a.tasks || []).filter(t => !t.action); // one-click actions show on the Containers/Updates pages
-    const convo = tasks.map(t => `<div class="msg">
-      <div class="q"><div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : t.status === 'cancelled' ? '' : 'restart', t.status)}
-        ${t.status === 'queued' ? `<button class="btn small ghost" data-cancel="${esc(t.id)}" data-agent="${esc(a.name)}">Cancel</button>` : ''}</div>
+      <button class="${scope === '_all' ? 'on' : ''}" data-val="_all">◎ Datacenter <span class="muted">all agents</span></button>
+      ${ag.map(x => `<button class="${x.name === scope ? 'on' : ''}" data-val="${esc(x.name)}">${dot(x.online ? 'up' : 'down')}${esc(hostOf(x))} <span class="muted">${esc(x.name)}</span></button>`).join('')}</div>`;
+    const chats = chatsFor(scope);
+    const chat = currentChat(scope);
+    const list = `<aside class="chat-list">
+        <button class="btn primary small new-chat" data-newchat>＋ New chat</button>
+        ${chats.map(c => `<div class="chat-item${chat && chat.id === c.id ? ' on' : ''}" data-chat="${esc(c.id)}" tabindex="0">
+            <div class="ci-title">${esc(c.title)}</div>
+            <div class="ci-meta">${esc(ago(c.updatedAt))} · ${c.messages} message${c.messages === 1 ? '' : 's'}</div>
+            <button class="ci-del" data-delchat="${esc(c.id)}" title="Delete this chat" aria-label="Delete chat">×</button>
+          </div>`).join('') || '<p class="muted small-note">No chats yet. Write below to start one.</p>'}
+      </aside>`;
+    const msgs = chat ? (scope === '_all' ? groupMessages(ag, chat.id) : agentMessages(ag.find(x => x.name === scope), chat.id)) : '';
+    const target = scope === '_all' ? ag : [ag.find(x => x.name === scope)];
+    const offline = target.filter(a => !a.online).map(a => hostOf(a));
+    const draftKey = `${scope}:${chat ? chat.id : 'new'}`;
+    const main = `<section class="chat-main card">
+        <div class="chat-head">
+          <div><h3>${chat ? esc(chat.title) : 'New chat'}</h3>
+            <div class="muted">${scope === '_all' ? `Every agent answers for its own host (${target.map(a => esc(hostOf(a))).join(', ')})` : `${esc(scope)} on ${esc(hostOf(target[0]))}`}${chat ? ' · follow-ups remember this conversation' : ''}</div></div>
+          ${chat ? `<button class="btn small ghost" data-renamechat="${esc(chat.id)}">✎ Rename</button>` : ''}
+        </div>
+        <div class="convo">${msgs || `<p class="muted center">${chat ? 'No messages left in this chat.' : 'Ask a question or tell the agent what to fix.'}</p>`}</div>
+        <form class="ask-form" data-agent="${esc(scope)}" data-chat="${chat ? esc(chat.id) : ''}" data-draft="${esc(draftKey)}">
+          <textarea name="text" rows="3" maxlength="4000" placeholder="${scope === '_all' ? 'e.g. Which containers use the most disk? · Are any services failing? · Check every container for pending reboots' : 'e.g. Why is AMPServer2 using so much memory? · Pi-hole isn\'t answering DNS, fix it · Update ai now'}">${esc(st.drafts[draftKey] || '')}</textarea>
+          <div class="ask-actions"><span class="muted">${chat ? 'Reply in this chat' : 'Starts a new chat'}${offline.length ? ` — <span class="pct-bad">${esc(offline.join(', '))} offline, runs when back</span>` : ''} · Ctrl+Enter to send</span>
+            <button class="btn primary" type="submit">${scope === '_all' ? 'Send to all' : 'Send'}</button></div>
+        </form>
+      </section>`;
+    const auto = scope !== '_all' ? (((target[0].report && target[0].report.autoTasks) || []).slice().reverse()) : [];
+    return `${pageHead('Ask agents', 'Each agent can look at and fix the containers on its own host; host changes only when you ask explicitly. <b>Datacenter</b> asks every agent at once. If an agent can\'t fix something it gives you a plan to paste into Claude Code.')}
+      ${picker}
+      <div class="chat-shell">${list}${main}</div>
+      ${usagePanel(target)}
+      ${auto.length ? details(`auto:${scope}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${statusTag(t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join(''), 'card pad') : ''}`;
+  }
+
+  function agentMessages(a, chatId) {
+    const tasks = (a.tasks || []).filter(t => t.chat === chatId && !t.action).sort((x, y) => x.createdAt - y.createdAt);
+    return tasks.map(t => `<div class="msg">
+      <div class="q"><div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))} ${statusTag(t.status)}
+        <button class="msg-del" data-delmsg="${esc(t.id)}" data-agent="${esc(a.name)}" title="Delete this message">🗑</button></div>
         <div class="q-text">${esc(t.text)}</div></div>
       ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
-        : `<div class="ans pending">${t.status === 'queued' ? (a.live ? 'Sending to the agent…' : 'Waiting for the agent to come online…') : t.status === 'running' ? `Working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}… answers usually take 1–3 minutes` : ''}</div>`}
+        : `<div class="ans pending">${esc(pendingText(a, t))}</div>`}
     </div>`).join('');
-    const auto = ((a.report && a.report.autoTasks) || []).slice().reverse();
-    return `${pageHead('Ask agents', 'Questions and fix requests go to the agent on that host. It can look at and fix its containers; host changes only when you ask for them explicitly.')}
-      ${picker}
-      <form class="ask-form card" data-agent="${esc(a.name)}">
-        <textarea name="text" rows="3" maxlength="4000" placeholder="e.g. Why is AMPServer2 using so much memory? · Pi-hole isn't answering DNS, fix it · Update ai now · Why are backups failing on this host?">${esc(st.drafts[a.name] || '')}</textarea>
-        <div class="ask-actions"><span class="muted">Sent to ${esc(a.name)} on ${esc(hostOf(a))}${a.online ? '' : ' — <span class="pct-bad">agent is offline, it will run when it is back</span>'}</span><button class="btn primary" type="submit">Send</button></div>
-      </form>
-      <div class="convo">${convo || '<p class="muted center">No questions yet.</p>'}</div>
-      ${usagePanel(ag.filter(x => x.name === a.name))}
-      ${auto.length ? details(`auto:${a.name}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : 'restart', t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join(''), 'card pad') : ''}`;
+  }
+
+  function groupMessages(ag, chatId) {
+    const groups = new Map();
+    for (const a of ag) for (const t of (a.tasks || [])) {
+      if (t.chat !== chatId || !t.group) continue;
+      if (!groups.has(t.group)) groups.set(t.group, { id: t.group, text: t.text, by: t.by, t: t.createdAt, parts: [] });
+      groups.get(t.group).parts.push({ a, t });
+    }
+    return [...groups.values()].sort((x, y) => x.t - y.t).map(g => {
+      const states = g.parts.map(p => p.t.status);
+      const overall = states.every(x => x === 'done') ? 'done' : states.some(x => x === 'failed') ? 'failed' : states.some(x => x === 'running') ? 'running' : states.every(x => x === 'cancelled') ? 'cancelled' : 'queued';
+      return `<div class="msg">
+        <div class="q"><div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${statusTag(overall)}
+          <button class="msg-del" data-delgroup="${esc(g.id)}" title="Delete this message and its answers">🗑</button></div>
+          <div class="q-text">${esc(g.text)}</div></div>
+        ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => t.output
+          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
+          : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${esc(pendingText(a, t))}</div>`).join('')}
+      </div>`;
+    }).join('');
   }
 
   const statusTag = s => tag(s === 'done' ? 'up' : s === 'failed' ? 'down' : s === 'cancelled' ? '' : 'restart', s);
@@ -627,34 +683,6 @@ const Dash = (() => {
         <p class="hint">Tokens the agents used: answers, auto-fixes and nightly update reviews. This counts against your Claude plan's limits; your plan's overall usage is on claude.ai → Settings → Usage.</p>
         ${recent.length ? details(`usage:${list.map(a => a.name).join(',')}`, `Recent runs (${recent.length})`, `<table class="mini"><tbody>${recent.slice(0, 25).map(r => `<tr><td class="muted">${esc(ago(r.t))}</td><td>${esc(r.agent)}</td><td>${tag(r.kind === 'review' ? '' : r.kind === 'autofix' ? 'restart' : 'up', r.kind || 'task')}</td><td class="wrap">${esc(r.label || '')}</td><td class="num">${kTok(usageTotal(r))}</td><td class="num">$${Number(r.cost || 0).toFixed(2)}</td></tr>`).join('')}</tbody></table>`) : ''}
       </div>`;
-  }
-
-  // One question to every agent; each answers for its own host.
-  function viewAskAll(ag, picker) {
-    const groups = new Map();
-    for (const a of ag) for (const t of (a.tasks || [])) {
-      if (!t.group) continue;
-      if (!groups.has(t.group)) groups.set(t.group, { text: t.text, by: t.by, t: t.createdAt, parts: [] });
-      groups.get(t.group).parts.push({ a, t });
-    }
-    const convo = [...groups.values()].sort((x, y) => y.t - x.t).map(g => {
-      const states = g.parts.map(p => p.t.status);
-      const overall = states.every(x => x === 'done') ? 'done' : states.some(x => x === 'failed') ? 'failed' : states.some(x => x === 'running') ? 'running' : states.every(x => x === 'cancelled') ? 'cancelled' : 'queued';
-      return `<div class="msg">
-        <div class="q"><div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${statusTag(overall)}</div><div class="q-text">${esc(g.text)}</div></div>
-        ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => t.output
-          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
-          : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${t.status === 'queued' ? (a.live ? 'sending…' : 'waiting for the agent to come online…') : t.status === 'running' ? `working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}…` : esc(t.status)}</div>`).join('')}
-      </div>`;
-    }).join('');
-    const offline = ag.filter(a => !a.online).map(a => hostOf(a));
-    return `${pageHead('Ask agents', 'The <b>Datacenter</b> box sends one message to every agent at once. Each answers and acts for its own Proxmox host, and the answers appear together. Pick a host to talk to one agent.')}
-      ${picker}
-      <form class="ask-form card" data-agent="_all">
-        <textarea name="text" rows="3" maxlength="4000" placeholder="e.g. Which containers are using the most disk? · Are any services failing? · Why are backups failing? · Check every container for pending reboots">${esc(st.drafts._all || '')}</textarea>
-        <div class="ask-actions"><span class="muted">Sent to ${ag.map(a => esc(hostOf(a))).join(' and ')}${offline.length ? ` — <span class="pct-bad">${esc(offline.join(', '))} offline, will run when back</span>` : ''}</span><button class="btn primary" type="submit">Send to all</button></div>
-      </form>
-      <div class="convo">${convo || '<p class="muted center">No datacenter-wide questions yet.</p>'}</div>`;
   }
 
   // ------------------------------------------------------------ Activity
@@ -750,7 +778,7 @@ const Dash = (() => {
     const t = e.target;
     if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; const pos = t.selectionStart; $('#v-containers').innerHTML = viewContainers(); const n = $('[data-filter-input="q"]'); n.focus(); n.setSelectionRange(pos, pos); return; }
     const form = t.closest && t.closest('.ask-form');
-    if (form) st.drafts[form.dataset.agent] = t.value;
+    if (form) st.drafts[form.dataset.draft || form.dataset.agent] = t.value;
   });
 
   document.addEventListener('click', async e => {
@@ -766,6 +794,35 @@ const Dash = (() => {
     if (row) { const id = row.dataset.ct; if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id); rerender(); return; }
     const ask = e.target.closest('[data-ask]');
     if (ask) { st.askAgent = ask.dataset.ask; st.drafts[ask.dataset.ask] = ask.dataset.prefill; location.hash = '#ask'; setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }, 50); return; }
+    const chatBtn = e.target.closest('[data-newchat], [data-delchat], [data-renamechat], [data-delmsg], [data-delgroup], .chat-item');
+    if (chatBtn) {
+      const scope = st.askAgent;
+      try {
+        if (chatBtn.hasAttribute('data-newchat')) { st.chatSel[scope] = 'new'; rerender(); setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) ta.focus(); }, 30); return; }
+        if (chatBtn.dataset.delchat) {
+          const c = chatsFor(scope).find(x => x.id === chatBtn.dataset.delchat);
+          if (!confirm(`Delete the chat "${c ? c.title : ''}" and all of its messages? This can't be undone.`)) return;
+          await api(`api/infra/chats/${encodeURIComponent(chatBtn.dataset.delchat)}`, { method: 'DELETE' });
+          if (st.chatSel[scope] === chatBtn.dataset.delchat) delete st.chatSel[scope];
+          toast('Chat deleted');
+        } else if (chatBtn.dataset.renamechat) {
+          const c = chatsFor(scope).find(x => x.id === chatBtn.dataset.renamechat);
+          const title = prompt('Rename chat', c ? c.title : '');
+          if (!title || !title.trim()) return;
+          await api(`api/infra/chats/${encodeURIComponent(chatBtn.dataset.renamechat)}/rename`, { method: 'POST', body: { title } });
+        } else if (chatBtn.dataset.delmsg) {
+          if (!confirm('Delete this message and its answer?')) return;
+          await api(`api/infra/${encodeURIComponent(chatBtn.dataset.agent)}/tasks/${chatBtn.dataset.delmsg}`, { method: 'DELETE' });
+        } else if (chatBtn.dataset.delgroup) {
+          if (!confirm('Delete this message and every agent\'s answer to it?')) return;
+          await api(`api/infra/_all/groups/${chatBtn.dataset.delgroup}`, { method: 'DELETE' });
+        } else if (chatBtn.classList.contains('chat-item')) {
+          st.chatSel[scope] = chatBtn.dataset.chat; rerender(); return;
+        }
+        await load(state.data); rerender();
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
     const pick = e.target.closest('[data-pick]');
     if (pick) {
       const key = pick.closest('[data-sel]').dataset.sel;
@@ -848,7 +905,10 @@ const Dash = (() => {
     const btn = form.querySelector('button[type="submit"]');
     btn.disabled = true;
     try {
-      await api(`api/infra/${encodeURIComponent(agent)}/tasks`, { method: 'POST', body: { text } });
+      const r = await api(`api/infra/${encodeURIComponent(agent)}/tasks`, { method: 'POST', body: { text, ...(form.dataset.chat ? { chat: form.dataset.chat } : {}) } });
+      const chatId = agent === '_all' ? (r.tasks && r.tasks[0] && r.tasks[0].chat) : r.chat;
+      if (chatId) st.chatSel[agent] = chatId;
+      st.drafts[form.dataset.draft] = '';
       st.drafts[agent] = '';
       form.text.value = '';
       form.text.blur();

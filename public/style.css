@@ -489,3 +489,29 @@ label.pkg { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr);
 label.pkg input[type="checkbox"] { width: auto; margin: 0; padding: 0; }
 label.pkg .pkg-name { white-space: nowrap; }
 label.pkg .muted { text-align: right; }
+/* chats */
+.chat-shell { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 14px; align-items: start; }
+.chat-list { display: grid; gap: 4px; position: sticky; top: 72px; max-height: calc(100vh - 90px); overflow: auto; padding-right: 2px; }
+.new-chat { justify-content: center; margin-bottom: 6px; }
+.chat-item { position: relative; padding: 8px 30px 8px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.chat-item:hover { background: var(--panel-2); }
+.chat-item.on { background: var(--panel); border-color: var(--border); box-shadow: var(--shadow); }
+.ci-title { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ci-meta { font-size: 11.5px; color: var(--muted); }
+.ci-del { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: 0; background: none; color: var(--muted); font-size: 17px; cursor: pointer; opacity: 0; padding: 2px 6px; border-radius: 6px; }
+.chat-item:hover .ci-del, .chat-item.on .ci-del, .ci-del:focus { opacity: 1; }
+.ci-del:hover { color: var(--down); background: var(--down-soft); }
+.small-note { font-size: 12.5px; padding: 6px 4px; }
+.chat-main { padding: 14px 16px; display: grid; gap: 14px; }
+.chat-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+.chat-head h3 { font-size: 16px; }
+.chat-head .muted { font-size: 12.5px; }
+.chat-main .ask-form { padding: 0; border-top: 1px solid var(--border); padding-top: 12px; }
+.msg-del { border: 0; background: none; cursor: pointer; font-size: 12px; opacity: 0; padding: 0 2px; filter: grayscale(1) brightness(2); }
+.msg:hover .msg-del, .msg-del:focus { opacity: .9; }
+@media (max-width: 900px) {
+  .chat-shell { grid-template-columns: minmax(0, 1fr); }
+  .chat-list { position: static; max-height: 220px; }
+  .ci-del { opacity: 1; }
+  .msg-del { opacity: .8; }
+}
