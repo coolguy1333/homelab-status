@@ -1,7 +1,8 @@
 # WebManager automatic failover
 
 Keeps the WebManager sites (and this status site, app 51) up when the
-WebManager primary goes down.
+WebManager primary goes down, and keeps the Proxmox web UI reachable when one
+of the two hosts is down.
 
 | Piece | Where | What it does |
 | --- | --- | --- |
@@ -63,6 +64,19 @@ nftables rules don't change. The stats page is at `http://127.0.0.1:8404/`.
 Health checks must send an IP as the `Host` header. Without one, WebManager's
 nginx routes the request to the site gateway and returns 404.
 
+## Proxmox web UI failover
+
+The same HAProxy also listens on `127.0.0.1:8006` (TCP passthrough). It
+sends traffic to HELP (`192.168.10.81:8006`) and switches to GOD
+(`192.168.10.23:8006`) when HELP's UI stops answering. GOD and HELP form one
+cluster (HELLLLP), so either UI manages both hosts and a login works on
+either. Open consoles stay on the host they started on, and new
+connections move over.
+
+This is a 2-node cluster without a QDevice. If one host is down, the other
+loses quorum: the UI works, but guests can't be started or changed until
+quorum returns (or `pvecm expected 1` is run on the surviving host).
+
 ## Cloudflare tunnel
 
 Every public hostname that used to point at `http://192.168.10.20:8080` must
@@ -70,6 +84,10 @@ point at `http://localhost:8081`:
 
 `webmgr.dev`, `web.mhsit.club`, `mhsit.club`, `print-away.com`, `mhscraft.cc`,
 `fingland.cc`, `mhstoday.com`, `fantasy-frc.com`, and the `*.` wildcard of each.
+
+`pm.mhsit.club`, `pve.mhsit.club` and `proxmox.mhsit.club` (formerly
+`https://192.168.10.81:8006`) must point at `https://localhost:8006`, with
+"No TLS Verify" kept on.
 
 ## Caveats
 
