@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -982,9 +982,16 @@ def health(vmid):
     failed_part, _, ports_part = out.partition("---")
     ports = set()
     for a in ports_part.split():
-        port = a.rsplit(":", 1)[-1]
-        if port.isdigit():
-            ports.add(port)
+        addr, _, port = a.rpartition(":")
+        if not port.isdigit():
+            continue
+        # Ports only the container itself can reach (127.x / ::1) aren't services anyone depends on, and ports
+        # in the ephemeral range get a new random number every restart (e.g. containerd's): neither counts as lost.
+        if addr.startswith("127.") or addr in ("[::1]", "::1") or "%lo" in addr:
+            continue
+        if 32768 <= int(port) <= 60999:
+            continue
+        ports.add(port)
     return {"running": True, "failed": set(failed_part.split()), "ports": ports}
 
 
@@ -1279,12 +1286,14 @@ def cmd_action(pid):
             vmid = int(item["vmid"])
             rc, out = ssh(f"pct config {vmid} | sed -n 's/^hostname: //p'")
             name = out.strip() or str(vmid)
+            # Consume the approval BEFORE updating: if this attempt is rolled back again, update_container
+            # creates a fresh "Retry updates" approval (often with the same id), which must survive.
+            with state() as s:
+                s["pending"].pop(pid, None)
             with open(UPDATE_LOCK, "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
                 r = update_container(vmid, name, mode="full", only=item.get("selected"))
             event("info", f"Approved update: {r}")
-            with state() as s:
-                s["pending"].pop(pid, None)
         else:
             event("warn", f"Don't know how to do approved item {pid} ({kind})")
     except Exception as e:

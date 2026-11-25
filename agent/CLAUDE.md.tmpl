@@ -46,5 +46,9 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
 6. Network: this container may only reach its own Proxmox host, the backup server, other machines on its
    own LAN subnet (for checks) and the internet. Don't change the
    firewall in this container (`nft list ruleset`) to get around that. Ask the owner instead.
-7. When you finish a task, end with a short plain summary: what you found, what you changed, and
+7. **Don't edit your own automation** (`~/agent/hl_agent.py`, `install.sh`, the systemd units, `CLAUDE.md`). It
+   is deployed from the owner's repository and your edits would be overwritten (and the other agent wouldn't
+   get them). If you find a bug in it, explain the fix with the exact code change in a
+   `## Handoff plan for Claude Code` section instead.
+8. When you finish a task, end with a short plain summary: what you found, what you changed, and
    any snapshot you took.

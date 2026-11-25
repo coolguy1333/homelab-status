@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.2
+
+- Agent 1.7.1 (fixes first found by the connector1 agent):
+  - After an update, ports bound only to the container itself, and random ports in the ephemeral range
+    (32768–60999), no longer count as "lost". This was a false rollback on WebManager (containerd's internal port).
+  - An approved retry that gets rolled back again keeps its new "Retry updates" approval. It used to be deleted,
+    leaving the container blocked with no way to retry.
+  - Agents don't edit their own automation any more. Fixes come back as a hand-off plan, because the code is
+    deployed from this repository.
+
 ## 2.5.1
 
 - Agent 1.7: both agents can work on the backup server (PBS) over SSH: read everything, and change it only when
