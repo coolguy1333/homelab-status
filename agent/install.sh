@@ -61,6 +61,23 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
+cat > /etc/systemd/system/hl-poll.service <<EOF
+[Unit]
+Description=Homelab agent: instant pickup of dashboard requests ($NAME)
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=agent
+WorkingDirectory=$A
+Environment=HOME=/home/agent PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 $A/hl_agent.py poll
+# Tasks it starts must survive a restart of this service.
+KillMode=process
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
 cat > /etc/systemd/system/hl-update.service <<EOF
 [Unit]
 Description=Homelab agent: nightly container updates ($NAME)
@@ -126,7 +143,13 @@ nft -c -f /etc/nftables.conf
 systemctl enable -q nftables
 systemctl restart nftables
 
+# Let the agent user ping container IPs (uptime checks) without raw-socket privileges.
+G=$(id -g agent)
+echo "net.ipv4.ping_group_range = $G $G" > /etc/sysctl.d/90-hl-agent-ping.conf
+sysctl -q -p /etc/sysctl.d/90-hl-agent-ping.conf || true
+
 systemctl daemon-reload
-systemctl enable -q --now hl-report.timer hl-update.timer
+systemctl enable -q --now hl-report.timer hl-update.timer hl-poll.service
+systemctl restart hl-poll.service
 echo "installed $NAME (host $HOST, vmid $VMID, updates at $UPDATE_AT)"
 echo "AGENT_TOKENS entry: $NAME:$(python3 -c "import json;print(json.load(open('$A/config.json'))['token'])")"

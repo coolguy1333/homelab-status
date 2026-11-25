@@ -710,6 +710,22 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, ...infra.receive(name, body) });
   }
 
+  // Quick channel: the agent posts task progress and waits (up to 25 s) for new work, so requests from
+  // the dashboard reach it within a second instead of at its next 5-minute report.
+  if (p === '/api/agent/sync' && method === 'POST') {
+    const name = infra.agentFrom(req);
+    if (!name) return send(res, 401, { error: 'Invalid or missing agent token' });
+    if (needJson()) return;
+    const body = await readBody(req, 512 * 1024);
+    infra.applyResults(name, body);
+    const wait = Math.max(0, Math.min(25, Number(body.wait) || 0)) * 1000;
+    let closed = false;
+    req.on('close', () => { closed = true; });
+    const out = await infra.waitFor(name, wait);
+    if (closed) return;
+    return send(res, 200, { ok: true, ...out });
+  }
+
   // Everything else about the infrastructure is for signed-in admins only, even on a public dashboard:
   // it names hosts, containers and IPs, and lets you send the agents work.
   if (p === '/api/infra' && method === 'GET') {

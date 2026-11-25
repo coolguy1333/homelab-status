@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -277,6 +277,7 @@ def collect_slow(s, node, host, containers, force=False):
     except Exception as e:
         log(f"backup jobs: {e}")
     backups = {}
+    pbs = []
     storages = [x for x in ssh_json(f"pvesh get /nodes/{node}/storage --output-format json")
                 if x.get("active") and "backup" in str(x.get("content", ""))]
     for st in storages:
@@ -285,6 +286,8 @@ def collect_slow(s, node, host, containers, force=False):
         except Exception as e:
             log(f"backup list {st['storage']}: {e}")
             continue
+        if st.get("type") == "pbs":
+            pbs.append(pbs_summary(st, items))
         for b in items:
             v = int(b.get("vmid") or 0)
             if v not in vmids:
@@ -330,7 +333,7 @@ def collect_slow(s, node, host, containers, force=False):
             pass
     for j in jobs:
         j.pop("_raw", None)
-    slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40],
+    slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40], "pbs": pbs,
             "snapshots": {str(k): v for k, v in snaps.items()},
             "services": discover_services(containers), "public": discover_public()}
     slow["webmanager"] = discover_webmanager(containers)
@@ -350,6 +353,45 @@ def collect_slow(s, node, host, containers, force=False):
 IGNORE_PORTS = {25, 111, 631, 5355}  # mail relay, rpcbind, cups, llmnr: noise, not services
 
 
+def pbs_summary(st, items):
+    """A Proxmox Backup Server storage as the cluster sees it (no extra credentials needed)."""
+    try:
+        cfg = ssh_json(f"pvesh get /storage/{st['storage']} --output-format json")
+    except Exception:
+        cfg = {}
+    server = cfg.get("server")
+    port = int(cfg.get("port") or 8007)
+    up, ms = False, None
+    if server:
+        t0 = time.time()
+        try:
+            with socket.create_connection((server, port), timeout=4):
+                up, ms = True, round((time.time() - t0) * 1000, 1)
+        except OSError:
+            pass
+    times = sorted((b.get("ctime") or 0) * 1000 for b in items)
+    ver = [((b.get("verification") or {}).get("state")) for b in items]
+    guests = {}
+    for b in items:
+        g = guests.setdefault(b.get("vmid"), {"n": 0, "last": 0, "size": 0, "type": b.get("subtype")})
+        g["n"] += 1
+        g["size"] = max(g["size"], b.get("size") or 0)
+        g["last"] = max(g["last"], (b.get("ctime") or 0) * 1000)
+    day = now_ms() - 86400e3
+    return {
+        "storage": st["storage"], "server": server, "port": port, "datastore": cfg.get("datastore"),
+        "reachable": up, "ms": ms, "total": st.get("total"), "used": st.get("used"), "avail": st.get("avail"),
+        "count": len(items), "guests": len(guests),
+        "containers": sum(1 for g in guests.values() if g["type"] == "lxc"), "vms": sum(1 for g in guests.values() if g["type"] == "qemu"),
+        "last": times[-1] if times else None, "oldest": times[0] if times else None,
+        "last24h": sum(1 for t in times if t > day),
+        "verifiedOk": sum(1 for v in ver if v == "ok"), "verifyFailed": sum(1 for v in ver if v == "failed"),
+        "unverified": sum(1 for v in ver if not v),
+        "staleGuests": sum(1 for g in guests.values() if g["last"] < now_ms() - 3 * 86400e3),
+        "checkedAt": now_ms(),
+    }
+
+
 def discover_services(containers):
     """Listening TCP ports inside each running container (not loopback-only ones)."""
     found = []
@@ -366,6 +408,8 @@ def discover_services(containers):
         ip = next((x for x in ips_part.split() if re.match(r"^\d+\.\d+\.\d+\.\d+$", x) and not x.startswith("127.")), None)
         if not ip:
             continue
+        # The container's address itself (ping), before its ports.
+        found.append({"key": f"{c['vmid']}:ping", "vmid": c["vmid"], "container": c["name"], "ip": ip, "port": 0, "proc": "ping"})
         seen = set()
         for line in ss_part.splitlines():
             parts = line.split()
@@ -455,6 +499,14 @@ def discover_public():
 def check_services(services):
     def one(sv):
         t0 = time.time()
+        if sv.get("port") == 0:  # ICMP ping of the container's IP
+            try:
+                p = subprocess.run(["ping", "-c", "1", "-W", "2", sv["ip"]], capture_output=True, text=True, timeout=5)
+                m = re.search(r"time=([\d.]+)", p.stdout)
+                return {**sv, "ok": p.returncode == 0, "ms": float(m.group(1)) if m else None,
+                        **({} if p.returncode == 0 else {"err": "no ping reply"})}
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return {**sv, "ok": False, "ms": None, "err": str(e)[:80]}
         try:
             with socket.create_connection((sv["ip"], sv["port"]), timeout=3):
                 return {**sv, "ok": True, "ms": round((time.time() - t0) * 1000, 1)}
@@ -515,7 +567,7 @@ def build_report(s, host, containers):
         "agent": CFG["name"], "agentVersion": VERSION, "generatedAt": now_ms(),
         "host": host, "containers": containers, "pending": pending,
         "events": events, "updateRuns": s["updateRuns"][-20:],
-        "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t")},
+        "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t", "pbs")},
         "services": s.get("serviceChecks", []),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
@@ -524,6 +576,57 @@ def build_report(s, host, containers):
                       for t in internal[-5:]],
         "taskResults": tasks, "acked": list(s["handled"].keys()),
     }
+
+
+def sync(url, wait=0):
+    """Quick channel: send task progress, then wait up to `wait` s for new work from the dashboard."""
+    with state() as s:
+        cutoff = now_ms() - 15 * 60e3
+        results = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:]}
+                   for t in s["tasks"].values() if not t.get("internal") and t.get("u", t["t"]) > cutoff]
+        acked = list(s["handled"].keys())
+    data = json.dumps({"taskResults": results, "acked": acked, "wait": wait}).encode()
+    req = urllib.request.Request(url.rstrip("/") + "/api/agent/sync", data=data, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {CFG['token']}",
+        "User-Agent": f"homelab-agent/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=wait + 20) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def sync_now():
+    for url in CFG["site_urls"]:
+        try:
+            sync(url, 0)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log(f"sync to {url} failed: {e}")
+
+
+def cmd_poll():
+    """Long-running: picks up dashboard requests within a second (systemd hl-poll.service)."""
+    import threading
+
+    def loop(url):
+        backoff = 5
+        while True:
+            try:
+                r = sync(url, 25)
+                backoff = 5
+                if r.get("tasks") or r.get("decisions"):
+                    handle_replies([r])
+                    sync(url, 0)  # show "running" on the dashboard right away
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                log(f"poll {url}: {e}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+            except Exception as e:  # never die; systemd would restart us anyway
+                log(f"poll {url}: unexpected {e!r}")
+                time.sleep(10)
+
+    threads = [threading.Thread(target=loop, args=(u,), daemon=True) for u in CFG["site_urls"]]
+    for t in threads:
+        t.start()
+    while True:
+        time.sleep(3600)
 
 
 def post(url, payload):
@@ -573,9 +676,13 @@ def cmd_report(send=True):
             replies.append(post(url, report))
         except (urllib.error.URLError, OSError, ValueError) as e:
             log(f"report to {url} failed: {e}")
+    handle_replies(replies)
+
+
+def handle_replies(replies):
+    """Act on decisions and tasks the dashboard sent back (from a report or a quick sync)."""
     if not replies:
         return
-
     decisions, tasks = {}, {}
     for r in replies:
         for d in r.get("decisions", []):
@@ -602,7 +709,7 @@ def cmd_report(send=True):
             if tid in s["tasks"]:
                 continue
             s["tasks"][tid] = {"id": tid, "text": t["text"], "by": t.get("by"), "status": "running", "output": "",
-                               "t": now_ms(), **({"action": t["action"]} if t.get("action") else {})}
+                               "t": now_ms(), "u": now_ms(), **({"action": t["action"]} if t.get("action") else {})}
             spawn("ctaction" if t.get("action") else "task", tid)
 
 
@@ -618,16 +725,20 @@ def cmd_task(tid):
     prompt = (f"Request from {who}:\n\n{text}\n\n"
               "You are this Proxmox host's homelab agent (see CLAUDE.md for the setup and rules). "
               "Do what is asked; if it is a question, answer it from real data you look up. "
-              "Finish with a short plain-text summary of what you found and anything you changed.")
+              "Your reply is shown on a web dashboard that renders Markdown: use short headings, bullet lists, "
+              "**bold** for key facts, `code` for commands/paths, and tables where they help. Keep it concise. "
+              "End with what you changed (or 'No changes made') and any snapshot you took.")
     rc, out = claude(prompt)
     with state() as s:
         t = s["tasks"].get(tid)
         if t:
             t["status"] = "done" if rc == 0 else "failed"
             t["output"] = out[-20000:] or "(no output)"
+            t["u"] = now_ms()
         if internal:
             event("info" if rc == 0 else "error", f"Auto-fix finished: {out.strip().splitlines()[-1][:300] if out.strip() else 'no output'}", s)
-    cmd_report()  # get the answer onto the dashboard right away
+    sync_now()    # answer onto the dashboard right away
+    cmd_report()  # then refresh everything else
 
 
 # ------------------------------------------------------------------ updates
@@ -1041,6 +1152,20 @@ def cmd_ctaction(tid):
             with state() as s:
                 runs = s["updateRuns"]
                 out = runs[-1]["summary"] if runs else "done"
+        elif typ == "check":
+            rc, o = cx(vmid, "command -v apt-get >/dev/null || { echo NOAPT; exit 0; }; apt-get update -q 2>&1 | tail -3", 900)
+            if "NOAPT" in o:
+                raise RuntimeError("this container does not use apt")
+            rc, lst = cx(vmid, "apt list --upgradable 2>/dev/null", 120)
+            pkgs = parse_upgradable(lst)
+            sec = [x for x in pkgs if x["security"]]
+            set_container(vmid, updates={"count": len(pkgs), "security": len(sec), "checkedAt": now_ms()})
+            with state() as s:  # show the new count right away
+                for c in (s.get("lastCollect") or {}).get("containers", []):
+                    if c["vmid"] == vmid:
+                        c["updates"] = s["containers"][str(vmid)]["updates"]
+            out = (f"{len(pkgs)} update(s) available ({len(sec)} security):\n" + "\n".join(f"{x['name']} {x['old']} -> {x['new']}" for x in pkgs[:60])
+                   + ("\n…" if len(pkgs) > 60 else "")) if pkgs else "Up to date."
         elif typ == "check-updates":
             n = check_host_updates()
             out = f"{n} host package update(s) available." if n else "The host is up to date."
@@ -1053,7 +1178,9 @@ def cmd_ctaction(tid):
         if t:
             t["status"] = "done" if ok else "failed"
             t["output"] = (out or "done")[-20000:]
+            t["u"] = now_ms()
         event("info" if ok else "error", f"{t['text'] if t else typ} ({'done' if ok else 'failed'}) — requested by {by}", s)
+    sync_now()
     cmd_report()
 
 
@@ -1075,6 +1202,8 @@ def main():
         cmd_action(sys.argv[2])
     elif cmd == "task" and len(sys.argv) > 2:
         cmd_task(sys.argv[2])
+    elif cmd == "poll":
+        cmd_poll()
     elif cmd == "ctaction" and len(sys.argv) > 2:
         cmd_ctaction(sys.argv[2])
     else:

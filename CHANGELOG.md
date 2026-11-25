@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0
+
+- Requests reach the agents instantly. They keep a connection open (`/api/agent/sync`) instead of checking every
+  5 minutes, and progress and answers show up as soon as they're ready.
+- Agent answers render as Markdown: headings, lists, tables, code.
+- The backup server (PBS) appears as a server on the Overview and Backups pages: datastore usage, backup count,
+  verification rate, newest and oldest backup, reachability.
+- Every container has "Check for updates" and "Update now" buttons, on the Containers and Updates pages.
+- The agents also ping each container's IP address as an internal uptime check.
+
 ## 2.1.0 — Homelab Status
 
 - New layout: sidebar with Overview, Containers, Updates, Backups, Uptime, Ask agents, and Activity.

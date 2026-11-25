@@ -55,6 +55,11 @@ const Dash = (() => {
       const failed = ((r.backups && r.backups.tasks) || []).filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR);
       if (failed.length) push('err', `${failed.length} backup run${failed.length > 1 ? 's' : ''} failed on ${hostOf(a)} in the last 24 h`, 'backups');
     }
+    for (const p of pbsServers()) {
+      if (!p.reachable) push('err', `Backup server ${p.storage} (${p.server}) is not reachable`, 'backups');
+      if (p.verifyFailed) push('err', `${p.verifyFailed} backup(s) on ${p.storage} failed verification`, 'backups');
+      if (p.total && p.used / p.total >= 0.85) push('warn', `Backup datastore ${p.datastore} is ${Math.round(p.used / p.total * 100)}% full`, 'backups');
+    }
     for (const c of containers()) {
       if (c.onboot && c.status !== 'running') push('err', `${c.name} (${c.vmid}) on ${c.host} is ${c.status}`, 'containers');
       const lu = c.lastUpdate;
@@ -66,9 +71,67 @@ const Dash = (() => {
     const mDown = ((d && d.monitors) || []).filter(m => m.status === 'down');
     if (mDown.length) push('err', `${mDown.length} public site${mDown.length > 1 ? 's' : ''} down: ${mDown.slice(0, 3).map(m => m.name).join(', ')}${mDown.length > 3 ? '…' : ''}`, 'uptime');
     const sDown = services().filter(s => s.status === 'down' && !s.stale);
-    if (sDown.length) push('err', `${sDown.length} internal service${sDown.length > 1 ? 's' : ''} down: ${sDown.slice(0, 3).map(s => `${s.container}:${s.port}`).join(', ')}`, 'uptime');
+    if (sDown.length) push('err', `${sDown.length} internal service${sDown.length > 1 ? 's' : ''} down: ${sDown.slice(0, 3).map(s => `${s.container}${s.port ? `:${s.port}` : ' (no ping)'}`).join(', ')}`, 'uptime');
     const order = { err: 0, warn: 1, info: 2 };
     return items.sort((x, y) => order[x.level] - order[y.level]);
+  }
+
+  // ------------------------------------------------------------ Markdown (agent answers)
+  // Small, safe renderer: everything is HTML-escaped first; only links to http(s) are kept.
+  function mdInline(t) {
+    const codes = [];
+    let h = esc(t).replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+    h = h.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/__([^_]+)__/g, '<b>$1</b>')
+      .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\w)/g, '$1<i>$2</i>')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return h.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+  }
+  function md(src) {
+    const lines = String(src || '').replace(/\r/g, '').split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^\s*```/.test(line)) {
+        const buf = [];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+        i++;
+        out.push(`<pre>${esc(buf.join('\n'))}</pre>`);
+        continue;
+      }
+      if (!line.trim()) { i++; continue; }
+      let m;
+      if ((m = line.match(/^\s*(#{1,6})\s+(.*)$/))) { const lv = Math.min(6, m[1].length + 2); out.push(`<h${lv}>${mdInline(m[2])}</h${lv}>`); i++; continue; }
+      if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        const rows = [];
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
+        const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+        const body = rows.filter(r => !/^\s*\|[\s:|-]+\|\s*$/.test(r));
+        const [head, ...rest] = body;
+        out.push(`<div class="table-wrap"><table class="mdt"><thead><tr>${cells(head).map(c => `<th>${mdInline(c)}</th>`).join('')}</tr></thead><tbody>${rest.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+        continue;
+      }
+      if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+        const ordered = /^\s*\d/.test(line);
+        const items = [];
+        while (i < lines.length && (/^\s*([-*+]|\d+[.)])\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length))) {
+          const l = lines[i++];
+          const mm = l.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+          if (mm) items.push({ depth: Math.floor(mm[1].replace(/\t/g, '  ').length / 2), text: mm[3] });
+          else items[items.length - 1].text += ' ' + l.trim();
+        }
+        const tag = ordered ? 'ol' : 'ul';
+        out.push(`<${tag}>${items.map(it => `<li class="d${Math.min(it.depth, 3)}">${mdInline(it.text)}</li>`).join('')}</${tag}>`);
+        continue;
+      }
+      const para = [];
+      while (i < lines.length && lines[i].trim() && !/^\s*(#{1,6}\s|```|\||([-*+]|\d+[.)])\s+)/.test(lines[i])) para.push(lines[i++].trim());
+      if (para.length) out.push(`<p>${para.map(mdInline).join('<br>')}</p>`);
+      else i++;
+    }
+    return `<div class="md">${out.join('')}</div>`;
   }
 
   // ------------------------------------------------------------ small pieces
@@ -123,7 +186,7 @@ const Dash = (() => {
       ${kpi('Agents', `${agOn}<span class="kpi-of">/${ag.length}</span>`, 'online', agOn < ag.length ? 'bad' : '', '')}
     </div>`;
 
-    const hosts = `<div class="hosts">${ag.map(hostCard).join('')}</div>`;
+    const hosts = `<div class="hosts">${ag.map(hostCard).join('')}${pbsServers().map(pbsCard).join('')}</div>`;
     const events = [];
     for (const a of agents()) for (const e of ((a.report || {}).events || [])) events.push({ ...e, host: hostOf(a) });
     events.sort((x, y) => y.t - x.t);
@@ -133,6 +196,38 @@ const Dash = (() => {
       <h3 class="sec-title">Proxmox hosts</h3>${hosts}
       <div class="card pad"><div class="att-head"><h3>Recent activity</h3><a href="#activity">All activity →</a></div>
         ${recent ? `<ul class="events">${recent}</ul>` : '<p class="muted">Nothing yet.</p>'}</div>`;
+  }
+
+  // Backup servers (PBS) as the agents see them; both agents see the same one, keep the freshest.
+  function pbsServers() {
+    const m = new Map();
+    for (const a of agents()) for (const p of ((a.report && a.report.backups && a.report.backups.pbs) || [])) {
+      const k = `${p.server}/${p.datastore}`;
+      if (!m.has(k) || (m.get(k).checkedAt || 0) < (p.checkedAt || 0)) m.set(k, { ...p, seenBy: a.name });
+    }
+    return [...m.values()];
+  }
+
+  function pbsCard(p) {
+    const verPct = p.count ? Math.round((p.verifiedOk / p.count) * 100) : null;
+    return `<div class="card host">
+      <div class="host-head">${dot(p.reachable ? 'up' : 'down')}<div><h3>${esc(p.storage)} <span class="muted">${esc(p.server || '')}</span></h3>
+        <div class="muted ${p.reachable ? '' : 'pct-bad'}">Proxmox Backup Server · datastore ${esc(p.datastore || '?')} · ${p.reachable ? `answering (${p.ms} ms)` : 'NOT REACHABLE'}</div></div>
+        <span class="pill">backup server</span></div>
+      <div class="host-meters"><div class="kv"><span>${esc(p.datastore || 'Datastore')}</span>${meter(p.used, p.total)}</div></div>
+      <div class="pbs-stats">
+        <div><b>${p.count}</b><span>backups</span></div>
+        <div><b>${p.guests}</b><span>guests (${p.containers} CT · ${p.vms} VM)</span></div>
+        <div><b>${p.last24h}</b><span>in last 24 h</span></div>
+        <div><b class="${p.verifyFailed ? 'pct-bad' : verPct === 100 ? 'pct-good' : ''}">${verPct == null ? '—' : `${verPct}%`}</b><span>verified${p.verifyFailed ? ` · ${p.verifyFailed} failed` : ''}</span></div>
+      </div>
+      <div class="meta">
+        <span>Newest <b>${p.last ? esc(ago(p.last)) : '—'}</b></span>
+        <span>Oldest <b>${p.oldest ? esc(new Date(p.oldest).toLocaleDateString()) : '—'}</b></span>
+        <span>Free <b>${p.avail ? bytes(p.avail) : '—'}</b></span>
+        ${p.staleGuests ? `<span class="pct-warn">${p.staleGuests} guest(s) with no backup in 3 days</span>` : ''}
+      </div>
+    </div>`;
   }
 
   function hostCard(a) {
@@ -218,7 +313,7 @@ const Dash = (() => {
   function containerDetail(c, sv) {
     const b = c.backup || {};
     const snaps = (c.snapshots || []).slice().sort((x, y) => y.t - x.t);
-    const svc = sv.length ? `<table class="mini"><tbody>${sv.sort((x, y) => x.port - y.port).map(s => `<tr><td>${dot(s.status === 'up' ? 'up' : 'down')}:${s.port}</td><td>${esc(s.proc || '')}</td><td class="muted">${esc(s.ip)}</td><td>${pct(s.uptime24h)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">No listening services found.</p>';
+    const svc = sv.length ? `<table class="mini"><tbody>${sv.sort((x, y) => x.port - y.port).map(s => `<tr><td>${dot(s.status === 'up' ? 'up' : 'down')}${s.port ? `:${s.port}` : 'IP'}</td><td>${esc(s.proc || '')}</td><td class="muted">${esc(s.ip)}</td><td>${pct(s.uptime24h)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">No listening services found.</p>';
     return `<div class="cd-grid">
       <div><h4>Services</h4>${svc}</div>
       <div><h4>Backups</h4>
@@ -240,11 +335,19 @@ const Dash = (() => {
         : `<button class="btn small primary" data-act="start" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">▶ Start</button>`}
       <button class="btn small" data-act="snapshot" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">◷ Snapshot</button>
       <button class="btn small" data-act="backup" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⛁ Back up now</button>
-      ${c.status === 'running' ? `<button class="btn small" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⟳ Update now</button>` : ''}
+      ${c.status === 'running' ? `<button class="btn small" data-act="check" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⌕ Check for updates</button>
+        <button class="btn small" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⟳ Update now</button>` : ''}
       <span class="spacer"></span>
       <button class="btn small" data-ask="${esc(c.agent)}" data-prefill="${esc(`About ${c.name} (container ${c.vmid}) on ${c.host}: `)}">✦ Ask about ${esc(c.name)}</button>
     </div>
     ${actionLog(c.agent, c.vmid)}`;
+  }
+
+  // "Checking…/Updating…" while one of those actions is queued or running for the container.
+  function busyNote(c) {
+    const a = agents().find(x => x.name === c.agent);
+    const t = ((a && a.tasks) || []).find(x => x.action && x.action.vmid === c.vmid && ['queued', 'running'].includes(x.status) && ['check', 'update'].includes(x.action.type));
+    return t ? ` <span class="pill warn">${t.action.type === 'check' ? 'checking…' : 'updating…'}</span>` : '';
   }
 
   // Recent one-click actions for a container (or the host when vmid is null).
@@ -262,7 +365,7 @@ const Dash = (() => {
     for (const a of ag) for (const p of (a.report.pending || [])) pend.push({ a, p });
     const pendHtml = pend.length ? pend.map(({ a, p }) => {
       const dec = a.decisions[p.id];
-      const act = dec ? `<span class="muted">${dec.decision === 'approve' ? 'Approved' : 'Denied'} by ${esc(dec.by)} ${esc(ago(dec.at))} — ${dec.acked ? 'agent is on it' : 'waiting for the agent (≤ 5 min)'}</span>`
+      const act = dec ? `<span class="muted">${dec.decision === 'approve' ? 'Approved' : 'Denied'} by ${esc(dec.by)} ${esc(ago(dec.at))} — ${dec.acked ? 'agent is on it' : 'sending to the agent…'}</span>`
         : `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Approve</button>
            <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`;
       return `<div class="card approval">
@@ -294,15 +397,17 @@ const Dash = (() => {
         <td class="num">${u.count ?? '<span class="muted">—</span>'}</td><td class="num">${u.security ? `<span class="pct-bad">${u.security}</span>` : (u.count != null ? '0' : '')}</td>
         <td>${u.checkedAt ? esc(ago(u.checkedAt)) : '<span class="muted">tonight</span>'}</td>
         <td>${lu ? `<span class="${lu.result === 'ok' ? 'pct-good' : lu.result === 'held' ? 'pct-warn' : 'pct-bad'}">${esc(lu.result)}</span> <span class="muted">${esc(ago(lu.t))}</span>` : '<span class="muted">—</span>'}</td>
-        <td class="wrap muted">${esc((lu && lu.msg) || '')}</td></tr>`;
+        <td class="wrap muted">${esc((lu && lu.msg) || '')}${busyNote(c)}</td>
+        <td class="row-actions">${c.status === 'running' ? `<button class="btn small" data-act="check" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Refresh the package list and count pending updates">Check</button>
+          <button class="btn small primary" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Snapshot, install everything, health-check, roll back if broken">Update now</button>` : ''}</td></tr>`;
     }).join('');
     return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the agent rates them low-risk; the rest wait here. Every update is snapshotted first and rolled back if services break.')}
       <h3 class="sec-title">Waiting for approval</h3><div class="stack">${pendHtml}</div>
       <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}</div>
       <h3 class="sec-title">Containers</h3>
       <div class="card table-card"><div class="table-wrap"><table class="ctable">
-        <thead><tr><th>Container</th><th>Host</th><th>Pending</th><th>Security</th><th>Checked</th><th>Last update</th><th>Notes</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">No data yet.</td></tr>'}</tbody></table></div></div>`;
+        <thead><tr><th>Container</th><th>Host</th><th>Pending</th><th>Security</th><th>Checked</th><th>Last update</th><th>Notes</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" class="muted">No data yet.</td></tr>'}</tbody></table></div></div>`;
   }
 
   // ------------------------------------------------------------ Backups
@@ -351,8 +456,10 @@ const Dash = (() => {
     const taskRows = tasks.slice(0, 30).map(t => `<li><time>${esc(fmtDate(t.t))}</time>${t.status === 'OK' ? tag('up', 'ok') : t.status === 'running' ? tag('restart', 'running') : tag('down', 'failed')}
       <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${t.status !== 'OK' && t.status !== 'running' ? ` — <span class="pct-bad">${esc(t.status)}</span>` : ''}</span></li>`).join('');
 
+    const servers = pbsServers();
     return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent update snapshots (hlauto…) are listed too.')}
       ${kpis}
+      ${servers.length ? `<div class="hosts">${servers.map(pbsCard).join('')}</div>` : ''}
       <h3 class="sec-title">Containers</h3>
       <div class="card table-card"><div class="table-wrap"><table class="ctable">
         <thead><tr><th>Container</th><th>Host</th><th>In a job</th><th>Last backup</th><th>Size</th><th>Verified</th><th>Kept</th><th>Snapshots</th></tr></thead>
@@ -381,7 +488,7 @@ const Dash = (() => {
       return `<div class="card svc-card">
         <div class="svc-head">${dot(down ? 'down' : 'up')}<b>${esc(g.name)}</b><span class="muted">${g.vmid} · ${esc(hostName(g.agent))} · ${esc(g.list[0].ip || '')}</span></div>
         ${g.list.sort((x, y) => x.port - y.port).map(s => `<div class="svc-row${s.stale ? ' stale' : ''}">
-          <span class="svc-port">${dot(s.stale ? '' : s.status === 'up' ? 'up' : 'down')}:${s.port}</span>
+          <span class="svc-port">${dot(s.stale ? '' : s.status === 'up' ? 'up' : 'down')}${s.port ? `:${s.port}` : 'IP'}</span>
           <span class="svc-proc">${esc(s.proc || '')}</span>
           <span class="svc-bars">${recentBars(s.recent || [], 48)}</span>
           <span class="svc-num">${s.last && s.last.ok && s.last.ms != null ? `${s.last.ms} ms` : s.status === 'down' ? `<span class="pct-bad">down ${esc(ago(s.since).replace(' ago', ''))}</span>` : '—'}</span>
@@ -409,8 +516,8 @@ const Dash = (() => {
       <div class="q"><div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : t.status === 'cancelled' ? '' : 'restart', t.status)}
         ${t.status === 'queued' ? `<button class="btn small ghost" data-cancel="${esc(t.id)}" data-agent="${esc(a.name)}">Cancel</button>` : ''}</div>
         <div class="q-text">${esc(t.text)}</div></div>
-      ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''}</div><pre>${esc(t.output)}</pre></div>`
-        : `<div class="ans pending">${t.status === 'queued' ? 'Waiting for the agent to pick this up (within 5 minutes)…' : t.status === 'running' ? 'Working on it…' : ''}</div>`}
+      ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''}</div>${md(t.output)}</div>`
+        : `<div class="ans pending">${t.status === 'queued' ? (a.live ? 'Sending to the agent…' : 'Waiting for the agent to come online…') : t.status === 'running' ? `Working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}… answers usually take 1–3 minutes` : ''}</div>`}
     </div>`).join('');
     const auto = ((a.report && a.report.autoTasks) || []).slice().reverse();
     return `${pageHead('Ask agents', 'Questions and fix requests go to the agent on that host. It can look at and fix its containers; host changes only when you ask for them explicitly.')}
@@ -420,7 +527,7 @@ const Dash = (() => {
         <div class="ask-actions"><span class="muted">Sent to ${esc(a.name)} on ${esc(hostOf(a))}${a.online ? '' : ' — <span class="pct-bad">agent is offline, it will run when it is back</span>'}</span><button class="btn primary" type="submit">Send</button></div>
       </form>
       <div class="convo">${convo || '<p class="muted center">No questions yet.</p>'}</div>
-      ${auto.length ? details(`auto:${a.name}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : 'restart', t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans"><pre>${esc(t.output)}</pre></div>` : ''}</div>`).join(''), 'card pad') : ''}`;
+      ${auto.length ? details(`auto:${a.name}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : 'restart', t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join(''), 'card pad') : ''}`;
   }
 
   const statusTag = s => tag(s === 'done' ? 'up' : s === 'failed' ? 'down' : s === 'cancelled' ? '' : 'restart', s);
@@ -439,8 +546,8 @@ const Dash = (() => {
       return `<div class="msg">
         <div class="q"><div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${statusTag(overall)}</div><div class="q-text">${esc(g.text)}</div></div>
         ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => t.output
-          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)}</div><pre>${esc(t.output)}</pre></div>`
-          : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${t.status === 'queued' ? 'waiting for the agent to pick this up (within 5 minutes)…' : t.status === 'running' ? 'working on it…' : esc(t.status)}</div>`).join('')}
+          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)}</div>${md(t.output)}</div>`
+          : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${t.status === 'queued' ? (a.live ? 'sending…' : 'waiting for the agent to come online…') : t.status === 'running' ? `working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}…` : esc(t.status)}</div>`).join('')}
       </div>`;
     }).join('');
     const offline = ag.filter(a => !a.online).map(a => hostOf(a));
@@ -560,6 +667,7 @@ const Dash = (() => {
         start: `Start ${name}?`, shutdown: `Shut down ${name}? Its services stop until you start it again.`,
         reboot: `Reboot ${name}? Its services are briefly unavailable.`, snapshot: `Take a snapshot of ${name}?`,
         backup: `Back up ${name} now to the backup storage?`,
+        check: `Check ${name} for updates now? (Refreshes its package list; nothing is installed.)`,
         update: `Install all pending updates on ${name} now? A snapshot is taken first and it rolls back automatically if services break.`,
         'update-all': `Run the full nightly update on ${name} now? Every container is snapshotted, updated and checked one by one.`,
         'check-updates': `Check ${name} for host package updates now?`,
@@ -568,7 +676,7 @@ const Dash = (() => {
       act.disabled = true;
       try {
         await api(`api/infra/${encodeURIComponent(agent)}/actions`, { method: 'POST', body: { type, vmid: vmid ? Number(vmid) : null } });
-        toast('Queued. The agent runs it within 5 minutes; progress shows here.');
+        toast('Sent. Progress shows here.');
         await load(state.data); rerender();
       } catch (err) { toast(err.message, true); act.disabled = false; }
       return;
@@ -582,7 +690,7 @@ const Dash = (() => {
         if (!confirm(`${dec.dataset.decide === 'approve' ? 'Approve' : 'Deny'}: ${what}?`)) return;
         dec.disabled = true;
         await api(`api/infra/${encodeURIComponent(agent)}/decision`, { method: 'POST', body: { id, decision: dec.dataset.decide } });
-        toast(dec.dataset.decide === 'approve' ? `Approved. ${agent} acts on it within 5 minutes.` : 'Denied.');
+        toast(dec.dataset.decide === 'approve' ? `Approved. ${agent} is starting on it.` : 'Denied.');
       } else if (cancel) {
         await api(`api/infra/${encodeURIComponent(cancel.dataset.agent)}/tasks/${cancel.dataset.cancel}/cancel`, { method: 'POST', body: {} });
         toast('Cancelled');
@@ -610,7 +718,7 @@ const Dash = (() => {
       st.drafts[agent] = '';
       form.text.value = '';
       form.text.blur();
-      toast(agent === '_all' ? 'Sent to every agent. They pick it up within 5 minutes.' : `Sent to ${agent}. It picks it up within 5 minutes.`);
+      toast(agent === '_all' ? 'Sent to every agent.' : `Sent to ${agent}.`);
       await load(state.data); rerender();
     } catch (err) { toast(err.message, true); } finally { btn.disabled = false; }
   });
