@@ -220,6 +220,7 @@ const Dash = (() => {
   const usageTotal = u => (u ? (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) : 0);
   function usageLine(u) {
     if (!u) return '';
+    if (u.script) return '<span class="usage-line script" title="Answered by a script on the agent from live data. Start a message with /ai to ask Claude instead.">⚡ script · no Claude tokens</span>';
     return `<span class="usage-line" title="${esc(`input ${u.input || 0} · output ${u.output || 0} · cache read ${u.cacheRead || 0} · cache write ${u.cacheWrite || 0}${u.model ? ` · ${u.model}` : ''}`)}">${kTok(usageTotal(u))} tokens${u.cost ? ` · $${Number(u.cost).toFixed(2)}` : ''}${u.turns ? ` · ${u.turns} step${u.turns > 1 ? 's' : ''}` : ''}${u.ms ? ` · ${duration(u.ms / 1000)}` : ''}</span>`;
   }
   function answer(output, id) {
@@ -365,7 +366,7 @@ const Dash = (() => {
           <span class="core-state ${cls}">${c.status === 'up' ? 'Up' : c.status === 'down' ? 'DOWN' : c.status === 'degraded' ? 'Degraded' : 'Unknown'}</span></div>
         <div class="core-ports">${Object.entries(ports).map(([p, v]) => `<span class="${v != null ? 'pct-good' : 'pct-bad'}">:${esc(p)} ${v != null ? '✓' : '✗'}</span>`).join('')}
           ${ms.length ? `<span class="muted">${Math.min(...ms).toFixed(1)} ms</span>` : ''}
-          <span class="muted">${c.status === 'up' ? 'up' : 'state'} for ${esc(ago(c.since).replace(' ago', ''))}</span></div>
+          ${c.since ? `<span class="muted">${c.status === 'up' ? 'up' : c.status === 'down' ? 'down' : c.status === 'degraded' ? 'degraded' : 'unknown'} for ${esc(duration((Date.now() - c.since) / 1000).split(' ').slice(0, 2).join(' '))}</span>` : ''}</div>
         ${recentBars(c.recent || [], 48)}
         <div class="core-foot"><span>24 h ${pct(c.uptime24h)}</span><span class="muted">checked by ${by.length ? esc(by.map(([a]) => a).join(' + ')) : 'no agent right now'}</span></div>
       </div>`;
@@ -629,7 +630,7 @@ const Dash = (() => {
     const rows = cs.map(c => {
       const u = c.updates || {};
       const lu = c.lastUpdate;
-      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span></td><td>${esc(c.host)}</td>
+      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span><span class="sub-host muted">${esc(c.host)}</span></td><td>${esc(c.host)}</td>
         <td class="num">${u.count ?? '<span class="muted">—</span>'}</td><td class="num">${u.security ? `<span class="pct-bad">${u.security}</span>` : (u.count != null ? '0' : '')}</td>
         <td>${u.checkedAt ? esc(ago(u.checkedAt)) : '<span class="muted">tonight</span>'}</td>
         <td>${lu ? `<span class="${lu.result === 'ok' ? 'pct-good' : lu.result === 'held' ? 'pct-warn' : 'pct-bad'}">${esc(lu.result)}</span> <span class="muted">${esc(ago(lu.t))}</span>` : '<span class="muted">—</span>'}</td>
@@ -671,7 +672,7 @@ const Dash = (() => {
 
     const kpis = `<div class="kpis">
       ${kpi('Fresh backups', `${fresh}<span class="kpi-of">/${covered.length}</span>`, 'containers backed up in the last 26 h', fresh < covered.length ? 'warn' : '')}
-      ${kpi('Not covered', uncovered.length, uncovered.length ? esc(uncovered.map(c => c.name).join(', ')) : 'every container is in a job', uncovered.length ? 'warn' : '')}
+      ${kpi('Not covered', uncovered.length, uncovered.length ? esc(uncovered.map(c => (cs.filter(x => x.name === c.name).length > 1 ? `${c.name} (${c.host})` : c.name)).join(', ')) : 'every container is in a job', uncovered.length ? 'warn' : '')}
       ${kpi('Failed runs (24 h)', failed24, failed24 ? 'see runs below' : 'all good', failed24 ? 'bad' : '')}
       ${kpi('Container backups', bytes(total), 'total size kept (all versions)')}
       ${[...bstore.values()].map(s => kpi(`Storage ${s.name}`, `${Math.round(s.used / s.total * 100)}%`, `${bytes(s.used)} of ${bytes(s.total)}`, s.used / s.total > 0.9 ? 'bad' : s.used / s.total > 0.75 ? 'warn' : '')).join('')}
@@ -685,7 +686,7 @@ const Dash = (() => {
       const b = c.backup || {};
       const age = backupAge(c);
       const snaps = (c.snapshots || []).length;
-      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span></td><td>${esc(c.host)}</td>
+      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span><span class="sub-host muted">${esc(c.host)}</span></td><td>${esc(c.host)}</td>
         <td>${b.covered ? '<span class="pct-good">yes</span>' : '<span class="pct-bad">no</span>'}</td>
         <td><span class="${ageCls(age)}">${b.last ? esc(ago(b.last.t)) : 'never'}</span></td>
         <td class="num">${b.last && b.last.size ? bytes(b.last.size) : '—'}</td>
@@ -855,7 +856,7 @@ const Dash = (() => {
         ${toSeg}
         <div class="composer-box"><textarea name="text" rows="1" maxlength="4000" aria-label="Message" placeholder="${chat ? 'Reply — the agent remembers this conversation…' : 'Ask a question or describe what to fix…'}">${esc(st.drafts[draftKey] || '')}</textarea>
           <button class="btn primary send" type="submit">Send</button></div>
-        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'}${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
+        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'} · simple requests (ping, status, restart, disk, updates…) are answered by a script for free; start with <code>/ai</code> to always ask Claude${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
       </form>`;
     const main = `<section class="ask-main">${head}<div class="convo" data-convo="${esc(draftKey)}">${msgs || welcome}</div>${form}</section>`;
 
@@ -938,7 +939,7 @@ const Dash = (() => {
 
   // How much Claude the agents used (from each run's own token report).
   function usageSum(list, key) {
-    const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, scripted: 0 };
     for (const a of list) { const u = a.report && a.report.usage && a.report.usage[key]; if (u) for (const k in o) o[k] += u[k] || 0; }
     return o;
   }
@@ -957,7 +958,7 @@ const Dash = (() => {
     const recent = [];
     for (const a of list) for (const r of ((a.report && a.report.usage && a.report.usage.recent) || [])) recent.push({ ...r, agent: a.name });
     recent.sort((x, y) => y.t - x.t);
-    const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices</div></div>`;
+    const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} Claude run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices${u.scripted ? ` · <span class="pct-good">⚡ ${u.scripted} answered by scripts</span>` : ''}</div></div>`;
     return `<div class="usage">
       <div class="kpis">${tile('Today', today)}${tile('Last 7 days', week)}${tile('Last 30 days', month)}</div>
       <div><div class="usage-bars">${bars}</div><div class="bars-legend"><span>30 days ago</span><span>Today</span></div></div>

@@ -17,6 +17,7 @@
   --nodata: #e5e7eb;
   --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
   --radius: 12px;
+  --topbar-h: 62px; /* set to the real header height by app.js */
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -247,7 +248,7 @@ label.check input { width: auto; }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
 #toast.error { background: var(--down); color: #fff; }
 
-.footer { max-width: 1100px; margin: 0 auto; padding: 0 16px 28px; color: var(--muted); font-size: 12.5px; display: flex; gap: 8px; justify-content: center; }
+.footer { padding: 6px 0 0; color: var(--muted); font-size: 12.5px; display: flex; gap: 8px; justify-content: center; }
 
 /* ---------- responsive ---------- */
 @media (max-width: 760px) {
@@ -282,7 +283,7 @@ body.with-nav .topbar { padding-left: max(16px, calc((100% - 1440px) / 2 + 20px)
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; align-content: start; }
 /* Short pages must not stretch their rows to fill the sidebar's full height (big gaps on Containers). */
 main, .view > [id^="v-"] { align-content: start; }
-.sidenav { position: sticky; top: 57px; align-self: start; height: calc(100vh - 57px); padding: 18px 10px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); }
+.sidenav { position: sticky; top: var(--topbar-h); align-self: start; height: calc(100vh - var(--topbar-h)); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; padding: 18px 10px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); }
 .sidenav a { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 550; }
 .sidenav a:hover { background: var(--panel-2); color: var(--text); }
 .sidenav a.active { background: var(--panel); color: var(--text); box-shadow: var(--shadow); border: 1px solid var(--border); padding: 7px 11px; }
@@ -421,7 +422,7 @@ details > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 /* layout: small screens get the nav as a scrolling tab bar */
 @media (max-width: 900px) {
   body.with-nav .shell { display: block; }
-  .sidenav { position: sticky; top: 57px; z-index: 9; height: auto; flex-direction: row; overflow-x: auto; padding: 6px 10px; border-right: 0; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(8px); }
+  .sidenav { position: sticky; top: var(--topbar-h); z-index: 9; height: auto; overflow-y: visible; flex-direction: row; overflow-x: auto; padding: 6px 10px; border-right: 0; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(8px); }
   .sidenav a { flex: none; padding: 6px 10px; }
   .sidenav a.active { padding: 5px 9px; }
   body.with-nav main { padding: 16px 14px 40px; }
@@ -733,3 +734,24 @@ a.head-status:hover { filter: brightness(.95); }
   .ct-runs th:nth-child(2), .ct-runs td:nth-child(2), .ct-runs th:nth-child(5), .ct-runs td:nth-child(5), .ct-runs th:nth-child(6), .ct-runs td:nth-child(6) { display: none; }
   .ct-runs td.wrap { min-width: 160px; }
 }
+.usage-line.script { color: var(--up); font-weight: 600; }
+
+/* narrow phones: toolbars wrap instead of pushing the page sideways */
+.filters { flex-wrap: wrap; }
+.svc-head { flex-wrap: wrap; min-width: 0; }
+.svc-head .muted { overflow-wrap: anywhere; }
+@media (max-width: 520px) {
+  .filters { width: 100%; }
+  .filters input { flex: 1; min-width: 0; width: auto; }
+  .section-head > h3 { min-width: 0; }
+}
+@media (max-width: 520px) {
+  .svc-card { min-width: 0; }
+  .svc-row { grid-template-columns: 58px minmax(0, 1fr) 70px 48px; }
+  .svc-row .svc-bars { display: none; }
+}
+
+/* Updates/Backups hide the Host column on phones: show the host under the name instead */
+@media (max-width: 760px) { .ct-updates .sub-host, .ct-backups .sub-host { display: block; padding-left: 16px; } }
+/* "nothing here" rows span the table: let them wrap */
+.ctable td[colspan] { white-space: normal; }

@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -276,7 +276,7 @@ def usage_report(s):
     daily = s.get("usageDaily", {})
     def total(days):
         keys = [time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400)) for i in range(days)]
-        out = {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0}
+        out = {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0, "scripted": 0}
         for k in keys:
             for f in out:
                 out[f] += (daily.get(k) or {}).get(f, 0)
@@ -750,9 +750,14 @@ def autofix(s, host, containers):
                 if rc == 0:
                     event("warn", f"{c['name']} ({vmid}) was {c['status']}; started it again", s)
                     c["status"] = "starting"
+                elif "locked" in out and "BUSY" not in ssh("pgrep -f 'vzdump|pct snapshot|pct rollback' >/dev/null && echo BUSY")[1] \
+                        and ssh(f"pct unlock {vmid}")[0] == 0 and ssh(f"pct start {vmid}", 120)[0] == 0:
+                    # A lock left behind by an interrupted backup/snapshot: nothing is running, so clear it (no Claude).
+                    event("warn", f"{c['name']} ({vmid}) was stuck with a stale lock ({out.strip()[-80:]}); unlocked and started it", s)
+                    c["status"] = "starting"
                 else:
                     event("error", f"{c['name']} ({vmid}) is {c['status']} and would not start: {out[-200:]}", s)
-                    if cooled(s, f"claudefix:{vmid}", 6 * 3600):
+                    if cooled(s, f"claudefix:{vmid}", int(CFG.get("autofix_claude_hours", 24)) * 3600):
                         queue_internal_task(s, f"Container {c['name']} (vmid {vmid}) on this host is {c['status']} and "
                                                f"`pct start {vmid}` failed with:\n{out[-1500:]}\n\nFind out why and fix it "
                                                f"so it runs again. Take a snapshot first if you change anything inside it.")
@@ -972,6 +977,310 @@ def handle_replies(replies):
 
 # ------------------------------------------------------------------ tasks (Claude)
 
+# ------------------------------------------------------------------ quick answers (no Claude)
+# Simple requests (ping, status, start/restart, disk use, failing services, updates, backups, ...) are answered by a
+# script straight from live data, so they cost no Claude tokens. Anything else, or a message that starts with /ai,
+# goes to Claude as before.
+
+DC_PREFIX = re.compile(r"^\[Datacenter-wide request:[^\]]*\]\s*", re.S)
+FORCE_AI = re.compile(r"^\s*(/ai|/claude|claude[:,])\s*", re.I)
+SCRIPT_NOTE = "\n\n*⚡ Answered by a script from live data — no Claude tokens used. Start a message with `/ai` to ask Claude instead.*"
+
+
+def _bytes(n):
+    n = float(n or 0)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+
+def _pct(a, b):
+    return f"{(a or 0) / b * 100:.0f}%" if b else "—"
+
+
+def _ago(ms):
+    if not ms:
+        return "never"
+    m = (now_ms() - ms) / 60000
+    return f"{m:.0f} min ago" if m < 90 else f"{m / 60:.0f} h ago" if m < 48 * 60 else f"{m / 1440:.0f} days ago"
+
+
+def _snapshot():
+    with state() as s:
+        last = s.get("lastCollect") or {}
+        return (last.get("host") or {}), (last.get("containers") or []), list(s.get("serviceChecks") or []), \
+            (s.get("slow") or {}), list(s.get("updateRuns") or [])
+
+
+def _find(containers, word, exact_only=False):
+    """Containers matching a name or vmid (exact match first, then substring unless exact_only)."""
+    w = word.lower().strip(" .,!?'\"`")
+    if not w:
+        return []
+    exact = [c for c in containers if str(c["vmid"]) == w or (c.get("name") or "").lower() == w]
+    if exact or exact_only:
+        return exact
+    return [c for c in containers if w in (c.get("name") or "").lower()] if len(w) >= 3 else []
+
+
+def _ip_of(c, services):
+    ip = next((x.get("ip") for x in services if x.get("vmid") == c["vmid"] and x.get("ip")), None)
+    if ip:
+        return ip
+    rc, conf = ssh(f"pct config {int(c['vmid'])}")
+    m = re.search(r"ip=(\d+\.\d+\.\d+\.\d+)", conf)
+    return m.group(1) if m else None
+
+
+def _ping(ip, count=3):
+    try:
+        p = subprocess.run(["ping", "-c", str(count), "-W", "2", ip], capture_output=True, text=True, timeout=count * 3 + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None, "100%"
+    avg = re.search(r"= [\d.]+/([\d.]+)/", p.stdout)
+    loss = re.search(r"([\d.]+)% packet loss", p.stdout)
+    return p.returncode == 0, (float(avg.group(1)) if avg else None), (f"{loss.group(1)}%" if loss else "?")
+
+
+def _table(head, rows):
+    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    out += ["| " + " | ".join(str(x).replace("|", "/") for x in r) + " |" for r in rows]
+    return "\n".join(out)
+
+
+def q_ping(targets_text):
+    host, cts, services, _, _ = _snapshot()
+    filler = {"the", "container", "containers", "ct", "lxc", "please", "to", "from", "host", "and", "for", "me", "now"}
+    words = [w for w in re.split(r"[\s,]+", targets_text) if w.strip(" .,!?") and w.strip(" .,!?").lower() not in filler]
+    if re.search(r"\b(all|everything|every container|all containers)\b", targets_text):
+        targets = [(c["name"], _ip_of(c, services)) for c in cts if c["status"] == "running"]
+    else:
+        targets = []
+        for w in words:
+            w = w.strip(" .,!?'\"`")
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", w) or re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", w, re.I):
+                targets.append((w, w))
+                continue
+            found = _find(cts, w)
+            if len(found) != 1:
+                return None  # not clearly a container or address: let Claude handle it
+            targets.append((found[0]["name"], _ip_of(found[0], services)))
+    if not targets:
+        return None
+    rows = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda t: (t, _ping(t[1]) if t[1] else (False, None, "no IP")), targets[:40]))
+    for (name, ip), (ok, avg, loss) in results:
+        rows.append([f"**{name}**", ip or "—", "✅ replies" if ok else "❌ no reply", f"{avg:.1f} ms" if avg is not None else "—", loss])
+    bad = sum(1 for _, r in results if not r[0])
+    head = "All reachable." if not bad else f"**{bad} of {len(results)} did not answer.**"
+    return f"### Ping from {CFG['name']}\n{head}\n\n" + _table(["Target", "IP", "Result", "Avg", "Loss"], rows)
+
+
+def q_status(word):
+    host, cts, services, _, _ = _snapshot()
+    found = _find(cts, word)
+    if len(found) != 1:
+        return None
+    c = found[0]
+    rc, st = ssh(f"pct status {int(c['vmid'])}")
+    status = st.replace("status:", "").strip() or c["status"]
+    mine = [x for x in services if x.get("vmid") == c["vmid"]]
+    lines = [f"### {c['name']} ({c['vmid']}) is **{status}**",
+             f"- CPU {float(c.get('cpu') or 0) * 100:.0f}% · memory {_bytes(c.get('mem'))} of {_bytes(c.get('maxmem'))} · "
+             f"disk {_bytes(c.get('disk'))} of {_bytes(c.get('maxdisk'))} ({_pct(c.get('disk'), c.get('maxdisk'))})"]
+    if mine:
+        lines.append("- Services: " + ", ".join(
+            f"{'✅' if x.get('ok') else '❌'} {(':' + str(x['port'])) if x.get('port') else 'ping'}{(' ' + x['proc']) if x.get('proc') and x.get('port') else ''}"
+            for x in sorted(mine, key=lambda x: x.get("port") or 0)))
+    u = c.get("updates") or {}
+    if u:
+        lines.append(f"- Updates: {u.get('count', 0)} pending ({u.get('security', 0)} security), checked {_ago(u.get('checkedAt'))}")
+    lu = c.get("lastUpdate") or {}
+    if lu:
+        lines.append(f"- Last update: {lu.get('result')} {_ago(lu.get('t'))} — {lu.get('msg', '')}")
+    return "\n".join(lines)
+
+
+def q_power(verb, word):
+    host, cts, _, _, _ = _snapshot()
+    found = _find(cts, word, exact_only=True)  # never guess which container to stop or restart
+    if len(found) != 1:
+        return None
+    c = found[0]
+    vmid, name = int(c["vmid"]), c["name"]
+    verb = {"restart": "reboot", "stop": "shutdown", "shut down": "shutdown", "shutdown": "shutdown"}.get(verb, verb)
+    if vmid == CFG.get("self_vmid"):
+        if verb == "shutdown":
+            return f"I won't shut down **{name}**: it is this agent's own container."
+        if verb == "reboot":
+            ssh(f"systemd-run --on-active=20 --unit=hl-selfreboot-{int(time.time())} pct reboot {vmid}")
+            return f"**{name}** (this agent's own container) reboots in 20 seconds."
+    cmd = {"start": f"pct start {vmid}", "shutdown": f"pct shutdown {vmid} --timeout 120", "reboot": f"pct reboot {vmid} --timeout 120"}[verb]
+    rc, out = ssh(cmd, 300)
+    rc2, st = ssh(f"pct status {vmid}")
+    event("info" if rc == 0 else "error", f"{verb} {name} ({vmid}) from chat: {'done' if rc == 0 else out[-150:]}")
+    word_done = {"start": "Started", "shutdown": "Shut down", "reboot": "Rebooted"}[verb]
+    return (f"{word_done} **{name}** ({vmid}). Now: `{st.strip()}`" if rc == 0
+            else f"❌ `{cmd}` failed:\n```\n{out[-1500:]}\n```\nNow: `{st.strip()}`")
+
+
+def q_top(what):
+    host, cts, _, _, _ = _snapshot()
+    key = {"disk": ("disk", "maxdisk"), "storage": ("disk", "maxdisk"), "space": ("disk", "maxdisk"),
+           "memory": ("mem", "maxmem"), "ram": ("mem", "maxmem"), "cpu": ("cpu", None)}[what]
+    rows = []
+    if key[1] is None:
+        for c in sorted(cts, key=lambda c: -(c.get("cpu") or 0)):
+            rows.append([f"**{c['name']}**", c["vmid"], f"{float(c.get('cpu') or 0) * 100:.1f}%", c["status"]])
+        return f"### CPU use on {host.get('node') or CFG['name']}\n" + _table(["Container", "ID", "CPU", "Status"], rows[:25])
+    used, total = key
+    for c in sorted(cts, key=lambda c: -(c.get(used) or 0)):
+        rows.append([f"**{c['name']}**", c["vmid"], _bytes(c.get(used)), _bytes(c.get(total)), _pct(c.get(used), c.get(total))])
+    label = "Disk" if used == "disk" else "Memory"
+    extra = ""
+    if used == "disk":
+        extra = "\n\nHost storage: " + ", ".join(f"{x['name']} {_pct(x.get('used'), x.get('total'))} of {_bytes(x.get('total'))}"
+                                                 for x in host.get("storage") or [])
+    return f"### {label} use on {host.get('node') or CFG['name']}\n" + _table(["Container", "ID", "Used", "Size", "%"], rows[:25]) + extra
+
+
+def q_list():
+    host, cts, services, _, _ = _snapshot()
+    rows = [[f"**{c['name']}**", c["vmid"], ("✅ " if c["status"] == "running" else "⛔ ") + c["status"],
+             f"{float(c.get('cpu') or 0) * 100:.0f}%", _pct(c.get("mem"), c.get("maxmem")), _pct(c.get("disk"), c.get("maxdisk"))]
+            for c in sorted(cts, key=lambda c: c["vmid"])]
+    return f"### Containers on {host.get('node') or CFG['name']} ({len(cts)})\n" + _table(["Name", "ID", "Status", "CPU", "Mem", "Disk"], rows)
+
+
+def q_problems():
+    host, cts, services, slow, _ = _snapshot()
+    items = []
+    for c in cts:
+        if c.get("onboot") and c["status"] != "running":
+            items.append(f"⛔ **{c['name']}** ({c['vmid']}) is {c['status']} but should run on boot")
+    for x in services:
+        if not x.get("ok"):
+            what = f":{x['port']}" + (f" ({x['proc']})" if x.get("proc") else "") if x.get("port") else "ping"
+            items.append(f"❌ **{x.get('container')}** {what} at {x.get('ip')} — {x.get('err') or 'no answer'}")
+    for c in cts:
+        if c.get("maxdisk") and (c.get("disk") or 0) / c["maxdisk"] >= 0.9:
+            items.append(f"⚠️ **{c['name']}** disk {_pct(c.get('disk'), c.get('maxdisk'))} full")
+    for x in host.get("storage") or []:
+        if x.get("total") and (x.get("used") or 0) / x["total"] >= 0.9:
+            items.append(f"⚠️ host storage **{x['name']}** {_pct(x.get('used'), x.get('total'))} full")
+    if host.get("rebootRequired"):
+        items.append("ℹ️ the Proxmox host needs a reboot to finish updates")
+    ok = sum(1 for x in services if x.get("ok"))
+    head = f"### {host.get('node') or CFG['name']}: " + ("nothing is failing" if not items else f"{len(items)} problem(s)")
+    return head + f"\n{ok} of {len(services)} service checks answered just now." + ("\n\n" + "\n".join(f"- {i}" for i in items) if items else "")
+
+
+def q_updates(word=None):
+    host, cts, _, _, _ = _snapshot()
+    if word:
+        found = _find(cts, word)
+        if len(found) != 1:
+            return None
+        c = found[0]
+        rc, o = cx(c["vmid"], "command -v apt-get >/dev/null || { echo NOAPT; exit 0; }; apt-get update -q >/dev/null 2>&1; apt list --upgradable 2>/dev/null", 900)
+        if "NOAPT" in o:
+            return f"**{c['name']}** does not use apt."
+        pkgs = parse_upgradable(o)
+        sec = [p for p in pkgs if p["security"]]
+        set_container(c["vmid"], updates={"count": len(pkgs), "security": len(sec), "checkedAt": now_ms()})
+        if not pkgs:
+            return f"**{c['name']}** is up to date."
+        return (f"### {c['name']}: {len(pkgs)} update(s), {len(sec)} security\n" +
+                _table(["Package", "From", "To", ""], [[p["name"], p["old"], p["new"], "🔒 security" if p["security"] else ""] for p in pkgs[:80]]))
+    rows = [[f"**{c['name']}**", c["vmid"], (c.get("updates") or {}).get("count", "?"), (c.get("updates") or {}).get("security", "?"),
+             _ago((c.get("updates") or {}).get("checkedAt"))]
+            for c in sorted(cts, key=lambda c: (-((c.get("updates") or {}).get("security") or 0), -((c.get("updates") or {}).get("count") or 0)))]
+    hu = host.get("updates") or {}
+    return (f"### Pending updates on {host.get('node') or CFG['name']}\nHost: {hu.get('count', '?')} package(s), {hu.get('security', '?')} security.\n\n" +
+            _table(["Container", "ID", "Pending", "Security", "Checked"], rows))
+
+
+def q_backups():
+    host, cts, _, slow, _ = _snapshot()
+    rows = []
+    for c in sorted(cts, key=lambda c: c["vmid"]):
+        b = ((slow.get("backups") or {}).get(str(c["vmid"])) or {})
+        last = b.get("last") or {}
+        rows.append([f"**{c['name']}**", c["vmid"], _ago(last.get("t")) if last else "never", _bytes(last.get("size")) if last.get("size") else "—",
+                     last.get("verified") or "—", b.get("count") or 0])
+    failed = [t for t in (slow.get("tasks") or []) if t.get("status") not in ("OK", "running") and now_ms() - (t.get("t") or 0) < 86400e3]
+    return (f"### Backups on {host.get('node') or CFG['name']}\n" + (f"**{len(failed)} backup run(s) failed in the last 24 h.**\n\n" if failed else "No failed backup runs in the last 24 h.\n\n") +
+            _table(["Container", "ID", "Last backup", "Size", "Verified", "Kept"], rows))
+
+
+def q_host():
+    host, cts, _, _, _ = _snapshot()
+    up = host.get("uptime") or 0
+    running = sum(1 for c in cts if c["status"] == "running")
+    return (f"### {host.get('node') or CFG['name']} ({host.get('ip')})\n"
+            f"- Up {up // 86400} d {up % 86400 // 3600} h · load {' '.join(str(x) for x in host.get('loadavg') or [])} · CPU {float(host.get('cpu') or 0) * 100:.0f}%\n"
+            f"- Memory {_bytes((host.get('memory') or {}).get('used'))} of {_bytes((host.get('memory') or {}).get('total'))}\n"
+            f"- Containers: {running} of {len(cts)} running\n"
+            f"- PVE {host.get('pveVersion') or '?'} · kernel {host.get('kernel') or '?'}" + (" · **reboot needed**" if host.get("rebootRequired") else "") + "\n"
+            f"- Storage: " + ", ".join(f"{x['name']} {_pct(x.get('used'), x.get('total'))}" for x in host.get("storage") or []))
+
+
+def q_lastrun():
+    _, _, _, _, runs = _snapshot()
+    if not runs:
+        return "No update run has happened on this host yet."
+    r = runs[-1]
+    return f"### Last update run ({time.strftime('%Y-%m-%d %H:%M', time.localtime(r['t'] / 1000))})\n```\n{r['summary'][:6000]}\n```"
+
+
+QUICK = [
+    (r"^(?:please\s+|can you\s+|could you\s+)?ping\s+(.+?)(?:\s+(?:for me|please|now))?$", lambda m: q_ping(m.group(1))),
+    (r"^(?:is|are)\s+(.+?)\s+(?:pingable|reachable|answering)$", lambda m: q_ping(m.group(1))),
+    (r"^(?:please\s+)?(start|restart|reboot|stop|shut ?down)\s+(?:the\s+)?(?:container\s+|ct\s+|lxc\s+)?(\S+)(?:\s+(?:container|now|please))*$",
+     lambda m: q_power(m.group(1).replace("shut down", "shutdown"), m.group(2))),
+    (r"^(?:what(?:'s| is)\s+(?:the\s+)?)?status(?:\s+of)?\s+(?:container\s+)?(\S+)$", lambda m: q_status(m.group(1))),
+    (r"^(?:is|are)\s+(?:container\s+)?(\S+)\s+(?:up|running|down|ok|online|working|healthy)$", lambda m: q_status(m.group(1))),
+    (r"^(\S+)\s+status$", lambda m: q_status(m.group(1))),
+    (r"^(?:which|what)\s+containers?\s+(?:use|uses|are using|is using)\s+(?:the\s+)?most\s+(disk|storage|space|memory|ram|cpu)(?:\s+space)?$",
+     lambda m: q_top(m.group(1))),
+    (r"^(?:show\s+)?(disk|storage|memory|ram|cpu)\s+(?:use|usage)(?:\s+per container)?$", lambda m: q_top(m.group(1))),
+    (r"^what(?:'s| is)\s+using\s+(?:the\s+)?most\s+(disk|storage|space|memory|ram|cpu)(?:\s+on this host)?$", lambda m: q_top(m.group(1))),
+    (r"^are (?:all )?(?:the )?containers (?:healthy|ok|running|up|fine)$", lambda m: q_problems()),
+    (r"^check (?:that )?(?:every|each|all) containers? (?:has|have) (?:a )?(?:recent )?backups?$", lambda m: q_backups()),
+    (r"^(?:list|show|what are)(?:\s+(?:all|the|my))*\s+containers$|^containers$", lambda m: q_list()),
+    (r"^(?:are\s+)?(?:any(?:thing)?|what(?:'s| is))\s+(?:services?\s+)?(?:failing|down|broken)(?:\s+right now|\s+now)?$|^(?:any\s+)?problems$|^health ?check$",
+     lambda m: q_problems()),
+    (r"^are any services failing(?: right now)?$", lambda m: q_problems()),
+    (r"^(?:check\s+(?:for\s+)?updates\s+(?:on|for|in)\s+(\S+))$", lambda m: q_updates(m.group(1))),
+    (r"^(?:which|what)\s+containers?\s+(?:have|has)\s+(?:security\s+)?updates(?:\s+waiting)?$|^(?:pending|any)\s+updates$|^updates$",
+     lambda m: q_updates()),
+    (r"^(?:show\s+)?(?:last|latest)?\s*backups?(?:\s+status)?$|^when was the last backup$", lambda m: q_backups()),
+    (r"^(?:host\s+status|uptime|load|how is the host(?: doing)?|host)$", lambda m: q_host()),
+    (r"^(?:summari[sz]e|show)\s+(?:the\s+)?(?:last night'?s|last|latest)\s+update(?:\s+run)?$", lambda m: q_lastrun()),
+]
+
+
+def quick_answer(text):
+    """The script's answer to a simple request, or None when Claude should handle it."""
+    t = DC_PREFIX.sub("", text).strip().lower()
+    t = re.sub(r"[?.!]+$", "", t).strip()
+    if not t or len(t) > 160 or "\n" in t:
+        return None
+    for pat, fn in QUICK:
+        m = re.match(pat, t)
+        if m:
+            try:
+                ans = fn(m)
+            except Exception as e:  # a script bug must not lose the question: fall back to Claude
+                log(f"quick answer failed ({e!r}); asking Claude", "warn")
+                return None
+            if ans:
+                return ans
+    return None
+
+
 def cmd_task(tid):
     with state() as s:
         t = s["tasks"].get(tid)
@@ -980,6 +1289,25 @@ def cmd_task(tid):
         text, by, internal = t["text"], t.get("by"), t.get("internal")
         chat = t.get("chat")
         session = (s.get("chatSessions") or {}).get(chat) if chat else None
+    # Simple requests get a scripted answer (no Claude). "/ai ..." skips that and always asks Claude.
+    pre = DC_PREFIX.match(text)
+    prefix = pre.group(0) if pre else ""
+    forced = FORCE_AI.match(text[len(prefix):])
+    if forced:
+        text = prefix + (text[len(prefix) + forced.end():] or text[len(prefix):])
+    elif not internal and CFG.get("quick_answers", True):
+        ans = quick_answer(text)
+        if ans:
+            with state() as s:
+                t = s["tasks"].get(tid)
+                if t:
+                    t.update(status="done", output=(ans + SCRIPT_NOTE)[-20000:], u=now_ms(), usage={"script": True})
+                d = s.setdefault("usageDaily", {}).setdefault(time.strftime("%Y-%m-%d"),
+                                                             {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0})
+                d["scripted"] = d.get("scripted", 0) + 1
+            log(f"answered by script (no Claude): {text[len(prefix):][:120]}")
+            sync_now()
+            return
     who = "this agent's own monitoring" if internal else f"{by} via the status dashboard"
     prompt = (f"Request from {who}:\n\n{text}\n\n"
               "You are this Proxmox host's homelab agent (see CLAUDE.md for the setup and rules). "
@@ -1050,8 +1378,42 @@ def fallback_risk(pkgs, removals):
     return ("high" if reasons else "low"), reasons
 
 
+def rules_risk(pkgs, removals):
+    """Built-in rules. Returns (risk, reasons, sure); sure=False means only a real review can tell."""
+    reasons, unsure = [], []
+    if removals:
+        reasons.append(f"would remove packages: {', '.join(removals[:10])}")
+    for p in pkgs:
+        if p["security"] or major(p["old"]) == major(p["new"]):
+            continue  # security fix, or a point release / Debian revision of the same major.minor
+        if RISKY_RE.match(p["name"]) and major(p["new"])[0] != major(p["old"])[0]:
+            reasons.append(f"{p['name']} major version {p['old']} -> {p['new']}")
+        else:
+            unsure.append(p)
+    if reasons:
+        return "high", reasons, True
+    if not unsure:
+        return "low", ["only security fixes and point releases"], True
+    return "low", [f"{len(unsure)} package(s) move to a new minor/major version"], False
+
+
 def risk_review(name, pkgs, removals):
-    """Ask Claude whether these updates could break the container. Returns (risk, reasons)."""
+    """Could these updates break the container? Returns (risk, reasons). The built-in rules decide the clear cases;
+    Claude is asked only about packages that jump a minor/major version, and its verdict is reused for 14 days."""
+    mode = CFG.get("claude_review", "auto")  # auto | always | never
+    risk, reasons, sure = rules_risk(pkgs, removals)
+    if mode == "never" or (mode == "auto" and sure):
+        return risk, reasons + ["(decided by the built-in rules; Claude was not needed)"]
+    look = pkgs if mode == "always" else [p for p in pkgs if not p["security"] and major(p["old"]) != major(p["new"])]
+    key = hashlib.sha1(json.dumps([sorted((p["name"], p["new"]) for p in look), sorted(removals)]).encode()).hexdigest()[:16]
+    with state() as s:
+        cache = s.setdefault("reviewCache", {})
+        for k in [k for k, v in cache.items() if now_ms() - v.get("t", 0) > 14 * 86400e3]:
+            cache.pop(k)
+        hit = cache.get(key)
+    if hit:
+        return hit["risk"], hit["reasons"] + ["(same packages were reviewed before; reused that verdict)"]
+    pkgs = look
     listing = "\n".join(f"{p['name']} {p['old']} -> {p['new']} ({p['suite']})" for p in pkgs[:300])
     prompt = (f"You are reviewing pending apt updates for the Proxmox LXC container '{name}' before they are installed "
               f"automatically overnight (non-interactive, keeping existing config files, with a snapshot and automatic "
@@ -1068,7 +1430,10 @@ def risk_review(name, pkgs, removals):
         try:
             j = json.loads(m.group(0))
             if j.get("risk") in ("low", "high"):
-                return j["risk"], [str(r) for r in j.get("reasons", [])][:10]
+                verdict = (j["risk"], [str(r) for r in j.get("reasons", [])][:10])
+                with state() as s:
+                    s.setdefault("reviewCache", {})[key] = {"t": now_ms(), "risk": verdict[0], "reasons": verdict[1]}
+                return verdict
         except json.JSONDecodeError:
             pass
     risk, reasons = fallback_risk(pkgs, removals)

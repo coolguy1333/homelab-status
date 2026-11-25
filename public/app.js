@@ -718,6 +718,11 @@ $('#themeBtn').addEventListener('click', () => {
 });
 
 // ------------------------------------------------------------------ boot
+// The sidebar sticks right under the header and is exactly as tall as the rest of the window, so it never
+// pokes out below the screen (which made short pages scroll a few pixels and the sidebar jump).
+function setTopbarHeight() { document.documentElement.style.setProperty('--topbar-h', `${$('.topbar').offsetHeight}px`); }
+setTopbarHeight();
+if (window.ResizeObserver) new ResizeObserver(setTopbarHeight).observe($('.topbar'));
 showLoginErrorFromUrl();
 refresh();
 setInterval(() => { if (!document.hidden && !$('dialog[open]')) refresh(); }, REFRESH_MS);
