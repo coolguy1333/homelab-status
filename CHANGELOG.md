@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.7.0
+
+- **Agent logs on the dashboard.** A new **Logs** page shows each agent's own log (what it ran, warnings, errors),
+  refreshed every 5 s, with a host filter, "warnings & errors" filter, search, copy and download.
+- **Update logs.** Every update (nightly run, run-now, single container, approved update) keeps a step-by-step log:
+  package list, review result, plan, snapshot, the apt output, reboot, health check and rollback. The progress card
+  on the Updates page shows it live; afterwards **View log** opens it (Updates → host card → Update logs, and the
+  Logs page). Logs of the last 40 runs per host are kept in `runlogs.json`.
+- One-click container actions get **View output** (for updates this includes the full log).
+- Agent 1.8.0: writes `~/agent/logs/agent.log` and sends its tail with each report and quick sync; update runs record
+  their own log.
+
 ## 2.6.0
 
 - **Security-only updates.** Each host's nightly run can be switched between "everything low-risk" (as before) and

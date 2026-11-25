@@ -12,6 +12,7 @@ and keeps all of its features (monitors, Google sign-in, webhook alerts, peers).
 | **Uptime** | Public monitors (tunnel hostnames and WebManager sites are added automatically) and internal services found inside containers, checked on the LAN |
 | **Ask agents** | A chat inbox: questions and fix requests to one host's agent, or to every agent at once (**Datacenter**). Follow-ups remember the conversation; messages can be copied, asked again, cancelled or deleted |
 | **Activity** | Everything the agents did or noticed |
+| **Logs** | Each update run step by step (apt output included) with a live view while it runs, and the agents' own log (search, filter, copy, download) |
 
 How it works: an agent on each Proxmox host (connector1 on GOD, connector2 on HELP) reports to this app every
 5 minutes. Each night it snapshots, risk-reviews, updates, and health-checks every container, and rolls back if

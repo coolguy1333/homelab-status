@@ -69,13 +69,14 @@ function selectingIn(el) {
 }
 
 const Dash = (() => {
-  const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity'];
+  const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity', 'logs'];
   const st = {
     data: null, error: null, loading: false,
     open: new Set(), expanded: new Set(), sel: new Map(),
     drafts: {},                         // composer text per chat id ("new" = a chat not started yet)
     askChat: null, askTo: '_all',       // open chat ('new' or an id) and who a new chat goes to
     askFilter: '', askQ: '', askPane: 'list', stickBottom: false,
+    logf: { agent: '', level: '', q: '' }, logLines: {}, logsAt: 0, logsLoading: false, logErr: null,
     filters: { host: '', status: '', q: '', level: '', ahost: '', upd: '' },
   };
 
@@ -290,6 +291,7 @@ const Dash = (() => {
       ${progressBar(p)}
       <div class="up-sub"><span>${p.kind === 'run' ? `<b>${p.done}</b> of <b>${p.total}</b> containers done` : `<b>${Math.round(progPct(p))}%</b>`}</span>
         <span class="up-now">${stale ? `<span class="pct-warn">No progress reported for ${esc(ago(Math.max(p.u || 0, p.at || 0)).replace(' ago', ''))} — the run may have stopped</span>` : `Now: ${esc(progNow(p))}`}</span></div>
+      ${(p.log || []).length ? `<div class="up-log-head muted">Live log</div>${logBox(p.log, `prog:${a.name}`, { proc: false })}` : ''}
       ${res.length ? details(`progres:${a.name}`, `Finished so far (${res.length})`, `<ul class="plain up-res">${res.map(r => `<li><span class="${resCls(r.r)}">●</span> ${esc(r.r)}</li>`).join('')}</ul>`) : ''}
     </div>`;
   }
@@ -522,7 +524,13 @@ const Dash = (() => {
     const a = agents().find(x => x.name === agent);
     const acts = ((a && a.tasks) || []).filter(t => t.action && (t.action.vmid ?? null) === vmid).slice(0, 4);
     if (!acts.length) return '';
-    return `<ul class="events act-log">${acts.map(t => `<li><time>${esc(ago(t.createdAt))}</time>${statusTag(t.status)}<span>${esc(t.text)} <span class="muted">by ${esc(t.by || '')}</span>${t.output && t.status !== 'queued' ? `<span class="muted"> — ${esc(t.output.split('\n').filter(Boolean).slice(-1)[0] || '').slice(0, 160)}</span>` : ''}</span></li>`).join('')}</ul>`;
+    return `<ul class="events act-log">${acts.map(t => {
+      const out = String(t.output || '');
+      if (out) copyables.set(`o:${t.id}`, out);
+      const first = (out.split('\n--- log ---')[0].split('\n').filter(Boolean).slice(-1)[0] || '').slice(0, 160);
+      return `<li><time>${esc(ago(t.createdAt))}</time>${statusTag(t.status)}<span>${esc(t.text)} <span class="muted">by ${esc(t.by || '')}</span>${out && t.status !== 'queued' ? `<span class="muted"> — ${esc(first)}</span>` : ''}
+        ${out.includes('\n') ? `<button class="linkbtn" data-viewout="${esc(t.id)}" data-title="${esc(t.text)}">View output</button>` : ''}</span></li>`;
+    }).join('')}</ul>`;
   }
 
   // ------------------------------------------------------------ Updates
@@ -576,6 +584,8 @@ const Dash = (() => {
         <div class="cd-actions"><button class="btn small" data-act="update-all" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">⟳ Run the nightly update now</button>
           <button class="btn small" data-act="update-all-security" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}" ${ctSec ? '' : 'title="No container reports security updates right now"'}>⛨ Security updates only${ctSec ? ` (${ctSec})` : ''}</button></div>
         ${actionLog(a.name, null)}
+        ${(a.runs || []).length ? details(`rl:${a.name}`, `Update logs (${a.runs.length})`, `<ul class="events run-list">${a.runs.map(r => `<li><time>${esc(fmtDate(r.t))}</time>${runTag(r.level)}<span>${esc(r.title)}${r.kind === 'run' ? ` · ${r.done}/${r.total}` : ''}${r.end && r.t ? ` · ${esc(duration((r.end - r.t) / 1000))}` : ''}${r.summary ? ` <span class="muted">— ${esc(r.summary)}</span>` : ''}
+          ${r.lines ? `<button class="linkbtn" data-runlog="${esc(r.id)}" data-agent="${esc(a.name)}">View log</button>` : ''}</span></li>`).join('')}</ul>`) : ''}
         ${runs.length ? details(`runs:${a.name}`, `Run history (${runs.length})`, `<ul class="events">${runs.slice().reverse().map(u => `<li><time>${esc(fmtDate(u.t))}</time>${levelTag(u.level)}<span><pre class="inline">${esc(u.summary)}</pre></span></li>`).join('')}</ul>`) : ''}
       </div>`;
     }).join('');
@@ -921,6 +931,95 @@ const Dash = (() => {
     </div>`;
   }
 
+  // ------------------------------------------------------------ Logs
+  // Agent log lines are { t, p (process: report, update, task, ...), l (info/warn/error), m }.
+  const runTag = l => tag(l === 'error' ? 'down' : l === 'warn' ? 'restart' : 'up', l === 'error' ? 'problems' : l === 'warn' ? 'warnings' : 'ok');
+  const sameDay = t => new Date(t).toDateString() === new Date().toDateString();
+  const fmtClock = t => new Date(t).toLocaleString(undefined, sameDay(t)
+    ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  function logBox(lines, key, { host = false, proc = true, empty: none = 'No log lines yet.' } = {}) {
+    const rows = lines.map(l => `<div class="ll ${l.l || 'info'}"><time>${esc(fmtClock(l.t))}</time>${host ? `<span class="lh">${esc(l.host || '')}</span>` : ''}${proc && l.p ? `<span class="lp">${esc(l.p)}</span>` : ''}<span class="lm">${esc(l.m)}</span></div>`).join('');
+    return `<div class="logbox" data-logbox="${esc(key)}">${rows || `<div class="ll muted">${esc(none)}</div>`}</div>`;
+  }
+  const logPlain = (lines, host = false) => lines.map(l => `${new Date(l.t).toISOString().replace('T', ' ').slice(0, 19)}  ${host && l.host ? `${l.host}  ` : ''}${l.p ? `[${l.p}] ` : ''}${l.l && l.l !== 'info' ? `${l.l.toUpperCase()}: ` : ''}${l.m}`).join('\n');
+
+  async function loadLogs() {
+    if (st.logsLoading) return;
+    st.logsLoading = true;
+    try {
+      const ag = agents().filter(a => a.report);
+      await Promise.all(ag.map(async a => { st.logLines[a.name] = (await api(`api/infra/${encodeURIComponent(a.name)}/logs`)).lines || []; }));
+      st.logsAt = Date.now(); st.logErr = null;
+    } catch (err) { st.logErr = err.message; st.logsAt = Date.now(); } finally { st.logsLoading = false; }
+  }
+
+  function runRows(list) {
+    return list.map(({ a, r }) => `<tr><td>${esc(fmtDate(r.t))}</td><td>${esc(hostOf(a))}</td><td class="wrap"><b>${esc(r.title)}</b>${r.summary ? `<div class="muted small">${esc(r.summary)}</div>` : ''}</td>
+      <td>${runTag(r.level)}</td><td class="num">${r.kind === 'run' ? `${r.done}/${r.total}` : ''}</td><td class="num">${r.end && r.t ? esc(duration((r.end - r.t) / 1000)) : '—'}</td>
+      <td class="row-actions">${r.lines ? `<button class="btn small" data-runlog="${esc(r.id)}" data-agent="${esc(a.name)}">View log</button>` : '<span class="muted small">not kept</span>'}</td></tr>`).join('');
+  }
+
+  function viewLogs() {
+    const ag = agents().filter(a => a.report);
+    const f = st.logf;
+    if (f.agent && !ag.some(a => a.name === f.agent)) f.agent = '';
+    const sel = f.agent ? ag.filter(a => a.name === f.agent) : ag;
+    if (!st.logsAt && !st.logsLoading) loadLogs().then(rerender);
+    let lines = [];
+    for (const a of sel) for (const l of (st.logLines[a.name] || [])) lines.push({ ...l, host: hostOf(a) });
+    lines.sort((x, y) => x.t - y.t);
+    const total = lines.length;
+    if (f.level) lines = lines.filter(l => l.l !== 'info');
+    if (f.q) { const q = f.q.toLowerCase(); lines = lines.filter(l => `${l.m} ${l.p}`.toLowerCase().includes(q)); }
+    lines = lines.slice(-800);
+    const old = sel.filter(a => !verGte(a.report.agentVersion, '1.8.0'));
+    const runs = [];
+    for (const a of sel) for (const r of (a.runs || [])) runs.push({ a, r });
+    runs.sort((x, y) => (y.r.t || 0) - (x.r.t || 0));
+    const running = sel.filter(a => a.progress);
+    return `${pageHead('Logs', 'What the agents are doing: every update run step by step (including apt output), one-click actions, answers, auto-fixes and errors.')}
+      <div class="toolbar">
+        <div class="seg" data-logf="agent">${[['', 'All hosts'], ...ag.map(a => [a.name, hostOf(a)])].map(([v, l]) => `<button class="${f.agent === v ? 'on' : ''}" data-val="${esc(v)}">${esc(l)}</button>`).join('')}</div>
+        <div class="seg" data-logf="level">${[['', 'Everything'], ['problems', 'Warnings & errors']].map(([v, l]) => `<button class="${f.level === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div>
+        <input type="search" class="search" data-logq placeholder="Search the log…" aria-label="Search the log" value="${esc(f.q)}">
+      </div>
+      ${old.length ? `<p class="hint">${esc(old.map(a => `${hostOf(a)} (agent ${a.report.agentVersion || '?'})`).join(', '))}: logs need agent 1.8 — re-run install.sh on that connector.</p>` : ''}
+      ${running.map(a => `<div class="card pad"><div class="att-head"><h3><span class="spin"></span> Live: ${esc(a.progress.title || `update on ${hostOf(a)}`)}</h3><a href="#updates">Progress →</a></div>${logBox(a.progress.log || [], `live:${a.name}`, { proc: false })}</div>`).join('')}
+      <h3 class="sec-title">Update runs</h3>
+      <div class="card table-card"><div class="table-wrap"><table class="ctable ct-runs">
+        <thead><tr><th>Started</th><th>Host</th><th>What</th><th>Result</th><th>Done</th><th>Took</th><th></th></tr></thead>
+        <tbody>${runRows(runs) || '<tr><td colspan="7" class="muted">No update runs logged yet. They appear here after the next update (agent 1.8+).</td></tr>'}</tbody></table></div></div>
+      <h3 class="sec-title">Agent log</h3>
+      <div class="card pad log-card">
+        <div class="att-head"><span class="muted">${st.logErr ? `<span class="pct-bad">${esc(st.logErr)}</span>` : `${lines.length}${lines.length !== total ? ` of ${total}` : ''} line${total === 1 ? '' : 's'} · newest at the bottom · refreshes every 5 s`}</span>
+          <span><button class="linkbtn" data-logcopy>Copy</button> · <button class="linkbtn" data-logdl>Download</button></span></div>
+        ${logBox(lines, 'agent', { host: sel.length > 1, empty: st.logsAt ? 'Nothing logged yet.' : 'Loading…' })}
+      </div>`;
+  }
+
+  // ---- log viewer dialog
+  let dlgText = '', dlgName = 'log.txt';
+  function openLogDialog(title, sub, html, text, name) {
+    $('#logTitle').textContent = title;
+    $('#logSub').textContent = sub || '';
+    $('#logBody').innerHTML = html;
+    dlgText = text; dlgName = name || 'log.txt';
+    const d = $('#logDialog');
+    if (!d.open) d.showModal();
+    const box = $('#logBody .logbox, #logBody pre');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+  function download(name, text) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+  // (runs before app.js defines $, so plain DOM calls here)
+  document.getElementById('logCopy').addEventListener('click', async () => { await copyText(dlgText); toast('Copied'); });
+  document.getElementById('logDownload').addEventListener('click', () => download(dlgName, dlgText));
+
   // ------------------------------------------------------------ Activity
   function viewActivity() {
     const f = st.filters;
@@ -984,11 +1083,14 @@ const Dash = (() => {
     badges(d);
     const target = view === 'uptime' ? $('#v-services') : $(`#v-${view}`);
     if (selectingIn(target)) return;
-    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices }[view];
+    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices, logs: viewLogs }[view];
+    // Log boxes stay scrolled to the newest line unless you scrolled up to read.
+    const boxes = new Map($$('.logbox', target).map(b => [b.dataset.logbox, b.scrollHeight - b.scrollTop - b.clientHeight < 30]));
     // Chat: stay pinned to the newest message unless you scrolled up to read.
     const cv = view === 'ask' && $('.convo', target);
     const pin = !cv || st.stickBottom || cv.scrollHeight - cv.scrollTop - cv.clientHeight < 60 || cv.dataset.convo !== (st.askChat || '');
     morph(target, fn(d));
+    for (const b of $$('.logbox', target)) if (boxes.get(b.dataset.logbox) !== false) b.scrollTop = b.scrollHeight;
     if (view === 'ask') {
       const nv = $('.ask-main .convo', target);
       if (nv && pin) nv.scrollTop = nv.scrollHeight;
@@ -1011,6 +1113,14 @@ const Dash = (() => {
     try { await load(d); } finally { st.loading = false; }
     rerender();
   }, 3000);
+
+  // The Logs page tails the agent logs.
+  setInterval(async () => {
+    const d = typeof state !== 'undefined' && state.data;
+    if (!enabled(d) || document.hidden || currentView(d) !== 'logs' || document.querySelector('dialog[open]') || Date.now() - st.logsAt < 4500) return;
+    await loadLogs();
+    rerender();
+  }, 5000);
 
   document.addEventListener('toggle', e => {
     const el = e.target;
@@ -1038,6 +1148,7 @@ const Dash = (() => {
     const t = e.target;
     if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; rerender(); return; }
     if (t.matches && t.matches('[data-askq]')) { st.askQ = t.value; rerender(); return; }
+    if (t.matches && t.matches('[data-logq]')) { st.logf.q = t.value; rerender(); return; }
     const form = t.closest && t.closest('.ask-form');
     if (form) {
       st.drafts[form.dataset.draft] = t.value;
@@ -1100,6 +1211,7 @@ const Dash = (() => {
         } catch (err) { toast(err.message, true); }
         return;
       }
+      if (wrap.dataset.logf) { st.logf[wrap.dataset.logf] = val; if (wrap.dataset.logf === 'agent') loadLogs().then(rerender); }
       if (wrap.dataset.filter !== undefined) st.filters[wrap.dataset.filter] = val;
       if (wrap.hasAttribute('data-askfilter')) st.askFilter = val;
       if (wrap.hasAttribute('data-askto')) { st.askTo = val; rerender(); focusComposer(); return; }
@@ -1126,6 +1238,32 @@ const Dash = (() => {
     if (sugg) { st.drafts.new = sugg.dataset.sugg; rerender(); focusComposer(); return; }
     const copy = e.target.closest('[data-copy]');
     if (copy) { await copyText(copyables.get(copy.dataset.copy) || ''); toast('Copied'); return; }
+    const rl = e.target.closest('[data-runlog]');
+    if (rl) {
+      try {
+        const a = agents().find(x => x.name === rl.dataset.agent);
+        const r = await api(`api/infra/${encodeURIComponent(rl.dataset.agent)}/runs/${rl.dataset.runlog}`);
+        const lines = r.log || [];
+        openLogDialog(r.title, `${a ? hostOf(a) : rl.dataset.agent} · ${fmtDate(r.t)}${r.end ? ` · took ${duration((r.end - r.t) / 1000)}` : ''}${r.summary ? ` · ${r.summary}` : ''}`,
+          logBox(lines, 'dialog', { proc: false }), logPlain(lines), `update-${rl.dataset.agent}-${new Date(r.t).toISOString().slice(0, 16).replace('T', '-').replace(':', '')}.log`);
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
+    const vo = e.target.closest('[data-viewout]');
+    if (vo) {
+      const text = copyables.get(`o:${vo.dataset.viewout}`) || '';
+      openLogDialog(vo.dataset.title || 'Output', '', `<pre class="ld-pre">${esc(text)}</pre>`, text, `action-${vo.dataset.viewout}.log`);
+      return;
+    }
+    if (e.target.closest('[data-logcopy], [data-logdl]')) {
+      const sel = st.logf.agent ? agents().filter(a => a.name === st.logf.agent) : agents();
+      const lines = [];
+      for (const a of sel) for (const l of (st.logLines[a.name] || [])) lines.push({ ...l, host: hostOf(a) });
+      lines.sort((x, y) => x.t - y.t);
+      const text = logPlain(lines, sel.length > 1);
+      if (e.target.closest('[data-logcopy]')) { await copyText(text); toast('Copied'); } else download(`agent-log-${new Date().toISOString().slice(0, 10)}.txt`, text);
+      return;
+    }
     const cp = e.target.closest('[data-copy-plan]');
     if (cp) { await copyText(plans.get(cp.dataset.copyPlan) || ''); toast('Plan copied. Paste it into Claude Code.'); return; }
 
