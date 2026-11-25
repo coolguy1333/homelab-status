@@ -471,7 +471,8 @@ setInterval(() => {
 // ------------------------------------------------------------------ dialogs
 function openDialog(id) {
   const dlg = $(id);
-  $('.form-error', dlg).textContent = '';
+  const errEl = $('.form-error', dlg);
+  if (errEl) errEl.textContent = '';
   dlg.showModal();
   return dlg;
 }
@@ -482,6 +483,28 @@ $$('dialog').forEach(dlg => {
     if (e.target === dlg) dlg.close(); // click on backdrop
   });
 });
+
+// Styled replacements for confirm() and prompt(). Both resolve when the dialog closes (Esc / Cancel / backdrop = no).
+function uiAsk({ title, text = '', ok = 'OK', danger = false, input = null }) {
+  const dlg = $('#askDialog');
+  $('#askTitle').textContent = title;
+  $('#askText').textContent = text;
+  $('#askText').hidden = !text;
+  const inp = $('#askInput');
+  inp.hidden = input === null;
+  inp.value = input ?? '';
+  const okBtn = $('#askOk');
+  okBtn.textContent = ok;
+  okBtn.className = `btn ${danger ? 'danger-solid' : 'primary'}`;
+  dlg.returnValue = '';
+  dlg.showModal();
+  if (input !== null) { inp.focus(); inp.select(); } else okBtn.focus();
+  return new Promise(resolve => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok' ? (input !== null ? inp.value.trim() : true) : (input !== null ? null : false)), { once: true });
+  });
+}
+const uiConfirm = (title, text = '', opts = {}) => uiAsk({ title, text, ...opts });
+const uiPrompt = (title, value = '', opts = {}) => uiAsk({ title, input: value, ok: 'Save', ...opts });
 
 function syncTypeFields() {
   const form = $('#monitorForm');
@@ -658,7 +681,7 @@ document.addEventListener('click', async e => {
       toast(m.paused ? 'Monitor resumed' : 'Monitor paused');
     } else if (action === 'delete') {
       const also = state.data.sync ? '\n\nIt will also be deleted from your other servers.' : '';
-      if (!confirm(`Delete "${m.name}" and all of its history?${also}`)) return;
+      if (!await uiConfirm(`Delete "${m.name}"?`, `Its whole check history is deleted too.${also}`, { ok: 'Delete', danger: true })) return;
       await api(`api/monitors/${id}`, { method: 'DELETE' });
       state.open.delete(id);
       state.details.delete(id);

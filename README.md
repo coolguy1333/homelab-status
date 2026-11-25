@@ -7,11 +7,12 @@ and keeps all of its features (monitors, Google sign-in, webhook alerts, peers).
 |---|---|
 | **Overview** | A "needs attention" list, key numbers, a card per Proxmox host, and recent activity |
 | **Containers** | Every LXC on both hosts with CPU, memory, disk, services, updates, and backups. Row actions: start, shut down, reboot, snapshot, back up now, update now |
-| **Updates** | Approvals (host updates and reboots, held-back updates), the nightly schedule and run history, "run now" |
+| **Updates** | A live progress bar while an update runs, approvals (host updates and reboots, held-back updates), the nightly schedule per host (everything low-risk, or **security updates only**), run history, "run now", and per-container "security only" / "update all" |
 | **Backups** | Proxmox backup jobs, the last backup per container (age, size, PBS verification), failed runs, and snapshots |
 | **Uptime** | Public monitors (tunnel hostnames and WebManager sites are added automatically) and internal services found inside containers, checked on the LAN |
-| **Ask agents** | Questions and fix requests to one host's agent, or to every agent at once with the **Datacenter** box |
+| **Ask agents** | A chat inbox: questions and fix requests to one host's agent, or to every agent at once (**Datacenter**). Follow-ups remember the conversation; messages can be copied, asked again, cancelled or deleted |
 | **Activity** | Everything the agents did or noticed |
+| **Logs** | Each update run step by step (apt output included) with a live view while it runs, and the agents' own log (search, filter, copy, download) |
 
 How it works: an agent on each Proxmox host (connector1 on GOD, connector2 on HELP) reports to this app every
 5 minutes. Each night it snapshots, risk-reviews, updates, and health-checks every container, and rolls back if

@@ -24,6 +24,8 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
   - `hl-update.timer`, nightly: for each container: snapshot (`hlauto<date>`), a risk review of pending
     apt updates, install (security always; everything if low-risk), a health check, and automatic rollback
     if services broke. Risky updates and anything on the host wait for approval on the dashboard.
+    The dashboard can switch the nightly run to **security updates only** (stored as `policy` in
+    `~/agent/state.json`); then only security updates go in and nothing else is held for approval.
 - State: `~/agent/state.json`. Logs: `journalctl -u hl-report -u hl-update`, `~/agent/logs/`.
 
 ## Rules

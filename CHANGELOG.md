@@ -1,6 +1,9 @@
 # Changelog
 
-## 2.7.0
+## 2.9.0
+
+- Merged the parallel dashboard work (2.5.1–2.8.1: logs, live update progress, security-only policy, Ask inbox)
+  with core-server monitoring and stale-backup handling. The combined agent is **1.10.0**.
 
 - Core servers: GOD, HELP and HOLY get their own cards at the top of Overview and Uptime (ping, Proxmox :8006,
   PBS :8007, SSH :22, 24-hour bar, uptime). Both agents check all three from the LAN, so a dead host is still
@@ -9,6 +12,49 @@
 - Agent 1.9.1: when the backup storage is offline, the last-known backup data is kept and marked stale,
   instead of claiming every container has "no backup yet". The Backups page shows a banner.
 
+## 2.8.1
+
+- Merged main (agent 1.7 PBS access, 1.7.1 health-check and retry fixes, 1.8 snapshot cleanup) with the dashboard work
+  below. The combined agent is **1.9.0**; the dashboard's nightly-policy and log features check for 1.9.0.
+
+## 2.8.0
+
+- **Agent logs on the dashboard.** A new **Logs** page shows each agent's own log (what it ran, warnings, errors),
+  refreshed every 5 s, with a host filter, "warnings & errors" filter, search, copy and download.
+- **Update logs.** Every update (nightly run, run-now, single container, approved update) keeps a step-by-step log:
+  package list, review result, plan, snapshot, the apt output, reboot, health check and rollback. The progress card
+  on the Updates page shows it live; afterwards **View log** opens it (Updates → host card → Update logs, and the
+  Logs page). Logs of the last 40 runs per host are kept in `runlogs.json`.
+- One-click container actions get **View output** (for updates this includes the full log).
+- Agent 1.9.0 (includes 1.7.1 and 1.8 from main): writes `~/agent/logs/agent.log` and sends its tail with each report and quick sync; update runs record
+  their own log.
+
+## 2.7.0
+
+- **Security-only updates.** Each host's nightly run can be switched between "everything low-risk" (as before) and
+  "security updates only" on the Updates page. Containers also get a **Security only** button next to **Update all**,
+  and each host has a **Security updates only** run-now button. Needs agent 1.9.0.
+- **Live update progress bar.** While an update runs (nightly, run-now, or a single container), the Updates page
+  shows which container is being worked on, the current step (snapshot, installing, rebooting, health check, rollback),
+  how many are done, and what finished so far. Host cards on the Overview show a small bar too. It refreshes every 3 s.
+- **Ask agents reworked.** One inbox for all chats with search and a host filter, unread markers for new answers,
+  a spinner on chats that are being worked on, a proper chat layout with the newest message in view and a composer
+  that grows as you type (Enter sends, Shift+Enter for a new line), suggestion chips for new chats, and Copy /
+  Ask again / Cancel / Delete on messages. On phones the list and the chat are separate screens.
+- Styled confirm and rename dialogs replace the browser's pop-ups everywhere.
+- New icons in the sidebar and header; the header status chip links to the Overview.
+- Updates page: filter containers by "with updates" / "security".
+- Containers on phones show the host under the name; long names wrap.
+- Fixed: `/api/infra/:agent/decision/:id/cancel` (and similar) was accepted as a task cancel.
+- Agent (1.9.0): nightly policy (security only), `update-security` and `update-all-security` actions, live progress
+  reporting, and a leftover progress record from a killed run is cleared automatically.
+
+## 2.6.1
+
+- Fixed: short pages (e.g. Containers) were stretched to the sidebar's height, leaving big empty gaps.
+- Fixed: "Ask about <container>" opened the chat with an empty box; it now starts a new chat with the question filled in.
+- Fixed: Approve/Deny buttons swapped DOM elements on every refresh (both used the same key).
+- Agent sync: client disconnects are now detected on the response (the old request listener never fired).
 ## 2.6.0
 
 - Agent 1.8: snapshot cleanup, about every 30 minutes. Only the agents' own snapshots are deleted:

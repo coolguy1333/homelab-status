@@ -719,8 +719,9 @@ async function handleApi(req, res, url) {
     const body = await readBody(req, 512 * 1024);
     infra.applyResults(name, body);
     const wait = Math.max(0, Math.min(25, Number(body.wait) || 0)) * 1000;
+    // Watch the response, not the request: req 'close' already fired once the body was read.
     let closed = false;
-    req.on('close', () => { closed = true; });
+    res.on('close', () => { closed = true; });
     const out = await infra.waitFor(name, wait);
     if (closed) return;
     return send(res, 200, { ok: true, ...out });
@@ -746,12 +747,19 @@ async function handleApi(req, res, url) {
     if (method === 'POST' && cm[2]) { if (needJson()) return; const body = await readBody(req, 16 * 1024); return send(res, 200, infra.renameChat(cm[1], body.title)); }
     return send(res, 405, { error: 'Method not allowed' });
   }
+  // Agent logs and update-run logs (read only).
+  const lm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(logs|runs\/([a-f0-9]{6,32}))$/);
+  if (lm && method === 'GET') {
+    if (needAuth()) return;
+    if (lm[3]) return send(res, 200, infra.runLog(lm[1], lm[3]));
+    return send(res, 200, { agent: lm[1], lines: infra.agentLogs(lm[1]) });
+  }
   const gm = p.match(/^\/api\/infra\/_all\/groups\/(g[a-f0-9]{10})$/);
   if (gm && method === 'DELETE') { if (needAuth()) return; infra.deleteGroup(gm[1]); return send(res, 200, { ok: true }); }
   const dm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/tasks\/([a-f0-9]{12})$/);
   if (dm && method === 'DELETE') { if (needAuth()) return; infra.deleteMessage(dm[1], dm[2]); return send(res, 200, { ok: true }); }
 
-  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions)(?:\/([a-f0-9]{12})\/cancel)?$/);
+  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions|policy)(?:\/([a-f0-9]{12})\/cancel)?$/);
   if (im) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
     if (needAuth() || needJson()) return;
@@ -761,7 +769,8 @@ async function handleApi(req, res, url) {
       infra.decide(im[1], String(body.id || ''), String(body.decision || ''), who, Array.isArray(body.packages) ? body.packages.slice(0, 1000) : null);
       return send(res, 200, { ok: true });
     }
-    if (im[3]) { infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
+    if (im[3]) { if (im[2] !== 'tasks') return send(res, 404, { error: 'Not found' }); infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
+    if (im[2] === 'policy') return send(res, 200, infra.setPolicy(im[1], bool(body.securityOnly), who));
     if (im[2] === 'actions') return send(res, 201, infra.addAction(im[1], String(body.type || ''), body.vmid, who));
     if (!String(body.text || '').trim()) return send(res, 400, { error: 'Write a message first' });
     const chatId = body.chat ? String(body.chat).slice(0, 40) : null;
