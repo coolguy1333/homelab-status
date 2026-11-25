@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.6.0
+
+- **Security-only updates.** Each host's nightly run can be switched between "everything low-risk" (as before) and
+  "security updates only" on the Updates page. Containers also get a **Security only** button next to **Update all**,
+  and each host has a **Security updates only** run-now button. Needs agent 1.7.0.
+- **Live update progress bar.** While an update runs (nightly, run-now, or a single container), the Updates page
+  shows which container is being worked on, the current step (snapshot, installing, rebooting, health check, rollback),
+  how many are done, and what finished so far. Host cards on the Overview show a small bar too. It refreshes every 3 s.
+- **Ask agents reworked.** One inbox for all chats with search and a host filter, unread markers for new answers,
+  a spinner on chats that are being worked on, a proper chat layout with the newest message in view and a composer
+  that grows as you type (Enter sends, Shift+Enter for a new line), suggestion chips for new chats, and Copy /
+  Ask again / Cancel / Delete on messages. On phones the list and the chat are separate screens.
+- Styled confirm and rename dialogs replace the browser's pop-ups everywhere.
+- New icons in the sidebar and header; the header status chip links to the Overview.
+- Updates page: filter containers by "with updates" / "security".
+- Containers on phones show the host under the name; long names wrap.
+- Fixed: `/api/infra/:agent/decision/:id/cancel` (and similar) was accepted as a task cancel.
+- Agent 1.7.0: nightly policy (security only), `update-security` and `update-all-security` actions, live progress
+  reporting, and a leftover progress record from a killed run is cleared automatically.
+
 ## 2.5.1
 
 - Fixed: short pages (e.g. Containers) were stretched to the sidebar's height, leaving big empty gaps.

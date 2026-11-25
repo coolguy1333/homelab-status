@@ -72,9 +72,11 @@ const Dash = (() => {
   const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity'];
   const st = {
     data: null, error: null, loading: false,
-    open: new Set(), expanded: new Set(), sel: new Map(), chatSel: {},
-    drafts: {}, askAgent: null,
-    filters: { host: '', status: '', q: '', level: '', ahost: '' },
+    open: new Set(), expanded: new Set(), sel: new Map(),
+    drafts: {},                         // composer text per chat id ("new" = a chat not started yet)
+    askChat: null, askTo: '_all',       // open chat ('new' or an id) and who a new chat goes to
+    askFilter: '', askQ: '', askPane: 'list', stickBottom: false,
+    filters: { host: '', status: '', q: '', level: '', ahost: '', upd: '' },
   };
 
   // ------------------------------------------------------------ data
@@ -114,6 +116,7 @@ const Dash = (() => {
       if (r.host && r.host.unreachable) push('err', `${a.name} cannot reach Proxmox host ${r.host.ip}`, 'overview');
       const waiting = (r.pending || []).filter(p => !a.decisions[p.id]);
       if (waiting.length) push('warn', `${waiting.length} item${waiting.length > 1 ? 's' : ''} waiting for your approval on ${hostOf(a)}`, 'updates');
+      if (a.progress) push(progStale(a.progress) ? 'warn' : 'info', progStale(a.progress) ? `Update run on ${hostOf(a)} has not reported progress for a while` : `Updating on ${hostOf(a)}: ${a.progress.kind === 'run' ? `${a.progress.done}/${a.progress.total} containers · ` : ''}${progNow(a.progress)}`, 'updates');
       if (r.host && r.host.rebootRequired) push('info', `${hostOf(a)} needs a reboot to finish updates`, 'updates');
       for (const s of (r.host && r.host.storage) || []) if (s.total && s.used / s.total >= 0.9) push('warn', `${hostOf(a)} storage ${s.name} is ${Math.round(s.used / s.total * 100)}% full`, 'overview');
       const failed = ((r.backups && r.backups.tasks) || []).filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR);
@@ -249,6 +252,47 @@ const Dash = (() => {
   }
   const kpi = (label, value, sub, cls = '', view = '') =>
     `<${view ? `a href="#${view}"` : 'div'} class="kpi ${cls}"><div class="kpi-k">${esc(label)}</div><div class="kpi-v">${value}</div><div class="kpi-s">${sub || ''}</div></${view ? 'a' : 'div'}>`;
+  const verGte = (v, min) => {
+    const p = x => String(x || '0').split('.').map(n => parseInt(n, 10) || 0);
+    const a = p(v), b = p(min);
+    for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    return true;
+  };
+  // ---- live update progress (agent 1.7+)
+  const STEP = {
+    'apt-update': ['refreshing package lists', 0.08], review: ['reviewing the updates', 0.2], snapshot: ['taking a snapshot', 0.3],
+    install: ['installing', 0.45], reboot: ['rebooting', 0.75], health: ['checking services', 0.85], rollback: ['rolling back', 0.9], host: ['checking host updates', 0],
+  };
+  const PROGRESS_STALE = 20 * 60e3;
+  function progPct(p) {
+    if (!p || !p.total) return 0;
+    const frac = p.current && STEP[p.step] ? STEP[p.step][1] : 0;
+    return Math.max(2, Math.min(p.step === 'host' ? 99 : 100, ((p.done + frac) / p.total) * 100));
+  }
+  const progMode = p => (p.mode === 'security' ? 'security updates only' : p.mode === 'selected' ? 'selected packages' : p.mode === 'full' ? 'all updates' : 'nightly rules');
+  const progNow = p => (p.step === 'host' ? 'checking the host for updates'
+    : p.current ? `${p.current.name} (${p.current.vmid}) — ${(STEP[p.step] || [p.step || 'starting'])[0]}${p.step === 'install' && p.what ? ` ${p.what}` : p.step === 'review' && p.pkgs ? ` (${p.pkgs} packages)` : ''}` : 'starting…');
+  const progStale = p => Date.now() - Math.max(p.u || 0, p.at || 0) > PROGRESS_STALE;
+  function progressBar(p, { compact = false } = {}) {
+    const pct = progPct(p), stale = progStale(p);
+    return `<div class="pbar${stale ? ' stale' : ''}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><span style="width:${pct.toFixed(1)}%"></span></div>
+      ${compact ? `<div class="pb-sub muted">${p.kind === 'run' ? `${p.done}/${p.total} · ` : ''}${esc(progNow(p))}</div>` : ''}`;
+  }
+  function progressCard(a) {
+    const p = a.progress;
+    const stale = progStale(p);
+    const title = p.kind === 'run' ? `Update run on ${hostOf(a)}` : `Updating ${p.current ? p.current.name : 'a container'} on ${hostOf(a)}`;
+    const res = (p.results || []).slice().reverse();
+    const resCls = r => (/ROLLED BACK|BROKEN|error|failed/i.test(r) ? 'pct-bad' : /held/i.test(r) ? 'pct-warn' : 'pct-good');
+    return `<div class="card pad upd-progress" data-key="prog:${esc(a.name)}">
+      <div class="up-head">${stale ? dot('pending') : '<span class="spin"></span>'}<b>${esc(title)}</b><span class="pill">${esc(progMode(p))}</span>
+        <span class="muted up-time">started ${esc(ago(p.startedAt))}</span></div>
+      ${progressBar(p)}
+      <div class="up-sub"><span>${p.kind === 'run' ? `<b>${p.done}</b> of <b>${p.total}</b> containers done` : `<b>${Math.round(progPct(p))}%</b>`}</span>
+        <span class="up-now">${stale ? `<span class="pct-warn">No progress reported for ${esc(ago(Math.max(p.u || 0, p.at || 0)).replace(' ago', ''))} — the run may have stopped</span>` : `Now: ${esc(progNow(p))}`}</span></div>
+      ${res.length ? details(`progres:${a.name}`, `Finished so far (${res.length})`, `<ul class="plain up-res">${res.map(r => `<li><span class="${resCls(r.r)}">●</span> ${esc(r.r)}</li>`).join('')}</ul>`) : ''}
+    </div>`;
+  }
   const ageCls = ms => (ms == null ? 'pct-bad' : ms < 26 * HOUR ? 'pct-good' : ms < 72 * HOUR ? 'pct-warn' : 'pct-bad');
 
   // ------------------------------------------------------------ Overview
@@ -369,6 +413,7 @@ const Dash = (() => {
         <div class="kv"><span>Memory</span>${meter(h.memory && h.memory.used, h.memory && h.memory.total)}</div>
         ${storage}
       </div>
+      ${a.progress ? `<a class="host-prog" href="#updates"><div class="hp-k"><span class="spin"></span>${a.progress.kind === 'run' ? 'Update run' : 'Updating'} · ${Math.round(progPct(a.progress))}%</div>${progressBar(a.progress, { compact: true })}</a>` : ''}
       <div class="chips">${chips}</div>
       <div class="meta">
         <span>PVE <b>${esc((h.pveVersion || '?').split('/')[0])}</b></span>
@@ -376,7 +421,7 @@ const Dash = (() => {
         ${h.loadavg ? `<span>Load <b>${esc(h.loadavg.map(Number).map(n => n.toFixed(2)).join(' '))}</b></span>` : ''}
         <span>Host updates <b>${upd.count ?? '—'}</b></span>
         ${next ? `<span>Next backup <b>${esc(fmtTime(next))}</b></span>` : ''}
-        ${r.schedule && r.schedule.updates ? `<span>Updates <b>nightly ${esc(r.schedule.updates)}</b></span>` : ''}
+        ${r.schedule && r.schedule.updates ? `<span>Updates <b>nightly ${esc(r.schedule.updates)}${r.schedule.securityOnly ? ' · security only' : ''}</b></span>` : ''}
       </div>
     </div>`;
   }
@@ -408,7 +453,7 @@ const Dash = (() => {
       return `<tr class="crow${open ? ' open' : ''}" data-ct="${esc(id)}" tabindex="0">
         <td>${dot(running ? 'up' : c.onboot ? 'down' : '')}</td>
         <td class="num">${c.vmid}</td>
-        <td><b>${esc(c.name)}</b>${c.self ? ' <span class="muted">agent</span>' : ''}</td>
+        <td><b>${esc(c.name)}</b>${c.self ? ' <span class="muted">agent</span>' : ''}<span class="sub-host muted">${esc(c.host)} · ${c.vmid}</span></td>
         <td>${esc(c.host)}</td>
         <td>${running ? cpuMeter(c.cpu) : `<span class="${c.onboot ? 'pct-bad' : 'muted'}">${esc(c.status)}</span>`}</td>
         <td>${running ? meter(c.mem, c.maxmem) : ''}</td>
@@ -455,7 +500,8 @@ const Dash = (() => {
       <button class="btn small" data-act="snapshot" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">◷ Snapshot</button>
       <button class="btn small" data-act="backup" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⛁ Back up now</button>
       ${c.status === 'running' ? `<button class="btn small" data-act="check" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⌕ Check for updates</button>
-        <button class="btn small" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⟳ Update now</button>` : ''}
+        ${c.updates && c.updates.security ? `<button class="btn small" data-act="update-security" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⛨ Security updates (${c.updates.security})</button>` : ''}
+        <button class="btn small" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}">⟳ Update everything</button>` : ''}
       <span class="spacer"></span>
       <button class="btn small" data-ask="${esc(c.agent)}" data-prefill="${esc(`About ${c.name} (container ${c.vmid}) on ${c.host}: `)}">✦ Ask about ${esc(c.name)}</button>
     </div>
@@ -465,8 +511,10 @@ const Dash = (() => {
   // "Checking…/Updating…" while one of those actions is queued or running for the container.
   function busyNote(c) {
     const a = agents().find(x => x.name === c.agent);
-    const t = ((a && a.tasks) || []).find(x => x.action && x.action.vmid === c.vmid && ['queued', 'running'].includes(x.status) && ['check', 'update'].includes(x.action.type));
-    return t ? ` <span class="pill warn">${t.action.type === 'check' ? 'checking…' : 'updating…'}</span>` : '';
+    const p = a && a.progress;
+    if (p && p.current && p.current.vmid === c.vmid && !progStale(p)) return ` <span class="pill warn">${esc((STEP[p.step] || ['updating'])[0])}…</span>`;
+    const t = ((a && a.tasks) || []).find(x => x.action && x.action.vmid === c.vmid && ['queued', 'running'].includes(x.status) && ['check', 'update', 'update-security'].includes(x.action.type));
+    return t ? ` <span class="pill warn">${t.action.type === 'check' ? 'checking…' : t.action.type === 'update-security' ? 'security updates…' : 'updating…'}</span>` : '';
   }
 
   // Recent one-click actions for a container (or the host when vmid is null).
@@ -502,7 +550,7 @@ const Dash = (() => {
         </div>` : '';
       return `<div class="card approval">
         <div class="ap-head"><span class="pill ${p.kind === 'host-reboot' ? 'bad' : p.kind === 'host-update' ? 'warn' : ''}">${esc({ 'host-update': 'host update', 'host-reboot': 'host reboot', 'risky-update': 'held update' }[p.kind] || p.kind)}</span>
-          <b>${esc(p.summary)}</b><span class="muted">${esc(hostOf(a))} · ${esc(ago(p.t))}</span></div>
+          <b class="ap-title">${esc(p.summary)}</b><span class="muted">${esc(hostOf(a))} · ${esc(ago(p.t))}</span></div>
         ${picker}
         ${p.details ? details(`pd:${a.name}:${p.id}`, pk.length ? 'Why / full details' : 'Details', `<pre>${esc(p.details)}</pre>`) : ''}
         <div class="ap-actions">${act}</div></div>`;
@@ -512,17 +560,31 @@ const Dash = (() => {
       const runs = a.report.updateRuns || [];
       const last = runs[runs.length - 1];
       const hu = (a.report.host && a.report.host.updates) || {};
+      const sch = a.report.schedule || {};
+      const applied = Boolean(sch.securityOnly);
+      const want = a.policy ? a.policy.securityOnly : applied;
+      const oldAgent = !verGte(a.report.agentVersion, '1.7.0');
+      const syncing = a.policy && !oldAgent && (!a.report.policy || a.report.policy.at !== a.policy.at);
+      const ctSec = containers().filter(c => c.agent === a.name).reduce((n, c) => n + ((c.updates && c.updates.security) || 0), 0);
       return `<div class="card pad sched"><div class="host-head">${dot(a.online ? 'up' : 'down')}<div><h3>${esc(hostOf(a))}</h3>
-        <div class="muted">Nightly at <b>${esc((a.report.schedule && a.report.schedule.updates) || '?')}</b> · host packages: ${hu.count ?? '—'} waiting${hu.security ? ` (<span class="pct-bad">${hu.security} security</span>)` : ''}</div></div></div>
+        <div class="muted">Nightly at <b>${esc(sch.updates || '?')}</b> · host packages: ${hu.count ?? '—'} waiting${hu.security ? ` (<span class="pct-bad">${hu.security} security</span>)` : ''}
+          · <button class="linkbtn" data-act="check-updates" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">check now</button></div></div></div>
+        <div class="policy"><span class="pol-k">Nightly run installs</span>
+          <div class="seg small" data-policy="${esc(a.name)}"><button class="${want ? '' : 'on'}" data-val="full" title="Security updates always; everything else when the agent rates it low-risk (the rest waits for approval)">Everything low-risk</button><button class="${want ? 'on' : ''}" data-val="security" title="Only security updates; nothing else is installed or queued for approval">Security only</button></div>
+          ${oldAgent && a.policy ? `<span class="pct-warn pol-note">agent ${esc(a.report.agentVersion || '?')} ignores this — update it to 1.7</span>` : syncing ? '<span class="muted pol-note">sending to the agent…</span>' : ''}</div>
         ${last ? `<p>${levelTag(last.level)} Last run ${esc(ago(last.t))}: ${esc(last.summary.split('\n')[0])}</p>` : '<p class="muted">No update run yet — the first one is tonight.</p>'}
         <div class="cd-actions"><button class="btn small" data-act="update-all" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">⟳ Run the nightly update now</button>
-          <button class="btn small" data-act="check-updates" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">Check host updates</button></div>
+          <button class="btn small" data-act="update-all-security" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}" ${ctSec ? '' : 'title="No container reports security updates right now"'}>⛨ Security updates only${ctSec ? ` (${ctSec})` : ''}</button></div>
         ${actionLog(a.name, null)}
         ${runs.length ? details(`runs:${a.name}`, `Run history (${runs.length})`, `<ul class="events">${runs.slice().reverse().map(u => `<li><time>${esc(fmtDate(u.t))}</time>${levelTag(u.level)}<span><pre class="inline">${esc(u.summary)}</pre></span></li>`).join('')}</ul>`) : ''}
       </div>`;
     }).join('');
 
-    const cs = containers().slice().sort((x, y) => ((y.updates && y.updates.count) || 0) - ((x.updates && x.updates.count) || 0) || x.vmid - y.vmid);
+    const uf = st.filters.upd;
+    const all = containers();
+    const cs = all.filter(c => !uf || (uf === 'pending' ? c.updates && c.updates.count : c.updates && c.updates.security))
+      .sort((x, y) => ((y.updates && y.updates.security) || 0) - ((x.updates && x.updates.security) || 0) || ((y.updates && y.updates.count) || 0) - ((x.updates && x.updates.count) || 0) || x.vmid - y.vmid);
+    const nPend = all.filter(c => c.updates && c.updates.count).length, nSec = all.filter(c => c.updates && c.updates.security).length;
     const rows = cs.map(c => {
       const u = c.updates || {};
       const lu = c.lastUpdate;
@@ -531,16 +593,20 @@ const Dash = (() => {
         <td>${u.checkedAt ? esc(ago(u.checkedAt)) : '<span class="muted">tonight</span>'}</td>
         <td>${lu ? `<span class="${lu.result === 'ok' ? 'pct-good' : lu.result === 'held' ? 'pct-warn' : 'pct-bad'}">${esc(lu.result)}</span> <span class="muted">${esc(ago(lu.t))}</span>` : '<span class="muted">—</span>'}</td>
         <td class="wrap muted">${esc((lu && lu.msg) || '')}${busyNote(c)}</td>
-        <td class="row-actions">${c.status === 'running' ? `<button class="btn small" data-act="check" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Refresh the package list and count pending updates">Check</button>
-          <button class="btn small primary" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Snapshot, install everything, health-check, roll back if broken">Update now</button>` : ''}</td></tr>`;
+        <td class="row-actions">${c.status === 'running' ? `<button class="btn small ghost" data-act="check" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Refresh the package list and count pending updates">Check</button>
+          ${u.security ? `<button class="btn small" data-act="update-security" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Snapshot, install only the security updates, health-check, roll back if broken">Security only</button>` : ''}
+          ${u.count !== 0 ? `<button class="btn small primary" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Snapshot, install everything, health-check, roll back if broken">Update all</button>` : ''}` : ''}</td></tr>`;
     }).join('');
-    return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the agent rates them low-risk; the rest wait here. Every update is snapshotted first and rolled back if services break.')}
+    const running = agents().filter(a => a.progress);
+    return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the agent rates them low-risk, unless you switch a host to <b>security only</b>; the rest wait here. Every update is snapshotted first and rolled back if services break.')}
+      ${running.length ? `<h3 class="sec-title">In progress</h3><div class="stack">${running.map(progressCard).join('')}</div>` : ''}
       <h3 class="sec-title">Waiting for approval</h3><div class="stack">${pendHtml}</div>
       <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}</div>
       <h3 class="sec-title">Containers</h3>
+      <div class="toolbar"><div class="seg" data-filter="upd">${[['', `All (${all.length})`], ['pending', `With updates (${nPend})`], ['security', `Security (${nSec})`]].map(([v, l]) => `<button class="${uf === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div></div>
       <div class="card table-card"><div class="table-wrap"><table class="ctable ct-updates">
         <thead><tr><th>Container</th><th>Host</th><th>Pending</th><th>Security</th><th>Checked</th><th>Last update</th><th>Notes</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="8" class="muted">No data yet.</td></tr>'}</tbody></table></div></div>`;
+        <tbody>${rows || `<tr><td colspan="8" class="muted">${all.length ? 'Nothing matches this filter.' : 'No data yet.'}</td></tr>`}</tbody></table></div></div>`;
   }
 
   // ------------------------------------------------------------ Backups
@@ -635,68 +701,168 @@ const Dash = (() => {
   }
 
   // ------------------------------------------------------------ Ask (chats)
-  const chatsFor = scope => ((st.data && st.data.chats) || []).filter(c => c.scope === scope);
-  function currentChat(scope) {
-    const list = chatsFor(scope);
-    const sel = st.chatSel[scope];
-    if (sel === 'new') return null;
-    return list.find(c => c.id === sel) || list[0] || null;
+  // One inbox for every chat (datacenter-wide and per host). The open chat fills the right pane; a new chat
+  // picks who answers in the composer. Unread answers are remembered per browser.
+  const SEEN_KEY = 'hl-chat-seen';
+  let seen = null; // chat id -> time of the newest answer you have seen
+  function loadSeen() {
+    if (seen) return;
+    let raw = null;
+    try { raw = localStorage.getItem(SEEN_KEY); } catch { /* storage unavailable */ }
+    try { seen = raw ? JSON.parse(raw) || {} : null; } catch { seen = null; }
+    if (!seen) { // first visit: everything that already exists counts as read
+      seen = {};
+      for (const c of allChats()) seen[c.id] = chatInfo(c).lastAnswer || 1;
+      saveSeen();
+    }
   }
-  const pendingText = (a, t) => (t.status === 'queued' ? (a.live ? 'Sending to the agent…' : 'Waiting for the agent to come online…')
-    : t.status === 'running' ? `Working on it${t.startedAt ? ` (${duration((Date.now() - t.startedAt) / 1000)})` : ''}… answers usually take 1–3 minutes` : t.status);
+  const saveSeen = () => { try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch { /* ignore */ } };
+  const allChats = () => (st.data && st.data.chats) || [];
+  const scopeLabel = scope => { if (scope === '_all') return 'Datacenter'; const a = agents().find(x => x.name === scope); return a ? hostOf(a) : scope; };
+  const shortAgo = t => (!t ? '' : Date.now() - t < 60e3 ? 'now' : duration((Date.now() - t) / 1000).split(' ')[0]);
+  const plain = t => String(t || '').replace(/```[\s\S]*?```/g, ' ').replace(/^\s*([-*+]|\d+[.)])\s+/gm, '').replace(/[#*_`>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 110);
+  const isBusy = t => t.status === 'queued' || t.status === 'running';
+  const copyables = new Map(); // key -> text for the Copy buttons
+
+  function chatTasks(chatId) {
+    const out = [];
+    for (const a of agents()) for (const t of (a.tasks || [])) if (t.chat === chatId && !t.action) out.push({ a, t });
+    return out;
+  }
+  function chatInfo(c) {
+    let last = c.updatedAt || 0, lastAnswer = 0, working = false, newest = null;
+    for (const { t } of chatTasks(c.id)) {
+      last = Math.max(last, t.createdAt || 0, t.finishedAt || 0);
+      if (t.output && t.finishedAt) lastAnswer = Math.max(lastAnswer, t.finishedAt);
+      if (isBusy(t)) working = true;
+      if (!newest || t.createdAt > newest.createdAt || (t.createdAt === newest.createdAt && t.output && !newest.output)) newest = t;
+    }
+    const preview = newest ? (newest.output && !isBusy(newest) ? plain(newest.output) : `You: ${plain(newest.text)}`) : 'No messages yet';
+    const unread = Boolean(seen && lastAnswer > (seen[c.id] || 0) && !(st.askChat === c.id && currentView(state.data) === 'ask'));
+    return { last, lastAnswer, working, preview, unread };
+  }
+  function unreadCount() { loadSeen(); return allChats().filter(c => chatInfo(c).unread).length; }
+
+  const pendingText = (a, t) => (t.status === 'queued'
+    ? (a.online ? (a.live ? 'Sending to the agent…' : 'Queued — the agent picks it up at its next check-in…') : `${hostOf(a)} is offline — this runs when it is back`)
+    : `Working on it${t.startedAt ? ` · ${duration((Date.now() - t.startedAt) / 1000)}` : ''} — answers usually take 1–3 minutes`);
+  const typing = '<span class="typing" aria-hidden="true"><i></i><i></i><i></i></span>';
 
   function viewAsk() {
     const ag = agents().filter(a => a.configured);
-    if (!ag.length) return empty('No agents configured.');
-    if (!st.askAgent || (st.askAgent !== '_all' && !ag.some(a => a.name === st.askAgent))) st.askAgent = '_all';
-    const scope = st.askAgent;
-    const picker = `<div class="seg big" data-askpick>
-      <button class="${scope === '_all' ? 'on' : ''}" data-val="_all">◎ Datacenter <span class="muted">all agents</span></button>
-      ${ag.map(x => `<button class="${x.name === scope ? 'on' : ''}" data-val="${esc(x.name)}">${dot(x.online ? 'up' : 'down')}${esc(hostOf(x))} <span class="muted">${esc(x.name)}</span></button>`).join('')}</div>`;
-    const chats = chatsFor(scope);
-    const chat = currentChat(scope);
-    const list = `<aside class="chat-list">
-        <button class="btn primary small new-chat" data-newchat>＋ New chat</button>
-        ${chats.map(c => `<div class="chat-item${chat && chat.id === c.id ? ' on' : ''}" data-chat="${esc(c.id)}" tabindex="0">
-            <div class="ci-title">${esc(c.title)}</div>
-            <div class="ci-meta">${esc(ago(c.updatedAt))} · ${c.messages} message${c.messages === 1 ? '' : 's'}</div>
-            <button class="ci-del" data-delchat="${esc(c.id)}" title="Delete this chat" aria-label="Delete chat">×</button>
-          </div>`).join('') || '<p class="muted small-note">No chats yet. Write below to start one.</p>'}
+    if (!ag.length) return `${pageHead('Ask agents', '')}${empty('No agents configured. Set AGENT_TOKENS and install an agent on each Proxmox host.')}`;
+    loadSeen();
+    const chats = allChats();
+    if (st.askChat && st.askChat !== 'new' && !chats.some(c => c.id === st.askChat)) st.askChat = null;
+    if (!st.askChat) st.askChat = chats.length ? chats[0].id : 'new';
+    if (st.askTo !== '_all' && !ag.some(a => a.name === st.askTo)) st.askTo = '_all';
+    const chat = st.askChat === 'new' ? null : chats.find(c => c.id === st.askChat);
+    if (chat) { const i = chatInfo(chat); if (i.lastAnswer > (seen[chat.id] || 0)) { seen[chat.id] = i.lastAnswer; saveSeen(); } }
+
+    // ---- left: the inbox
+    const f = st.askFilter, q = st.askQ.trim().toLowerCase();
+    const shown = chats.filter(c => (!f || c.scope === f) && (!q || c.title.toLowerCase().includes(q)));
+    const filterSeg = `<div class="seg small scroll" data-askfilter>${[['', 'All'], ['_all', 'Datacenter'], ...ag.map(a => [a.name, hostOf(a)])]
+      .map(([v, l]) => `<button class="${f === v ? 'on' : ''}" data-val="${esc(v)}">${esc(l)}</button>`).join('')}</div>`;
+    const items = shown.map(c => {
+      const i = chatInfo(c);
+      return `<div class="chat-item${chat && chat.id === c.id ? ' on' : ''}${i.unread ? ' unread' : ''}" data-chat="${esc(c.id)}" tabindex="0" role="button">
+        <div class="ci-top"><span class="ci-scope${c.scope === '_all' ? ' dc' : ''}">${esc(scopeLabel(c.scope))}</span><span class="ci-time">${i.working ? '<span class="spin" title="Working"></span>' : esc(shortAgo(i.last))}</span></div>
+        <div class="ci-title">${i.unread ? '<span class="unread-dot" title="New answer"></span>' : ''}${esc(c.title)}</div>
+        <div class="ci-prev">${esc(i.preview)}</div>
+      </div>`;
+    }).join('');
+    const side = `<aside class="ask-side">
+        <div class="as-top"><button class="btn primary small" data-newchat>＋ New chat</button>
+          <input type="search" class="search" data-askq placeholder="Search chats" aria-label="Search chats" value="${esc(st.askQ)}"></div>
+        ${filterSeg}
+        <div class="chat-list">${items || `<p class="muted small-note">${chats.length ? 'No chats match.' : 'No chats yet.'}</p>`}</div>
       </aside>`;
-    const msgs = chat ? (scope === '_all' ? groupMessages(ag, chat.id) : agentMessages(ag.find(x => x.name === scope), chat.id)) : '';
-    const target = scope === '_all' ? ag : [ag.find(x => x.name === scope)];
-    const offline = target.filter(a => !a.online).map(a => hostOf(a));
-    const draftKey = `${scope}:${chat ? chat.id : 'new'}`;
-    const main = `<section class="chat-main card">
-        <div class="chat-head">
-          <div><h3>${chat ? esc(chat.title) : 'New chat'}</h3>
-            <div class="muted">${scope === '_all' ? `Every agent answers for its own host (${target.map(a => esc(hostOf(a))).join(', ')})` : `${esc(scope)} on ${esc(hostOf(target[0]))}`}${chat ? ' · follow-ups remember this conversation' : ''}</div></div>
-          ${chat ? `<button class="btn small ghost" data-renamechat="${esc(chat.id)}">✎ Rename</button>` : ''}
-        </div>
-        <div class="convo">${msgs || `<p class="muted center">${chat ? 'No messages left in this chat.' : 'Ask a question or tell the agent what to fix.'}</p>`}</div>
-        <form class="ask-form" data-agent="${esc(scope)}" data-chat="${chat ? esc(chat.id) : ''}" data-draft="${esc(draftKey)}">
-          <textarea name="text" rows="3" maxlength="4000" placeholder="${scope === '_all' ? 'e.g. Which containers use the most disk? · Are any services failing? · Check every container for pending reboots' : 'e.g. Why is AMPServer2 using so much memory? · Pi-hole isn\'t answering DNS, fix it · Update ai now'}">${esc(st.drafts[draftKey] || '')}</textarea>
-          <div class="ask-actions"><span class="muted">${chat ? 'Reply in this chat' : 'Starts a new chat'}${offline.length ? ` — <span class="pct-bad">${esc(offline.join(', '))} offline, runs when back</span>` : ''} · Ctrl+Enter to send</span>
-            <button class="btn primary" type="submit">${scope === '_all' ? 'Send to all' : 'Send'}</button></div>
-        </form>
-      </section>`;
-    const auto = scope !== '_all' ? (((target[0].report && target[0].report.autoTasks) || []).slice().reverse()) : [];
-    return `${pageHead('Ask agents', 'Each agent can look at and fix the containers on its own host; host changes only when you ask explicitly. <b>Datacenter</b> asks every agent at once. If an agent can\'t fix something it gives you a plan to paste into Claude Code.')}
-      ${picker}
-      <div class="chat-shell">${list}${main}</div>
-      ${usagePanel(target)}
-      ${auto.length ? details(`auto:${scope}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${statusTag(t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join(''), 'card pad') : ''}`;
+
+    // ---- right: the open chat (or a new one)
+    const scope = chat ? chat.scope : st.askTo;
+    const target = scope === '_all' ? ag : ag.filter(a => a.name === scope);
+    const offline = target.filter(a => !a.online).map(hostOf);
+    const sub = scope === '_all' ? `Datacenter · every agent answers for its own host (${ag.map(a => esc(hostOf(a))).join(', ')})` : `${esc(scopeLabel(scope))} · agent ${esc(scope)}`;
+    const head = `<div class="chat-head">
+        <button class="icon-btn back" data-askback aria-label="Back to chats">‹</button>
+        <div class="ch-title"><h3>${chat ? esc(chat.title) : 'New chat'}</h3><div class="muted">${chat ? sub : 'Choose who answers below, then ask'}</div></div>
+        <button class="btn small ghost new-m" data-newchat aria-label="New chat">＋</button>
+        ${chat ? `<div class="ch-actions"><button class="btn small ghost" data-renamechat="${esc(chat.id)}" title="Rename chat" aria-label="Rename chat">✎<span class="bl"> Rename</span></button><button class="btn small ghost danger" data-delchat="${esc(chat.id)}" title="Delete chat" aria-label="Delete chat">✕<span class="bl"> Delete</span></button></div>` : ''}
+      </div>`;
+    let msgs = '';
+    if (chat) {
+      if (scope === '_all') msgs = groupMessages(agents(), chat.id);
+      else { const a = agents().find(x => x.name === scope); msgs = a ? agentMessages(a, chat.id) : ''; }
+    }
+    const sugg = scope === '_all'
+      ? ['Which containers use the most disk?', 'Are any services failing right now?', 'Which containers have security updates waiting?', 'Summarise last night\'s update run']
+      : ['What is using the most memory on this host?', 'Are all containers healthy?', 'Check that every container has a recent backup', 'Why did the last update roll back?'];
+    const welcome = chat
+      ? '<p class="muted center convo-empty">No messages left in this chat.</p>'
+      : `<div class="chat-welcome"><div class="cw-ico">✦</div><h3>Ask ${scope === '_all' ? 'every agent' : esc(scopeLabel(scope))}</h3>
+          <p class="muted">Answers come from live data on the host. Ask it to fix something and it snapshots the container first; the Proxmox host itself is only changed when you ask for that explicitly. If it can't fix something, you get a plan to paste into Claude Code.</p>
+          <div class="sugg">${sugg.map(x => `<button type="button" class="sugg-btn" data-sugg="${esc(x)}">${esc(x)}</button>`).join('')}</div></div>`;
+    const draftKey = chat ? chat.id : 'new';
+    const toSeg = chat ? '' : `<div class="to-row"><span class="muted">To</span><div class="seg small scroll" data-askto>${[['_all', 'Datacenter (all)'], ...ag.map(a => [a.name, hostOf(a)])]
+      .map(([v, l]) => { const a = ag.find(x => x.name === v); return `<button type="button" class="${st.askTo === v ? 'on' : ''}" data-val="${esc(v)}">${a ? dot(a.online ? 'up' : 'down') : '◎ '}${esc(l)}</button>`; }).join('')}</div></div>`;
+    const form = `<form class="ask-form composer" data-agent="${esc(scope)}" data-chat="${chat ? esc(chat.id) : ''}" data-draft="${esc(draftKey)}">
+        ${toSeg}
+        <div class="composer-box"><textarea name="text" rows="1" maxlength="4000" aria-label="Message" placeholder="${chat ? 'Reply — the agent remembers this conversation…' : 'Ask a question or describe what to fix…'}">${esc(st.drafts[draftKey] || '')}</textarea>
+          <button class="btn primary send" type="submit">Send</button></div>
+        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'}${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
+      </form>`;
+    const main = `<section class="ask-main">${head}<div class="convo" data-convo="${esc(draftKey)}">${msgs || welcome}</div>${form}</section>`;
+
+    // ---- below: usage and the agents' own auto-fixes
+    const auto = [];
+    for (const a of target) for (const t of ((a.report && a.report.autoTasks) || [])) auto.push({ ...t, host: hostOf(a) });
+    auto.sort((x, y) => y.t - x.t);
+    const u = usageSum(target, 'today');
+    return `${pageHead('Ask agents', 'Ask about your hosts and containers, or tell an agent what to fix. <b>Datacenter</b> chats go to every agent at once.')}
+      <div class="ask-app card${st.askPane === 'chat' ? ' show-chat' : ''}">${side}${main}</div>
+      ${details(`usage:${scope}`, `Claude usage${target.length === 1 ? ` · ${esc(scopeLabel(scope))}` : ''} — today ${kTok(usageTotal(u))} tokens · ≈ $${u.cost.toFixed(2)}`, usagePanel(target), 'card pad')}
+      ${auto.length ? details(`auto:${scope}`, `Automatic fixes the agent${target.length > 1 ? 's' : ''} started (${auto.length})`, `<div class="convo">${auto.map(t => `<div class="msg">
+          <div class="q-meta left">${esc(t.host)} · ${esc(ago(t.t))} ${statusTag(t.status)}</div><div class="q auto"><div class="q-text">${esc(t.text)}</div></div>
+          ${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join('')}</div>`, 'card pad') : ''}`;
+  }
+  const coarse = () => window.matchMedia && matchMedia('(pointer: coarse)').matches;
+
+  // Buttons under your message: copy, retry, cancel (only before an agent picked it up), delete.
+  function msgTools({ copyKey, retry, cancel, del }) {
+    return `<span class="msg-tools">
+      <button class="linkbtn" data-copy="${esc(copyKey)}">Copy</button>
+      ${retry ? `<button class="linkbtn" data-retry="${esc(retry)}">Ask again</button>` : ''}
+      ${cancel || ''}
+      ${del}
+    </span>`;
+  }
+  function ansBlock(a, t, label) {
+    copyables.set(`a:${t.id}`, t.output || '');
+    rememberPlan({ ...t, agentName: a.name });
+    const meta = `<div class="ans-meta"><span class="who">✦ ${esc(label)}</span>${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''}${t.status === 'failed' ? ` ${statusTag('failed')}` : ''} ${usageLine(t.usage)}
+      <button class="linkbtn copy" data-copy="a:${esc(t.id)}">Copy</button></div>`;
+    if (t.output) return `<div class="ans${t.status === 'failed' ? ' failed' : ''}">${meta}${answer(t.output, t.id)}${isBusy(t) ? `<div class="ans-wait">${typing}</div>` : ''}</div>`;
+    if (t.status === 'cancelled') return `<div class="ans pending">✦ ${esc(label)}: cancelled</div>`;
+    return `<div class="ans pending">${typing}<span><b>${esc(label)}</b> · ${esc(pendingText(a, t))}</span></div>`;
   }
 
   function agentMessages(a, chatId) {
     const tasks = (a.tasks || []).filter(t => t.chat === chatId && !t.action).sort((x, y) => x.createdAt - y.createdAt);
-    return tasks.map(t => `<div class="msg">
-      <div class="q"><div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))} ${statusTag(t.status)}
-        <button class="msg-del" data-delmsg="${esc(t.id)}" data-agent="${esc(a.name)}" title="Delete this message">🗑</button></div>
-        <div class="q-text">${esc(t.text)}</div></div>
-      ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
-        : `<div class="ans pending">${esc(pendingText(a, t))}</div>`}
-    </div>`).join('');
+    return tasks.map(t => {
+      copyables.set(`q:${t.id}`, t.text);
+      const tools = msgTools({
+        copyKey: `q:${t.id}`,
+        retry: isBusy(t) ? null : t.id,
+        cancel: t.status === 'queued' ? `<button class="linkbtn" data-cancel="${esc(t.id)}" data-agent="${esc(a.name)}">Cancel</button>` : '',
+        del: `<button class="linkbtn danger" data-delmsg="${esc(t.id)}" data-agent="${esc(a.name)}">Delete</button>`,
+      });
+      return `<div class="msg" data-key="m:${esc(t.id)}">
+        <div class="q"><div class="q-text">${esc(t.text)}</div></div>
+        <div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))}${t.status === 'cancelled' ? ` ${statusTag('cancelled')}` : ''} ${tools}</div>
+        ${ansBlock(a, t, hostOf(a))}
+      </div>`;
+    }).join('');
   }
 
   function groupMessages(ag, chatId) {
@@ -707,15 +873,18 @@ const Dash = (() => {
       groups.get(t.group).parts.push({ a, t });
     }
     return [...groups.values()].sort((x, y) => x.t - y.t).map(g => {
-      const states = g.parts.map(p => p.t.status);
-      const overall = states.every(x => x === 'done') ? 'done' : states.some(x => x === 'failed') ? 'failed' : states.some(x => x === 'running') ? 'running' : states.every(x => x === 'cancelled') ? 'cancelled' : 'queued';
-      return `<div class="msg">
-        <div class="q"><div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${statusTag(overall)}
-          <button class="msg-del" data-delgroup="${esc(g.id)}" title="Delete this message and its answers">🗑</button></div>
-          <div class="q-text">${esc(g.text)}</div></div>
-        ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => t.output
-          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
-          : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${esc(pendingText(a, t))}</div>`).join('')}
+      copyables.set(`q:${g.id}`, g.text);
+      const queued = g.parts.filter(p => p.t.status === 'queued');
+      const tools = msgTools({
+        copyKey: `q:${g.id}`,
+        retry: g.parts.some(p => isBusy(p.t)) ? null : g.parts[0].t.id,
+        cancel: queued.length ? `<button class="linkbtn" data-cancelgroup="${esc(g.id)}">Cancel</button>` : '',
+        del: `<button class="linkbtn danger" data-delgroup="${esc(g.id)}">Delete</button>`,
+      });
+      return `<div class="msg" data-key="m:${esc(g.id)}">
+        <div class="q"><div class="q-text">${esc(g.text)}</div></div>
+        <div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${tools}</div>
+        ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => ansBlock(a, t, `${hostOf(a)}`)).join('')}
       </div>`;
     }).join('');
   }
@@ -723,13 +892,13 @@ const Dash = (() => {
   const statusTag = s => tag(s === 'done' ? 'up' : s === 'failed' ? 'down' : s === 'cancelled' ? '' : 'restart', s);
 
   // How much Claude the agents used (from each run's own token report).
+  function usageSum(list, key) {
+    const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    for (const a of list) { const u = a.report && a.report.usage && a.report.usage[key]; if (u) for (const k in o) o[k] += u[k] || 0; }
+    return o;
+  }
   function usagePanel(list) {
-    const sum = key => {
-      const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-      for (const a of list) { const u = a.report && a.report.usage && a.report.usage[key]; if (u) for (const k in o) o[k] += u[k] || 0; }
-      return o;
-    };
-    const today = sum('today'), week = sum('week'), month = sum('month');
+    const today = usageSum(list, 'today'), week = usageSum(list, 'week'), month = usageSum(list, 'month');
     const days = new Map();
     for (const a of list) for (const [d, v] of Object.entries((a.report && a.report.usage && a.report.usage.daily) || {})) {
       const cur = days.get(d) || { tokens: 0, cost: 0, runs: 0 };
@@ -744,12 +913,12 @@ const Dash = (() => {
     for (const a of list) for (const r of ((a.report && a.report.usage && a.report.usage.recent) || [])) recent.push({ ...r, agent: a.name });
     recent.sort((x, y) => y.t - x.t);
     const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices</div></div>`;
-    return `<h3 class="sec-title">Claude usage by ${list.length > 1 ? 'the agents' : esc(list[0] ? list[0].name : 'agent')}</h3>
+    return `<div class="usage">
       <div class="kpis">${tile('Today', today)}${tile('Last 7 days', week)}${tile('Last 30 days', month)}</div>
-      <div class="card pad"><div class="usage-bars">${bars}</div><div class="bars-legend"><span>30 days ago</span><span>Today</span></div>
-        <p class="hint">Tokens the agents used: answers, auto-fixes and nightly update reviews. This counts against your Claude plan's limits; your plan's overall usage is on claude.ai → Settings → Usage.</p>
-        ${recent.length ? details(`usage:${list.map(a => a.name).join(',')}`, `Recent runs (${recent.length})`, `<table class="mini"><tbody>${recent.slice(0, 25).map(r => `<tr><td class="muted">${esc(ago(r.t))}</td><td>${esc(r.agent)}</td><td>${tag(r.kind === 'review' ? '' : r.kind === 'autofix' ? 'restart' : 'up', r.kind || 'task')}</td><td class="wrap">${esc(r.label || '')}</td><td class="num">${kTok(usageTotal(r))}</td><td class="num">$${Number(r.cost || 0).toFixed(2)}</td></tr>`).join('')}</tbody></table>`) : ''}
-      </div>`;
+      <div><div class="usage-bars">${bars}</div><div class="bars-legend"><span>30 days ago</span><span>Today</span></div></div>
+      <p class="hint">Tokens used for answers, auto-fixes and nightly update reviews. This counts against your Claude plan's limits; your plan's overall usage is on claude.ai → Settings → Usage.</p>
+      ${recent.length ? `<div class="table-wrap"><table class="mini"><tbody>${recent.slice(0, 25).map(r => `<tr><td class="muted">${esc(ago(r.t))}</td><td>${esc(r.agent)}</td><td>${tag(r.kind === 'review' ? '' : r.kind === 'autofix' ? 'restart' : 'up', r.kind || 'task')}</td><td class="wrap">${esc(r.label || '')}</td><td class="num">${kTok(usageTotal(r))}</td><td class="num">$${Number(r.cost || 0).toFixed(2)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    </div>`;
   }
 
   // ------------------------------------------------------------ Activity
@@ -787,7 +956,8 @@ const Dash = (() => {
     set('updates', agents().reduce((n, a) => n + ((a.report && a.report.pending) || []).filter(p => !a.decisions[p.id]).length, 0), 'warn');
     set('backups', att.filter(i => i.view === 'backups').length, 'warn');
     set('uptime', ((d.monitors || []).filter(m => m.status === 'down').length) + services().filter(s => s.status === 'down' && !s.stale).length, 'bad');
-    set('ask', agents().reduce((n, a) => n + (a.tasks || []).filter(t => t.status === 'queued' || t.status === 'running').length, 0), '');
+    const unread = unreadCount();
+    set('ask', unread || agents().reduce((n, a) => n + (a.tasks || []).filter(t => !t.action && isBusy(t)).length, 0), unread ? 'new' : '');
     const errs = att.filter(i => i.level === 'err').length;
     const hs = $('#headStatus');
     hs.hidden = false;
@@ -806,7 +976,8 @@ const Dash = (() => {
     $$('#sidenav a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
     if (!on) { $('#v-services').innerHTML = ''; return; }
     if (!st.data) {
-      if (st.error) { const el = $(`#v-${view}`); if (el) morph(el, empty(st.error)); }
+      const el = $(`#v-${view}`);
+      if (el) morph(el, st.error ? empty(`Could not load the agents' data: ${st.error}`) : '<div class="card empty loading"><span class="spin"></span><p class="muted">Loading…</p></div>');
       if (!st.loading) { st.loading = true; load(d).then(() => { st.loading = false; if (st.data) render(d); }); }
       return;
     }
@@ -814,13 +985,32 @@ const Dash = (() => {
     const target = view === 'uptime' ? $('#v-services') : $(`#v-${view}`);
     if (selectingIn(target)) return;
     const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices }[view];
+    // Chat: stay pinned to the newest message unless you scrolled up to read.
+    const cv = view === 'ask' && $('.convo', target);
+    const pin = !cv || st.stickBottom || cv.scrollHeight - cv.scrollTop - cv.clientHeight < 60 || cv.dataset.convo !== (st.askChat || '');
     morph(target, fn(d));
+    if (view === 'ask') {
+      const nv = $('.ask-main .convo', target);
+      if (nv && pin) nv.scrollTop = nv.scrollHeight;
+      st.stickBottom = false;
+      fitComposer();
+    }
   }
 
   const rerender = () => state.data && render(state.data);
 
   // ------------------------------------------------------------ events
   window.addEventListener('hashchange', () => { rerender(); window.scrollTo(0, 0); });
+
+  // While an agent is working on something, refresh every 3 s so answers and progress show up quickly.
+  const anyBusy = () => agents().some(a => (a.progress && !progStale(a.progress)) || (a.tasks || []).some(isBusy));
+  setInterval(async () => {
+    const d = typeof state !== 'undefined' && state.data;
+    if (!enabled(d) || document.hidden || document.querySelector('dialog[open]') || st.loading || !anyBusy()) return;
+    st.loading = true;
+    try { await load(d); } finally { st.loading = false; }
+    rerender();
+  }, 3000);
 
   document.addEventListener('toggle', e => {
     const el = e.target;
@@ -838,56 +1028,144 @@ const Dash = (() => {
     rerender();
   });
 
+  function fitComposer(ta = $('.composer textarea')) {
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = `${Math.min(ta.scrollHeight + 2, 220)}px`;
+  }
+
   document.addEventListener('input', e => {
     const t = e.target;
-    if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; morph($('#v-containers'), viewContainers()); return; }
+    if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; rerender(); return; }
+    if (t.matches && t.matches('[data-askq]')) { st.askQ = t.value; rerender(); return; }
     const form = t.closest && t.closest('.ask-form');
-    if (form) { st.drafts[form.dataset.draft || form.dataset.agent] = t.value; if (t.value) t.dataset.dirty = '1'; else delete t.dataset.dirty; }
+    if (form) {
+      st.drafts[form.dataset.draft] = t.value;
+      if (t.value) t.dataset.dirty = '1'; else delete t.dataset.dirty;
+      fitComposer(t);
+    }
   });
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      const ta = document.createElement('textarea'); ta.value = text; document.body.append(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
+  }
+
+  function focusComposer() {
+    setTimeout(() => { const ta = $('.composer textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); fitComposer(ta); } }, 40);
+  }
+
+  async function sendMessage(agent, chatId, text) {
+    const r = await api(`api/infra/${encodeURIComponent(agent)}/tasks`, { method: 'POST', body: { text, ...(chatId ? { chat: chatId } : {}) } });
+    const id = agent === '_all' ? (r.tasks && r.tasks[0] && r.tasks[0].chat) : r.chat;
+    if (id) st.askChat = id;
+    st.askPane = 'chat';
+    st.stickBottom = true;
+    return r;
+  }
+
+  const ACT_TEXT = {
+    start: n => [`Start ${n}?`, ''],
+    shutdown: n => [`Shut down ${n}?`, 'Its services stop until you start it again.'],
+    reboot: n => [`Reboot ${n}?`, 'Its services are briefly unavailable.'],
+    snapshot: n => [`Take a snapshot of ${n}?`, ''],
+    backup: n => [`Back up ${n} now?`, 'Runs a backup to the backup storage of its job.'],
+    check: n => [`Check ${n} for updates?`, 'Refreshes its package list. Nothing is installed.'],
+    update: n => [`Install all updates on ${n}?`, 'A snapshot is taken first, and it rolls back automatically if services break.'],
+    'update-security': n => [`Install only the security updates on ${n}?`, 'A snapshot is taken first, and it rolls back automatically if services break. Other updates stay pending.'],
+    'update-all': n => [`Run the nightly update on ${n} now?`, 'Every container is snapshotted, updated and checked one by one, following this host\'s nightly setting.'],
+    'update-all-security': n => [`Install security updates on every container on ${n}?`, 'Each container is snapshotted, gets only its security updates, and is checked one by one.'],
+    'check-updates': n => [`Check ${n} for host package updates?`, ''],
+  };
+  const ACT_OK = { update: 'Update', 'update-security': 'Install', 'update-all': 'Run now', 'update-all-security': 'Install', shutdown: 'Shut down', reboot: 'Reboot' };
 
   document.addEventListener('click', async e => {
     const seg = e.target.closest('.seg button');
     if (seg) {
       const wrap = seg.closest('.seg');
-      if (wrap.dataset.filter !== undefined) st.filters[wrap.dataset.filter] = seg.dataset.val;
-      if (wrap.hasAttribute('data-askpick')) st.askAgent = seg.dataset.val;
+      const val = seg.dataset.val;
+      if (wrap.dataset.policy) {
+        const agent = wrap.dataset.policy;
+        const securityOnly = val === 'security';
+        const a = agents().find(x => x.name === agent);
+        const cur = a && (a.policy ? a.policy.securityOnly : Boolean(a.report && a.report.schedule && a.report.schedule.securityOnly));
+        if (cur === securityOnly) return;
+        try {
+          await api(`api/infra/${encodeURIComponent(agent)}/policy`, { method: 'POST', body: { securityOnly } });
+          toast(securityOnly ? `${hostOf(a || { name: agent })}: nightly run installs security updates only` : `${hostOf(a || { name: agent })}: nightly run installs everything low-risk`);
+          await load(state.data); rerender();
+        } catch (err) { toast(err.message, true); }
+        return;
+      }
+      if (wrap.dataset.filter !== undefined) st.filters[wrap.dataset.filter] = val;
+      if (wrap.hasAttribute('data-askfilter')) st.askFilter = val;
+      if (wrap.hasAttribute('data-askto')) { st.askTo = val; rerender(); focusComposer(); return; }
       rerender();
       return;
     }
     const row = e.target.closest('tr.crow');
-    if (row) { const id = row.dataset.ct; if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id); rerender(); return; }
+    if (row && !e.target.closest('button, a, input')) { const id = row.dataset.ct; if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id); rerender(); return; }
+
+    // ---- Ask agents
     const ask = e.target.closest('[data-ask]');
-    // Start a fresh chat with the question pre-filled (drafts are keyed "<agent>:<chat id or new>").
-    if (ask) { st.askAgent = ask.dataset.ask; st.chatSel[ask.dataset.ask] = 'new'; st.drafts[`${ask.dataset.ask}:new`] = ask.dataset.prefill; location.hash = '#ask'; setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }, 50); return; }
-    const chatBtn = e.target.closest('[data-newchat], [data-delchat], [data-renamechat], [data-delmsg], [data-delgroup], .chat-item');
+    if (ask) {
+      st.askChat = 'new'; st.askTo = ask.dataset.ask; st.askPane = 'chat';
+      st.drafts.new = ask.dataset.prefill;
+      location.hash = '#ask';
+      focusComposer();
+      return;
+    }
+    if (e.target.closest('[data-newchat]')) { st.askChat = 'new'; st.askPane = 'chat'; rerender(); focusComposer(); return; }
+    if (e.target.closest('[data-askback]')) { st.askPane = 'list'; rerender(); return; }
+    const item = e.target.closest('.chat-item');
+    if (item) { st.askChat = item.dataset.chat; st.askPane = 'chat'; st.stickBottom = true; rerender(); return; }
+    const sugg = e.target.closest('[data-sugg]');
+    if (sugg) { st.drafts.new = sugg.dataset.sugg; rerender(); focusComposer(); return; }
+    const copy = e.target.closest('[data-copy]');
+    if (copy) { await copyText(copyables.get(copy.dataset.copy) || ''); toast('Copied'); return; }
+    const cp = e.target.closest('[data-copy-plan]');
+    if (cp) { await copyText(plans.get(cp.dataset.copyPlan) || ''); toast('Plan copied. Paste it into Claude Code.'); return; }
+
+    const chatBtn = e.target.closest('[data-delchat], [data-renamechat], [data-delmsg], [data-delgroup], [data-retry], [data-cancelgroup]');
     if (chatBtn) {
-      const scope = st.askAgent;
+      const c = allChats().find(x => x.id === (chatBtn.dataset.delchat || chatBtn.dataset.renamechat || st.askChat));
       try {
-        if (chatBtn.hasAttribute('data-newchat')) { st.chatSel[scope] = 'new'; rerender(); setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) ta.focus(); }, 30); return; }
         if (chatBtn.dataset.delchat) {
-          const c = chatsFor(scope).find(x => x.id === chatBtn.dataset.delchat);
-          if (!confirm(`Delete the chat "${c ? c.title : ''}" and all of its messages? This can't be undone.`)) return;
+          if (!await uiConfirm(`Delete "${c ? c.title : 'this chat'}"?`, 'All of its messages and answers are deleted. This can\'t be undone.', { ok: 'Delete', danger: true })) return;
           await api(`api/infra/chats/${encodeURIComponent(chatBtn.dataset.delchat)}`, { method: 'DELETE' });
-          if (st.chatSel[scope] === chatBtn.dataset.delchat) delete st.chatSel[scope];
+          st.askChat = null; st.askPane = 'list';
           toast('Chat deleted');
         } else if (chatBtn.dataset.renamechat) {
-          const c = chatsFor(scope).find(x => x.id === chatBtn.dataset.renamechat);
-          const title = prompt('Rename chat', c ? c.title : '');
-          if (!title || !title.trim()) return;
+          const title = await uiPrompt('Rename chat', c ? c.title : '');
+          if (!title) return;
           await api(`api/infra/chats/${encodeURIComponent(chatBtn.dataset.renamechat)}/rename`, { method: 'POST', body: { title } });
         } else if (chatBtn.dataset.delmsg) {
-          if (!confirm('Delete this message and its answer?')) return;
+          if (!await uiConfirm('Delete this message?', 'Its answer is deleted too.', { ok: 'Delete', danger: true })) return;
           await api(`api/infra/${encodeURIComponent(chatBtn.dataset.agent)}/tasks/${chatBtn.dataset.delmsg}`, { method: 'DELETE' });
         } else if (chatBtn.dataset.delgroup) {
-          if (!confirm('Delete this message and every agent\'s answer to it?')) return;
+          if (!await uiConfirm('Delete this message?', 'Every agent\'s answer to it is deleted too.', { ok: 'Delete', danger: true })) return;
           await api(`api/infra/_all/groups/${chatBtn.dataset.delgroup}`, { method: 'DELETE' });
-        } else if (chatBtn.classList.contains('chat-item')) {
-          st.chatSel[scope] = chatBtn.dataset.chat; rerender(); return;
+        } else if (chatBtn.dataset.cancelgroup) {
+          for (const a of agents()) for (const t of (a.tasks || [])) {
+            if (t.group === chatBtn.dataset.cancelgroup && t.status === 'queued') await api(`api/infra/${encodeURIComponent(a.name)}/tasks/${t.id}/cancel`, { method: 'POST', body: {} }).catch(() => {});
+          }
+          toast('Cancelled');
+        } else if (chatBtn.dataset.retry) {
+          const text = (agents().flatMap(a => a.tasks || []).find(t => t.id === chatBtn.dataset.retry) || {}).text;
+          if (!text || !c) return;
+          chatBtn.disabled = true;
+          await sendMessage(c.scope, c.id, text);
+          toast('Asked again');
         }
         await load(state.data); rerender();
       } catch (err) { toast(err.message, true); }
       return;
     }
+
+    // ---- package picker on approvals
     const pick = e.target.closest('[data-pick]');
     if (pick) {
       const key = pick.closest('[data-sel]').dataset.sel;
@@ -900,53 +1178,38 @@ const Dash = (() => {
       rerender();
       return;
     }
-    const cp = e.target.closest('[data-copy-plan]');
-    if (cp) {
-      const text = plans.get(cp.dataset.copyPlan) || '';
-      try { await navigator.clipboard.writeText(text); }
-      catch {
-        const ta = document.createElement('textarea'); ta.value = text; document.body.append(ta); ta.select();
-        document.execCommand('copy'); ta.remove();
-      }
-      toast('Plan copied. Paste it into Claude Code.');
-      return;
-    }
+
+    // ---- one-click container / host actions
     const act = e.target.closest('[data-act]');
     if (act) {
       const { agent, vmid, name } = act.dataset;
       const type = act.dataset.act;
-      const ask = {
-        start: `Start ${name}?`, shutdown: `Shut down ${name}? Its services stop until you start it again.`,
-        reboot: `Reboot ${name}? Its services are briefly unavailable.`, snapshot: `Take a snapshot of ${name}?`,
-        backup: `Back up ${name} now to the backup storage?`,
-        check: `Check ${name} for updates now? (Refreshes its package list; nothing is installed.)`,
-        update: `Install all pending updates on ${name} now? A snapshot is taken first and it rolls back automatically if services break.`,
-        'update-all': `Run the full nightly update on ${name} now? Every container is snapshotted, updated and checked one by one.`,
-        'check-updates': `Check ${name} for host package updates now?`,
-      }[type];
-      if (!confirm(ask)) return;
+      const [title, text] = (ACT_TEXT[type] || (n => [`${type} ${n}?`, '']))(name);
+      if (!await uiConfirm(title, text, { ok: ACT_OK[type] || 'Yes', danger: type === 'shutdown' })) return;
       act.disabled = true;
       try {
         await api(`api/infra/${encodeURIComponent(agent)}/actions`, { method: 'POST', body: { type, vmid: vmid ? Number(vmid) : null } });
-        toast('Sent. Progress shows here.');
+        toast('Sent to the agent. Progress shows here.');
         await load(state.data); rerender();
       } catch (err) { toast(err.message, true); act.disabled = false; }
       return;
     }
+
+    // ---- approvals and task cancel
     const dec = e.target.closest('[data-decide]');
     const cancel = e.target.closest('[data-cancel]');
     try {
       if (dec) {
         const { agent, pid: id } = dec.dataset;
-        const selNow = st.sel.get(`${agent}:${id}`);
-        const what = dec.closest('.approval').querySelector('b').textContent + (dec.dataset.decide === 'approve' && selNow ? ` (${selNow.size} package${selNow.size === 1 ? '' : 's'})` : '');
-        if (!confirm(`${dec.dataset.decide === 'approve' ? 'Approve' : 'Deny'}: ${what}?`)) return;
-        dec.disabled = true;
+        const approve = dec.dataset.decide === 'approve';
         const sel = st.sel.get(`${agent}:${id}`);
+        const what = dec.closest('.approval').querySelector('.ap-title').textContent;
+        if (!await uiConfirm(`${approve ? 'Approve' : 'Deny'}: ${what}?`, approve && sel ? `${sel.size} package${sel.size === 1 ? '' : 's'} selected.` : '', { ok: approve ? 'Approve' : 'Deny', danger: !approve })) return;
+        dec.disabled = true;
         const body = { id, decision: dec.dataset.decide };
-        if (dec.dataset.decide === 'approve' && sel) body.packages = [...sel];
+        if (approve && sel) body.packages = [...sel];
         await api(`api/infra/${encodeURIComponent(agent)}/decision`, { method: 'POST', body });
-        toast(dec.dataset.decide === 'approve' ? `Approved. ${agent} is starting on it.` : 'Denied.');
+        toast(approve ? `Approved. ${agent} is starting on it.` : 'Denied.');
       } else if (cancel) {
         await api(`api/infra/${encodeURIComponent(cancel.dataset.agent)}/tasks/${cancel.dataset.cancel}/cancel`, { method: 'POST', body: {} });
         toast('Cancelled');
@@ -956,8 +1219,12 @@ const Dash = (() => {
   });
 
   document.addEventListener('keydown', e => {
-    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('tr.crow')) { e.preventDefault(); e.target.click(); }
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.closest && e.target.closest('.ask-form')) { e.preventDefault(); e.target.closest('form').requestSubmit(); }
+    const t = e.target;
+    if ((e.key === 'Enter' || e.key === ' ') && t.matches && t.matches('tr.crow, .chat-item')) { e.preventDefault(); t.click(); return; }
+    if (e.key === 'Enter' && t.closest && t.closest('.ask-form') && t.tagName === 'TEXTAREA' && !e.isComposing) {
+      // Enter sends (Shift+Enter = new line). On touch screens Enter is a new line and the Send button sends.
+      if (e.ctrlKey || e.metaKey || (!e.shiftKey && !coarse())) { e.preventDefault(); t.closest('form').requestSubmit(); }
+    }
   });
 
   document.addEventListener('submit', async e => {
@@ -968,20 +1235,17 @@ const Dash = (() => {
     const text = form.text.value.trim();
     if (!text) return;
     const btn = form.querySelector('button[type="submit"]');
+    if (btn.disabled) return;
     btn.disabled = true;
     try {
-      const r = await api(`api/infra/${encodeURIComponent(agent)}/tasks`, { method: 'POST', body: { text, ...(form.dataset.chat ? { chat: form.dataset.chat } : {}) } });
-      const chatId = agent === '_all' ? (r.tasks && r.tasks[0] && r.tasks[0].chat) : r.chat;
-      if (chatId) st.chatSel[agent] = chatId;
+      await sendMessage(agent, form.dataset.chat || null, text);
       st.drafts[form.dataset.draft] = '';
-      st.drafts[agent] = '';
       form.text.value = '';
       delete form.text.dataset.dirty;
-      form.text.blur();
-      toast(agent === '_all' ? 'Sent to every agent.' : `Sent to ${agent}.`);
       await load(state.data); rerender();
+      focusComposer();
     } catch (err) { toast(err.message, true); } finally { btn.disabled = false; }
   });
 
-  return { load, render };
+  return { load, render, fitComposer };
 })();

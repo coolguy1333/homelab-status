@@ -752,7 +752,7 @@ async function handleApi(req, res, url) {
   const dm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/tasks\/([a-f0-9]{12})$/);
   if (dm && method === 'DELETE') { if (needAuth()) return; infra.deleteMessage(dm[1], dm[2]); return send(res, 200, { ok: true }); }
 
-  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions)(?:\/([a-f0-9]{12})\/cancel)?$/);
+  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions|policy)(?:\/([a-f0-9]{12})\/cancel)?$/);
   if (im) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
     if (needAuth() || needJson()) return;
@@ -762,7 +762,8 @@ async function handleApi(req, res, url) {
       infra.decide(im[1], String(body.id || ''), String(body.decision || ''), who, Array.isArray(body.packages) ? body.packages.slice(0, 1000) : null);
       return send(res, 200, { ok: true });
     }
-    if (im[3]) { infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
+    if (im[3]) { if (im[2] !== 'tasks') return send(res, 404, { error: 'Not found' }); infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
+    if (im[2] === 'policy') return send(res, 200, infra.setPolicy(im[1], bool(body.securityOnly), who));
     if (im[2] === 'actions') return send(res, 201, infra.addAction(im[1], String(body.type || ''), body.vmid, who));
     if (!String(body.text || '').trim()) return send(res, 400, { error: 'Write a message first' });
     const chatId = body.chat ? String(body.chat).slice(0, 40) : null;

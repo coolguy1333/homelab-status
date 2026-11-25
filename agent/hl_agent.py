@@ -5,6 +5,7 @@ Runs on a connector container as user `agent`, reaching its Proxmox host as root
 
   hl_agent.py report        collect status, auto-fix the obvious, send report, pick up approvals/tasks (every 5 min)
   hl_agent.py update        nightly: snapshot -> risk check -> update -> health check -> roll back if broken
+                            (security updates only when the dashboard's nightly policy says so)
   hl_agent.py action <id>   carry out an approved pending item (started by `report`)
   hl_agent.py task <id>     run a task sent from the dashboard through Claude (started by `report`)
   hl_agent.py show          print the report that would be sent
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -707,7 +708,10 @@ def build_report(s, host, containers):
         "services": s.get("serviceChecks", []),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
-        "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300},
+        "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300,
+                     "securityOnly": bool((s.get("policy") or {}).get("securityOnly"))},
+        "policy": s.get("policy"),
+        "progress": s.get("progress"),
         "usage": usage_report(s),
         "autoTasks": [{"t": t["t"], "status": t["status"], "text": t["text"][:300], "output": t.get("output", "")[-4000:]}
                       for t in internal[-5:]],
@@ -722,7 +726,8 @@ def sync(url, wait=0):
         results = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage")}
                    for t in s["tasks"].values() if not t.get("internal") and t.get("u", t["t"]) > cutoff]
         acked = list(s["handled"].keys())
-    data = json.dumps({"taskResults": results, "acked": acked, "wait": wait}).encode()
+        prog = s.get("progress")
+    data = json.dumps({"taskResults": results, "acked": acked, "wait": wait, "progress": prog}).encode()
     req = urllib.request.Request(url.rstrip("/") + "/api/agent/sync", data=data, method="POST", headers={
         "Content-Type": "application/json", "Authorization": f"Bearer {CFG['token']}",
         "User-Agent": f"homelab-agent/{VERSION}"})
@@ -751,6 +756,8 @@ def cmd_poll():
                 if r.get("tasks") or r.get("decisions"):
                     handle_replies([r])
                     sync(url, 0)  # show "running" on the dashboard right away
+                elif isinstance(r.get("policy"), dict):
+                    handle_replies([r])  # nightly policy change only
             except (urllib.error.URLError, OSError, ValueError) as e:
                 log(f"poll {url}: {e}")
                 time.sleep(backoff)
@@ -777,6 +784,7 @@ def post(url, payload):
 
 def cmd_report(send=True):
     with state() as s:
+        clear_stale_progress(s)
         try:
             host, containers = collect(s)
             try:
@@ -829,13 +837,19 @@ def handle_replies(replies):
     """Act on decisions and tasks the dashboard sent back (from a report or a quick sync)."""
     if not replies:
         return
-    decisions, tasks = {}, {}
+    decisions, tasks, policy = {}, {}, None
     for r in replies:
+        if isinstance(r.get("policy"), dict):
+            policy = r["policy"]
         for d in r.get("decisions", []):
             decisions[d["id"]] = d
         for t in r.get("tasks", []):
             tasks[t["id"]] = t
     with state() as s:
+        if policy is not None and (s.get("policy") or {}).get("at") != policy.get("at"):
+            s["policy"] = {"securityOnly": bool(policy.get("securityOnly")), "at": policy.get("at"), "by": policy.get("by")}
+            event("info", f"Nightly updates set to {'security updates only' if s['policy']['securityOnly'] else 'full (risk-checked)'}"
+                          f" by {policy.get('by') or 'the dashboard'}", s)
         for did, d in decisions.items():
             if did in s["handled"]:
                 continue
@@ -1029,10 +1043,70 @@ def set_container(vmid, **kw):
         s["containers"].setdefault(str(vmid), {}).update(kw)
 
 
+# ------------------------------------------------------------------ live update progress (shown as a bar on the dashboard)
+
+def progress_start(kind, mode, targets):
+    """Begin a progress record for an update run (kind: run = every container, single = one container)."""
+    if DRY:
+        return
+    with state() as s:
+        s["progress"] = {"kind": kind, "mode": mode, "total": len(targets), "done": 0, "startedAt": now_ms(), "u": now_ms(),
+                         "current": None, "step": None, "results": []}
+    sync_now()
+
+
+def progress(step=None, push=True, **kw):
+    """Move the active progress record on (no-op when no update is running) and push it to the dashboard."""
+    with state() as s:
+        p = s.get("progress")
+        if not p:
+            return
+        if step:
+            p["step"] = step
+        p.update(kw)
+        p["u"] = now_ms()
+    if push:
+        sync_now()
+
+
+def progress_result(vmid, name, result):
+    with state() as s:
+        p = s.get("progress")
+        if not p:
+            return
+        p["done"] = min(p["total"], p["done"] + 1)
+        p["results"] = (p.get("results") or [])[-59:] + [{"vmid": vmid, "name": name, "r": str(result)[:300]}]
+        p["current"], p["step"], p["u"] = None, None, now_ms()
+    sync_now()
+
+
+def clear_stale_progress(s):
+    """A progress record with no update holding the lock is left over from a killed run: drop it."""
+    if not s.get("progress"):
+        return
+    try:
+        with open(UPDATE_LOCK, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lf, fcntl.LOCK_UN)
+    except OSError:  # BlockingIOError: an update is running right now
+        return
+    s["progress"] = None
+
+
+def progress_end():
+    if DRY:
+        return
+    with state() as s:
+        s["progress"] = None
+    sync_now()
+
+
 def update_container(vmid, name, mode="auto", only=None):
-    """mode: auto (nightly), full (approved). Returns a short result string for the run summary."""
+    """mode: auto (nightly), full (approved / "Update now"), security (security updates only).
+    Returns a short result string for the run summary."""
     is_self = vmid == CFG.get("self_vmid")
     label = f"{name} ({vmid})"
+    progress("apt-update", current={"vmid": vmid, "name": name})
     rc, out = cx(vmid, "command -v apt-get >/dev/null || { echo NOAPT; exit 0; }; apt-get update -q 2>&1 | tail -5", 900)
     if "NOAPT" in out:
         return f"{label}: skipped (no apt)"
@@ -1054,9 +1128,14 @@ def update_container(vmid, name, mode="auto", only=None):
 
     if mode == "full":
         plan, reasons = "full", []
+    elif mode == "security":
+        plan, reasons = ("security" if sec else "none"), ["security-only mode"]
+        if not sec:
+            return f"{label}: no security updates ({len(pkgs)} other update(s) left for later)"
     elif blocked:
         plan, reasons = ("security" if sec else "none"), [f"full updates paused: {blocked}"]
     else:
+        progress("review", pkgs=len(pkgs))
         risk, reasons = risk_review(name, pkgs, removals)
         plan = "full" if risk == "low" else ("security" if sec else "none")
 
@@ -1064,7 +1143,7 @@ def update_container(vmid, name, mode="auto", only=None):
         return (f"{label}: DRY RUN plan={plan} pkgs={len(pkgs)} security={len(sec)} removals={removals[:5]} "
                 f"reasons={reasons[:3]} health={ {k: sorted(v) if isinstance(v, set) else v for k, v in health(vmid).items()} }")
 
-    if plan != "full" and mode != "full":
+    if plan != "full" and mode not in ("full", "security"):
         # Leave the rest for the user to approve.
         others = [p for p in pkgs if not p["security"]] if plan == "security" else pkgs
         pid = f"ct-update-{vmid}-" + hashlib.sha1(json.dumps([(p['name'], p['new']) for p in others]).encode()).hexdigest()[:8]
@@ -1085,6 +1164,7 @@ def update_container(vmid, name, mode="auto", only=None):
 
     # Snapshot first. Without one there is no rollback, so only security fixes go in.
     snap = "hlauto" + time.strftime("%Y%m%d%H%M")
+    progress("snapshot")
     rc, out = ssh(f"pct snapshot {int(vmid)} {snap} --description 'homelab agent: before updates'", 600)
     if rc != 0:
         event("warn", f"{label}: snapshot failed ({out[-150:]}); installing security updates only, no rollback possible")
@@ -1112,6 +1192,7 @@ def update_container(vmid, name, mode="auto", only=None):
         names = " ".join(shlex.quote(p["name"]) for p in sec)
         cmd = f"{APT_ENV} apt-get {APT_OPTS} install --only-upgrade {names} 2>&1 | tail -30"
         what = f"{len(sec)} security update(s)"
+    progress("install", what=what)
     rc, out = cx(vmid, cmd, 3600)
     apt_ok = "E: " not in out
     rc2, rr = cx(vmid, "test -f /var/run/reboot-required && echo YES || true", 60)
@@ -1130,8 +1211,10 @@ def update_container(vmid, name, mode="auto", only=None):
         return f"{label}: {what} installed{' (reboot scheduled)' if needs_reboot else ''}"
 
     if needs_reboot:
+        progress("reboot")
         ssh(f"pct reboot {int(vmid)}", 300)
         wait_running(vmid)
+    progress("health")
     time.sleep(15)
     post_h = health(vmid)
     problems = broken(pre, post_h)
@@ -1141,6 +1224,7 @@ def update_container(vmid, name, mode="auto", only=None):
         problems = broken(pre, post_h)
 
     if problems and snap:
+        progress("rollback")
         rc, out2 = ssh(f"pct stop {int(vmid)}; pct rollback {int(vmid)} {snap} && pct start {int(vmid)}", 900)
         msg = f"{label}: update broke it ({'; '.join(problems)}); rolled back to {snap}" + ("" if rc == 0 else f" — ROLLBACK FAILED: {out2[-200:]}")
         event("error", msg)
@@ -1197,7 +1281,11 @@ def check_host_updates():
     return len(pkgs)
 
 
-def cmd_update():
+def cmd_update(mode=None):
+    """Nightly run. mode: None = follow the dashboard's policy, "security" = security updates only."""
+    if mode is None:
+        with state() as s:
+            mode = "security" if (s.get("policy") or {}).get("securityOnly") else "auto"
     with open(UPDATE_LOCK, "w") as lf:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1218,24 +1306,30 @@ def cmd_update():
             targets.append((vmid, c.get("name") or str(vmid)))
         targets.sort(key=lambda t: (t[0] == CFG.get("self_vmid"), t[0]))  # ourselves last
         results = []
-        for vmid, name in targets:
-            try:
-                results.append(update_container(vmid, name))
-            except Exception as e:
-                results.append(f"{name} ({vmid}): error {e}")
-                event("error", f"{name} ({vmid}): update run crashed: {e}")
-            log(results[-1])
-        if DRY:
-            print("\n".join(results))
-            return
+        progress_start("run", mode, targets)
         try:
-            n = check_host_updates()
-            results.append(f"host: {n} update(s) waiting for approval" if n else "host: up to date")
-        except Exception as e:
-            results.append(f"host: update check failed: {e}")
+            for vmid, name in targets:
+                try:
+                    results.append(update_container(vmid, name, mode=mode))
+                except Exception as e:
+                    results.append(f"{name} ({vmid}): error {e}")
+                    event("error", f"{name} ({vmid}): update run crashed: {e}")
+                log(results[-1])
+                progress_result(vmid, name, results[-1])
+            if DRY:
+                print("\n".join(results))
+                return
+            progress("host")
+            try:
+                n = check_host_updates()
+                results.append(f"host: {n} update(s) waiting for approval" if n else "host: up to date")
+            except Exception as e:
+                results.append(f"host: update check failed: {e}")
+        finally:
+            progress_end()
         bad = [r for r in results if "ROLLED BACK" in r or "BROKEN" in r or "error" in r or "failed" in r]
         held = [r for r in results if "held" in r]
-        summary = (f"{len(targets)} container(s) checked in {round((now_ms() - started) / 60000)} min" +
+        summary = (("Security-only run: " if mode == "security" else "") + f"{len(targets)} container(s) checked in {round((now_ms() - started) / 60000)} min" +
                    (f"; {len(bad)} problem(s)" if bad else "") + (f"; {len(held)} with updates held" if held else ""))
         with state() as s:
             s["updateRuns"].append({"t": now_ms(), "level": "error" if bad else "warn" if held else "info",
@@ -1281,7 +1375,11 @@ def cmd_action(pid):
             name = out.strip() or str(vmid)
             with open(UPDATE_LOCK, "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
-                r = update_container(vmid, name, mode="full", only=item.get("selected"))
+                progress_start("single", "selected" if item.get("selected") else "full", [vmid])
+                try:
+                    r = update_container(vmid, name, mode="full", only=item.get("selected"))
+                finally:
+                    progress_end()
             event("info", f"Approved update: {r}")
             with state() as s:
                 s["pending"].pop(pid, None)
@@ -1336,13 +1434,18 @@ def cmd_ctaction(tid):
             ok, out = rc == 0 and "ERROR" not in o, o
             with state() as s:
                 s.pop("slow", None)  # refresh the backup list on the next report
-        elif typ == "update":
+        elif typ in ("update", "update-security"):
             with open(UPDATE_LOCK, "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
-                out = update_container(vmid, name, mode="full")
+                mode = "full" if typ == "update" else "security"
+                progress_start("single", mode, [vmid])
+                try:
+                    out = update_container(vmid, name, mode=mode)
+                finally:
+                    progress_end()
             ok = "ROLLED BACK" not in out and "BROKEN" not in out and "failed" not in out
-        elif typ == "update-all":
-            cmd_update()
+        elif typ in ("update-all", "update-all-security"):
+            cmd_update("security" if typ == "update-all-security" else None)
             with state() as s:
                 runs = s["updateRuns"]
                 out = runs[-1]["summary"] if runs else "done"
