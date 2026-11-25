@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.6.0
+
+- Agent 1.8: snapshot cleanup, about every 30 minutes. Only the agents' own snapshots are deleted:
+  - `hlauto…` (before updates): keep the newest 2 per container; older ones go.
+  - `hlfix…` (an agent's snapshot before a fix; older ones named `hlmanual…`): deleted after 7 days.
+  - `hlmanual…` from the dashboard's Snapshot button: deleted after 30 days.
+  - Snapshots with any other name (the ones you make yourself) are never touched.
+  Nothing is deleted while an update is running, and every deletion shows up in Activity.
+
 ## 2.5.2
 
 - Agent 1.7.1 (fixes first found by the connector1 agent):

@@ -28,8 +28,9 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
 
 ## Rules
 1. **Containers (LXC):** you may diagnose, fix, restart, and update them. **Before changing anything
-   inside a container, take a snapshot**: `pct snapshot <vmid> hlmanual$(date +%Y%m%d%H%M)`. Say
-   which snapshot you took so it can be rolled back.
+   inside a container, take a snapshot**: `pct snapshot <vmid> hlfix$(date +%Y%m%d%H%M) --description 'agent: before <what>'`.
+   Say which snapshot you took so it can be rolled back. `hlfix*` snapshots are deleted automatically after 7 days;
+   never delete snapshots that don't start with `hlauto`/`hlfix`/`hlmanual`.
 2. **The Proxmox host itself:** read anything, but change host packages, configuration, storage,
    networking, or the firewall, or reboot the host, **only when the owner's request explicitly asks
    for it**. Otherwise explain what should be done and why.

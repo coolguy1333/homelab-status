@@ -590,7 +590,7 @@ const Dash = (() => {
       <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${t.status !== 'OK' && t.status !== 'running' ? ` — <span class="pct-bad">${esc(t.status)}</span>` : ''}</span></li>`).join('');
 
     const servers = pbsServers();
-    return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent update snapshots (hlauto…) are listed too.')}
+    return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent snapshots clean themselves up: update snapshots keep the newest 2, fix snapshots go after 7 days, dashboard snapshots after 30. Snapshots you make in Proxmox are never touched.')}
       ${kpis}
       ${servers.length ? `<div class="hosts">${servers.map(pbsCard).join('')}</div>` : ''}
       <h3 class="sec-title">Containers</h3>
