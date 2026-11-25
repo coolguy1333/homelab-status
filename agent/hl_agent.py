@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -425,6 +425,7 @@ def collect_slow(s, node, host, containers, force=False):
             who = f" of {t['vmid']}" if t["vmid"] else ""
             event("error", f"Backup{who} failed: {t['status']}", s)
     s["seenTasks"] = {k: v for k, v in seen.items() if now_ms() - v < 14 * 86400e3}
+    names = {c["vmid"]: c["name"] for c in containers}
     snaps = {}
     for v in sorted(vmids):
         try:
@@ -432,6 +433,10 @@ def collect_slow(s, node, host, containers, force=False):
                         for x in ssh_json(f"pvesh get /nodes/{node}/lxc/{v}/snapshot --output-format json") if x.get("name") != "current"]
         except Exception:
             pass
+    for v in sorted(snaps):
+        removed = cleanup_snapshots(v, snaps[v], s, names.get(v, str(v)))
+        if removed:
+            snaps[v] = [x for x in snaps[v] if x["name"] not in removed]
     for j in jobs:
         j.pop("_raw", None)
     slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40], "pbs": pbs,
@@ -939,7 +944,7 @@ def cmd_task(tid):
               "**bold** for key facts, `code` for commands/paths, and tables where they help. Keep it concise. "
               "End with what you changed (or 'No changes made') and any snapshot you took.\n\n"
               "If you could NOT fully solve it — because the fix is outside what you may do (host changes the owner "
-              "did not explicitly ask for, the other Proxmox host, VMs, the backup server, the router/firewall, "
+              "did not explicitly ask for, the other Proxmox host, VMs, deleting backups, the router/firewall, "
               "Cloudflare), you lack access, or you are not confident — finish with a section headed exactly "
               "`## Handoff plan for Claude Code`. Write it so the owner can paste it straight into Claude Code on "
               "their PC, which can SSH into both connector containers over Tailscale and from there reach the "
@@ -1039,9 +1044,16 @@ def health(vmid):
     failed_part, _, ports_part = out.partition("---")
     ports = set()
     for a in ports_part.split():
-        port = a.rsplit(":", 1)[-1]
-        if port.isdigit():
-            ports.add(port)
+        addr, _, port = a.rpartition(":")
+        if not port.isdigit():
+            continue
+        # Ports only the container itself can reach (127.x / ::1) aren't services anyone depends on, and ports
+        # in the ephemeral range get a new random number every restart (e.g. containerd's): neither counts as lost.
+        if addr.startswith("127.") or addr in ("[::1]", "::1") or "%lo" in addr:
+            continue
+        if 32768 <= int(port) <= 60999:
+            continue
+        ports.add(port)
     return {"running": True, "failed": set(failed_part.split()), "ports": ports}
 
 
@@ -1073,9 +1085,60 @@ def snapshots(vmid):
     return re.findall(r"(hlauto\d{12})", out)
 
 
+DAY_MS = 86400e3
+SNAP_RE = re.compile(r"^(hlauto|hlfix|hlmanual)\d{12}$")
+
+
+def snapshot_expired(snap, newest_auto):
+    """Is this one of OUR snapshots that is no longer useful? Snapshots not made by the agents never are."""
+    m = SNAP_RE.match(snap["name"])
+    if not m:
+        return None  # made by a person in Proxmox: never touched
+    age = now_ms() - (snap.get("t") or now_ms())
+    kind = m.group(1)
+    if kind == "hlauto":
+        if snap["name"] in newest_auto:
+            return None
+        return "superseded by newer update snapshots"
+    from_dashboard = "from the dashboard" in (snap.get("description") or "")
+    limit = 30 if (kind == "hlmanual" and from_dashboard) else 7
+    if age > limit * DAY_MS:
+        return f"older than {limit} days"
+    return None
+
+
+def cleanup_snapshots(vmid, snaps, s, name):
+    """Delete expired agent snapshots of one container. Skipped while an update run holds the lock."""
+    auto = sorted((x for x in snaps if x["name"].startswith("hlauto")), key=lambda x: x.get("t") or 0)
+    keep_auto = {x["name"] for x in auto[-2:] if now_ms() - (x.get("t") or 0) <= 7 * DAY_MS}
+    if auto and not keep_auto:  # even if all are older than 7 days, keep the very newest one
+        keep_auto = {auto[-1]["name"]} if now_ms() - (auto[-1].get("t") or 0) <= 30 * DAY_MS else set()
+    doomed = [(x, why) for x in snaps if (why := snapshot_expired(x, keep_auto))]
+    if not doomed:
+        return []
+    try:
+        lf = open(UPDATE_LOCK, "w")
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        return []  # an update is running and may still need its snapshot
+    removed = []
+    try:
+        for x, why in doomed[:10]:
+            rc, out = ssh(f"pct delsnapshot {int(vmid)} {x['name']}", 600)
+            if rc == 0:
+                removed.append(x["name"])
+                event("info", f"Deleted snapshot {x['name']} of {name} ({vmid}): {why}", s)
+            else:
+                log(f"could not delete snapshot {x['name']} of {vmid}: {out[-200:]}")
+    finally:
+        lf.close()
+    return removed
+
+
 def prune_snapshots(vmid):
     snaps = sorted(set(snapshots(vmid)))
-    for name in snaps[:-CFG["keep_snapshots"]] if len(snaps) > CFG["keep_snapshots"] else []:
+    keep = min(2, CFG["keep_snapshots"])
+    for name in snaps[:-keep] if len(snaps) > keep else []:
         rc, out = ssh(f"pct delsnapshot {int(vmid)} {name}", 600)
         if rc != 0:
             log(f"could not delete snapshot {name} of {vmid}: {out[-200:]}")
@@ -1475,6 +1538,10 @@ def cmd_action(pid):
             vmid = int(item["vmid"])
             rc, out = ssh(f"pct config {vmid} | sed -n 's/^hostname: //p'")
             name = out.strip() or str(vmid)
+            # Consume the approval BEFORE updating: if this attempt is rolled back again, update_container
+            # creates a fresh "Retry updates" approval (often with the same id), which must survive.
+            with state() as s:
+                s["pending"].pop(pid, None)
             with open(UPDATE_LOCK, "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
                 progress_start("single", "selected" if item.get("selected") else "full", [vmid], f"Approved update: {name} ({vmid})")
@@ -1484,8 +1551,6 @@ def cmd_action(pid):
                 finally:
                     progress_end(summary=r)
             event("info", f"Approved update: {r}")
-            with state() as s:
-                s["pending"].pop(pid, None)
         else:
             event("warn", f"Don't know how to do approved item {pid} ({kind})")
     except Exception as e:

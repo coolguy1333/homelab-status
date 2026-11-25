@@ -259,7 +259,7 @@ const Dash = (() => {
     for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
     return true;
   };
-  // ---- live update progress (agent 1.7+)
+  // ---- live update progress (agent 1.9+)
   const STEP = {
     'apt-update': ['refreshing package lists', 0.08], review: ['reviewing the updates', 0.2], snapshot: ['taking a snapshot', 0.3],
     install: ['installing', 0.45], reboot: ['rebooting', 0.75], health: ['checking services', 0.85], rollback: ['rolling back', 0.9], host: ['checking host updates', 0],
@@ -571,7 +571,7 @@ const Dash = (() => {
       const sch = a.report.schedule || {};
       const applied = Boolean(sch.securityOnly);
       const want = a.policy ? a.policy.securityOnly : applied;
-      const oldAgent = !verGte(a.report.agentVersion, '1.7.0');
+      const oldAgent = !verGte(a.report.agentVersion, '1.9.0');
       const syncing = a.policy && !oldAgent && (!a.report.policy || a.report.policy.at !== a.policy.at);
       const ctSec = containers().filter(c => c.agent === a.name).reduce((n, c) => n + ((c.updates && c.updates.security) || 0), 0);
       return `<div class="card pad sched"><div class="host-head">${dot(a.online ? 'up' : 'down')}<div><h3>${esc(hostOf(a))}</h3>
@@ -579,7 +579,7 @@ const Dash = (() => {
           · <button class="linkbtn" data-act="check-updates" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">check now</button></div></div></div>
         <div class="policy"><span class="pol-k">Nightly run installs</span>
           <div class="seg small" data-policy="${esc(a.name)}"><button class="${want ? '' : 'on'}" data-val="full" title="Security updates always; everything else when the agent rates it low-risk (the rest waits for approval)">Everything low-risk</button><button class="${want ? 'on' : ''}" data-val="security" title="Only security updates; nothing else is installed or queued for approval">Security only</button></div>
-          ${oldAgent && a.policy ? `<span class="pct-warn pol-note">agent ${esc(a.report.agentVersion || '?')} ignores this — update it to 1.7</span>` : syncing ? '<span class="muted pol-note">sending to the agent…</span>' : ''}</div>
+          ${oldAgent && a.policy ? `<span class="pct-warn pol-note">agent ${esc(a.report.agentVersion || '?')} ignores this — update it to 1.9</span>` : syncing ? '<span class="muted pol-note">sending to the agent…</span>' : ''}</div>
         ${last ? `<p>${levelTag(last.level)} Last run ${esc(ago(last.t))}: ${esc(last.summary.split('\n')[0])}</p>` : '<p class="muted">No update run yet — the first one is tonight.</p>'}
         <div class="cd-actions"><button class="btn small" data-act="update-all" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}">⟳ Run the nightly update now</button>
           <button class="btn small" data-act="update-all-security" data-agent="${esc(a.name)}" data-name="${esc(hostOf(a))}" ${ctSec ? '' : 'title="No container reports security updates right now"'}>⛨ Security updates only${ctSec ? ` (${ctSec})` : ''}</button></div>
@@ -666,7 +666,7 @@ const Dash = (() => {
       <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${t.status !== 'OK' && t.status !== 'running' ? ` — <span class="pct-bad">${esc(t.status)}</span>` : ''}</span></li>`).join('');
 
     const servers = pbsServers();
-    return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent update snapshots (hlauto…) are listed too.')}
+    return `${pageHead('Backups', 'Proxmox backup jobs, what each container has on the backup storage, and recent runs. Agent snapshots clean themselves up: update snapshots keep the newest 2, fix snapshots go after 7 days, dashboard snapshots after 30. Snapshots you make in Proxmox are never touched.')}
       ${kpis}
       ${servers.length ? `<div class="hosts">${servers.map(pbsCard).join('')}</div>` : ''}
       <h3 class="sec-title">Containers</h3>
@@ -973,7 +973,7 @@ const Dash = (() => {
     if (f.level) lines = lines.filter(l => l.l !== 'info');
     if (f.q) { const q = f.q.toLowerCase(); lines = lines.filter(l => `${l.m} ${l.p}`.toLowerCase().includes(q)); }
     lines = lines.slice(-800);
-    const old = sel.filter(a => !verGte(a.report.agentVersion, '1.8.0'));
+    const old = sel.filter(a => !verGte(a.report.agentVersion, '1.9.0'));
     const runs = [];
     for (const a of sel) for (const r of (a.runs || [])) runs.push({ a, r });
     runs.sort((x, y) => (y.r.t || 0) - (x.r.t || 0));
@@ -984,12 +984,12 @@ const Dash = (() => {
         <div class="seg" data-logf="level">${[['', 'Everything'], ['problems', 'Warnings & errors']].map(([v, l]) => `<button class="${f.level === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div>
         <input type="search" class="search" data-logq placeholder="Search the log…" aria-label="Search the log" value="${esc(f.q)}">
       </div>
-      ${old.length ? `<p class="hint">${esc(old.map(a => `${hostOf(a)} (agent ${a.report.agentVersion || '?'})`).join(', '))}: logs need agent 1.8 — re-run install.sh on that connector.</p>` : ''}
+      ${old.length ? `<p class="hint">${esc(old.map(a => `${hostOf(a)} (agent ${a.report.agentVersion || '?'})`).join(', '))}: logs need agent 1.9 — re-run install.sh on that connector.</p>` : ''}
       ${running.map(a => `<div class="card pad"><div class="att-head"><h3><span class="spin"></span> Live: ${esc(a.progress.title || `update on ${hostOf(a)}`)}</h3><a href="#updates">Progress →</a></div>${logBox(a.progress.log || [], `live:${a.name}`, { proc: false })}</div>`).join('')}
       <h3 class="sec-title">Update runs</h3>
       <div class="card table-card"><div class="table-wrap"><table class="ctable ct-runs">
         <thead><tr><th>Started</th><th>Host</th><th>What</th><th>Result</th><th>Done</th><th>Took</th><th></th></tr></thead>
-        <tbody>${runRows(runs) || '<tr><td colspan="7" class="muted">No update runs logged yet. They appear here after the next update (agent 1.8+).</td></tr>'}</tbody></table></div></div>
+        <tbody>${runRows(runs) || '<tr><td colspan="7" class="muted">No update runs logged yet. They appear here after the next update (agent 1.9+).</td></tr>'}</tbody></table></div></div>
       <h3 class="sec-title">Agent log</h3>
       <div class="card pad log-card">
         <div class="att-head"><span class="muted">${st.logErr ? `<span class="pct-bad">${esc(st.logErr)}</span>` : `${lines.length}${lines.length !== total ? ` of ${total}` : ''} line${total === 1 ? '' : 's'} · newest at the bottom · refreshes every 5 s`}</span>

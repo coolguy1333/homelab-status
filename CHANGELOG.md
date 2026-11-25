@@ -1,6 +1,11 @@
 # Changelog
 
-## 2.7.0
+## 2.8.1
+
+- Merged main (agent 1.7 PBS access, 1.7.1 health-check and retry fixes, 1.8 snapshot cleanup) with the dashboard work
+  below. The combined agent is **1.9.0**; the dashboard's nightly-policy and log features check for 1.9.0.
+
+## 2.8.0
 
 - **Agent logs on the dashboard.** A new **Logs** page shows each agent's own log (what it ran, warnings, errors),
   refreshed every 5 s, with a host filter, "warnings & errors" filter, search, copy and download.
@@ -9,14 +14,14 @@
   on the Updates page shows it live; afterwards **View log** opens it (Updates → host card → Update logs, and the
   Logs page). Logs of the last 40 runs per host are kept in `runlogs.json`.
 - One-click container actions get **View output** (for updates this includes the full log).
-- Agent 1.8.0: writes `~/agent/logs/agent.log` and sends its tail with each report and quick sync; update runs record
+- Agent 1.9.0 (includes 1.7.1 and 1.8 from main): writes `~/agent/logs/agent.log` and sends its tail with each report and quick sync; update runs record
   their own log.
 
-## 2.6.0
+## 2.7.0
 
 - **Security-only updates.** Each host's nightly run can be switched between "everything low-risk" (as before) and
   "security updates only" on the Updates page. Containers also get a **Security only** button next to **Update all**,
-  and each host has a **Security updates only** run-now button. Needs agent 1.7.0.
+  and each host has a **Security updates only** run-now button. Needs agent 1.9.0.
 - **Live update progress bar.** While an update runs (nightly, run-now, or a single container), the Updates page
   shows which container is being worked on, the current step (snapshot, installing, rebooting, health check, rollback),
   how many are done, and what finished so far. Host cards on the Overview show a small bar too. It refreshes every 3 s.
@@ -29,15 +34,38 @@
 - Updates page: filter containers by "with updates" / "security".
 - Containers on phones show the host under the name; long names wrap.
 - Fixed: `/api/infra/:agent/decision/:id/cancel` (and similar) was accepted as a task cancel.
-- Agent 1.7.0: nightly policy (security only), `update-security` and `update-all-security` actions, live progress
+- Agent (1.9.0): nightly policy (security only), `update-security` and `update-all-security` actions, live progress
   reporting, and a leftover progress record from a killed run is cleared automatically.
 
-## 2.5.1
+## 2.6.1
 
 - Fixed: short pages (e.g. Containers) were stretched to the sidebar's height, leaving big empty gaps.
 - Fixed: "Ask about <container>" opened the chat with an empty box; it now starts a new chat with the question filled in.
 - Fixed: Approve/Deny buttons swapped DOM elements on every refresh (both used the same key).
 - Agent sync: client disconnects are now detected on the response (the old request listener never fired).
+## 2.6.0
+
+- Agent 1.8: snapshot cleanup, about every 30 minutes. Only the agents' own snapshots are deleted:
+  - `hlauto…` (before updates): keep the newest 2 per container; older ones go.
+  - `hlfix…` (an agent's snapshot before a fix; older ones named `hlmanual…`): deleted after 7 days.
+  - `hlmanual…` from the dashboard's Snapshot button: deleted after 30 days.
+  - Snapshots with any other name (the ones you make yourself) are never touched.
+  Nothing is deleted while an update is running, and every deletion shows up in Activity.
+
+## 2.5.2
+
+- Agent 1.7.1 (fixes first found by the connector1 agent):
+  - After an update, ports bound only to the container itself, and random ports in the ephemeral range
+    (32768–60999), no longer count as "lost". This was a false rollback on WebManager (containerd's internal port).
+  - An approved retry that gets rolled back again keeps its new "Retry updates" approval. It used to be deleted,
+    leaving the container blocked with no way to retry.
+  - Agents don't edit their own automation any more. Fixes come back as a hand-off plan, because the code is
+    deployed from this repository.
+
+## 2.5.1
+
+- Agent 1.7: both agents can work on the backup server (PBS) over SSH: read everything, and change it only when
+  asked. Deleting backups, datastores, retention settings or disks needs an explicit request.
 
 ## 2.5.0
 

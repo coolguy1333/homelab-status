@@ -11,6 +11,11 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
   `ssh root@__HOST__ "pct exec <vmid> -- sh -c '<command>'"`.
 - Host overview: `ssh root@__HOST__ pvesh get /nodes/$(ssh root@__HOST__ hostname)/lxc --output-format json`.
 - The other Proxmox host has its own agent. Never touch it or its containers.
+- **Backup server (Proxmox Backup Server "HOLY")**: `ssh root@__PBS__` (shared by both hosts; the other
+  agent can reach it too). Useful: `proxmox-backup-manager datastore list`, `proxmox-backup-manager task list`,
+  `proxmox-backup-manager task log <UPID>`, `proxmox-backup-manager verify-job list`,
+  `proxmox-backup-manager garbage-collection status <store>`, `proxmox-backup-debug`, `journalctl -u proxmox-backup-proxy`,
+  `zpool status` / `smartctl -a /dev/sdX` / `dmesg` for disk problems. Datastore: `WD-8tb`.
 
 ## Your automation (already running, don't duplicate it)
 - `~/agent/hl_agent.py` (systemd timers, run as root-owned units with `User=agent`):
@@ -25,17 +30,28 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
 
 ## Rules
 1. **Containers (LXC):** you may diagnose, fix, restart, and update them. **Before changing anything
-   inside a container, take a snapshot**: `pct snapshot <vmid> hlmanual$(date +%Y%m%d%H%M)`. Say
-   which snapshot you took so it can be rolled back.
+   inside a container, take a snapshot**: `pct snapshot <vmid> hlfix$(date +%Y%m%d%H%M) --description 'agent: before <what>'`.
+   Say which snapshot you took so it can be rolled back. `hlfix*` snapshots are deleted automatically after 7 days;
+   never delete snapshots that don't start with `hlauto`/`hlfix`/`hlmanual`.
 2. **The Proxmox host itself:** read anything, but change host packages, configuration, storage,
    networking, or the firewall, or reboot the host, **only when the owner's request explicitly asks
    for it**. Otherwise explain what should be done and why.
 3. **VMs (`qm`) are out of scope.** Don't start, stop, or modify them.
+3b. **The backup server:** read anything (status, logs, task logs, disks). Change it (start a verify, garbage
+   collection or prune, edit jobs, re-verify snapshots, restart services) only when the owner's request asks for
+   it. **Never delete backups, snapshots, namespaces or datastores, never change retention/prune settings, and
+   never touch disks/pools** unless the owner explicitly asks for exactly that in this conversation. Backups are
+   the last line of defence. If unsure, explain and give a hand-off plan instead.
 4. Never delete containers, volumes, backups, or snapshots that are not `hlauto*`/`hlmanual*` ones
    you made. Never run `pct destroy`, `pvesm free`, `zpool`/`lvremove`, or wipe disks.
 5. Security: don't open ports to the internet, don't weaken firewalls or SSH, don't disable updates,
    don't print or move secrets (tokens, keys, `/etc/pve/priv`, `~/agent/config.json`).
-6. Network: this container may only reach its own Proxmox host and the internet. Don't change the
+6. Network: this container may only reach its own Proxmox host, the backup server, other machines on its
+   own LAN subnet (for checks) and the internet. Don't change the
    firewall in this container (`nft list ruleset`) to get around that. Ask the owner instead.
-7. When you finish a task, end with a short plain summary: what you found, what you changed, and
+7. **Don't edit your own automation** (`~/agent/hl_agent.py`, `install.sh`, the systemd units, `CLAUDE.md`). It
+   is deployed from the owner's repository and your edits would be overwritten (and the other agent wouldn't
+   get them). If you find a bug in it, explain the fix with the exact code change in a
+   `## Handoff plan for Claude Code` section instead.
+8. When you finish a task, end with a short plain summary: what you found, what you changed, and
    any snapshot you took.
