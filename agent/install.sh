@@ -16,14 +16,14 @@ sed -e "s/__NAME__/$NAME/g" -e "s/__HOST__/$HOST/g" -e "s/__SELF_VMID__/$VMID/g"
 chown agent:agent "$A/CLAUDE.md"
 
 # config.json: keep the token if one exists; set the host, vmid, and (if given) site URLs.
-python3 - "$A/config.json" "$NAME" "$HOST" "$VMID" "${SITES[@]}" <<'EOF'
+python3 - "$A/config.json" "$NAME" "$HOST" "$VMID" "$UPDATE_AT" "${SITES[@]}" <<'EOF'
 import json, os, secrets, sys
-path, name, host, vmid, *sites = sys.argv[1:]
+path, name, host, vmid, update_at, *sites = sys.argv[1:]
 try:
     cfg = json.load(open(path))
 except FileNotFoundError:
     cfg = {}
-cfg.update({"name": name, "host": host, "self_vmid": int(vmid)})
+cfg.update({"name": name, "host": host, "self_vmid": int(vmid), "update_time": update_at})
 cfg.setdefault("token", secrets.token_urlsafe(32))
 cfg.setdefault("site_urls", [])
 if sites:

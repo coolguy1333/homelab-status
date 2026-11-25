@@ -18,6 +18,8 @@ import os
 import re
 import secrets
 import shlex
+import socket
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import time
@@ -25,7 +27,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -49,7 +51,7 @@ def now_ms():
 
 
 def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr, flush=True)
 
 
 # ------------------------------------------------------------------ config / state
@@ -186,6 +188,13 @@ def claude(prompt, timeout=1800):
 def spawn(*args):
     """Start `hl_agent.py <args>` in the background, outliving this process."""
     os.makedirs(LOG_DIR, exist_ok=True)
+    # one small log per run; keep the newest 200
+    logs = sorted((os.path.join(LOG_DIR, f) for f in os.listdir(LOG_DIR)), key=os.path.getmtime)
+    for old in logs[:-200]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
     logf = open(os.path.join(LOG_DIR, f"{args[0]}-{args[1] if len(args) > 1 else 'x'}.log"), "a")
     subprocess.Popen([sys.executable, SELF, *args], stdout=logf, stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True, cwd=BASE)
@@ -240,6 +249,223 @@ def collect(s):
     return host, containers
 
 
+def job_covers(job, vmid, node):
+    if not job.get("enabled", 1) or (job.get("node") and job["node"] != node):
+        return False
+    if job.get("all"):
+        return str(vmid) not in str(job.get("exclude", "")).split(",")
+    return str(vmid) in str(job.get("vmid", "")).split(",")
+
+
+def collect_slow(s, node, host, containers, force=False):
+    """Backups, backup jobs/tasks and snapshots. Heavier, so refreshed every 30 minutes."""
+    slow = s.get("slow") or {}
+    if not force and now_ms() - slow.get("t", 0) < 30 * 60e3:
+        return slow
+    vmids = {c["vmid"] for c in containers}
+    jobs = []
+    try:
+        for j in ssh_json("pvesh get /cluster/backup --output-format json"):
+            if j.get("type", "vzdump") != "vzdump":
+                continue
+            jobs.append({"id": j.get("id"), "schedule": j.get("schedule"), "storage": j.get("storage"),
+                         "enabled": bool(j.get("enabled", 1)), "nextRun": (j.get("next-run") or 0) * 1000 or None,
+                         "mode": j.get("mode"), "keep": j.get("prune-backups"), "comment": j.get("comment"),
+                         "node": j.get("node"),
+                         "guests": ("all" + (f" except {j['exclude']}" if j.get("exclude") else "")) if j.get("all") else str(j.get("vmid", "")),
+                         "covers": sorted(v for v in vmids if job_covers(j, v, node)), "_raw": j})
+    except Exception as e:
+        log(f"backup jobs: {e}")
+    backups = {}
+    storages = [x for x in ssh_json(f"pvesh get /nodes/{node}/storage --output-format json")
+                if x.get("active") and "backup" in str(x.get("content", ""))]
+    for st in storages:
+        try:
+            items = ssh_json(f"pvesh get /nodes/{node}/storage/{st['storage']}/content --content backup --output-format json", 120)
+        except Exception as e:
+            log(f"backup list {st['storage']}: {e}")
+            continue
+        for b in items:
+            v = int(b.get("vmid") or 0)
+            if v not in vmids:
+                continue
+            e = backups.setdefault(v, {"count": 0, "size": 0, "last": None, "first": None})
+            e["count"] += 1
+            e["size"] += b.get("size") or 0
+            t = (b.get("ctime") or 0) * 1000
+            if not e["last"] or t > e["last"]["t"]:
+                e["last"] = {"t": t, "size": b.get("size"), "storage": st["storage"],
+                             "verified": (b.get("verification") or {}).get("state"), "protected": bool(b.get("protected"))}
+            if not e["first"] or t < e["first"]:
+                e["first"] = t
+    tasks = []
+    try:
+        for t in ssh_json(f"pvesh get /nodes/{node}/tasks --typefilter vzdump --limit 40 --output-format json"):
+            tasks.append({"upid": t.get("upid"), "t": (t.get("starttime") or 0) * 1000,
+                          "end": (t.get("endtime") or 0) * 1000 or None, "status": t.get("status") or "running",
+                          "vmid": int(t["id"]) if str(t.get("id", "")).isdigit() else None})
+    except Exception as e:
+        log(f"backup tasks: {e}")
+    first = "seenTasks" not in s
+    seen = s.setdefault("seenTasks", {})
+    if first:  # don't replay history as dozens of alerts: one summary instead
+        bad = [t for t in tasks if t["status"] not in ("OK", "running")]
+        for t in tasks:
+            seen[t["upid"]] = now_ms()
+        if bad:
+            event("error", f"{len(bad)} of the last {len(tasks)} backup runs on this host failed "
+                           f"(latest: {bad[0]['status']} at {time.strftime('%Y-%m-%d %H:%M', time.localtime(bad[0]['t'] / 1000))})", s)
+    for t in tasks:
+        if t["status"] not in ("OK", "running") and t["upid"] not in seen:
+            seen[t["upid"]] = now_ms()
+            who = f" of {t['vmid']}" if t["vmid"] else ""
+            event("error", f"Backup{who} failed: {t['status']}", s)
+    s["seenTasks"] = {k: v for k, v in seen.items() if now_ms() - v < 14 * 86400e3}
+    snaps = {}
+    for v in sorted(vmids):
+        try:
+            snaps[v] = [{"name": x["name"], "t": (x.get("snaptime") or 0) * 1000, "description": (x.get("description") or "")[:120]}
+                        for x in ssh_json(f"pvesh get /nodes/{node}/lxc/{v}/snapshot --output-format json") if x.get("name") != "current"]
+        except Exception:
+            pass
+    for j in jobs:
+        j.pop("_raw", None)
+    slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40],
+            "snapshots": {str(k): v for k, v in snaps.items()},
+            "services": discover_services(containers), "public": discover_public()}
+    slow["webmanager"] = discover_webmanager(containers)
+    for c in containers:
+        c.pop("_webmanager", None)
+    # Every running WebManager site becomes a public monitor too (main address only, not aliases).
+    for wm in slow["webmanager"]:
+        for site in wm["sites"]:
+            if site.get("hosts") and site.get("status") in (None, "running", "deployed", "ready", "live"):
+                h = site["hosts"][0]
+                slow["public"].append({"host": h, "name": site["name"], "url": f"{site.get('scheme', 'https')}://{h}/",
+                                       "service": f"WebManager ({wm['container']})"})
+    s["slow"] = slow
+    return slow
+
+
+IGNORE_PORTS = {25, 111, 631, 5355}  # mail relay, rpcbind, cups, llmnr: noise, not services
+
+
+def discover_services(containers):
+    """Listening TCP ports inside each running container (not loopback-only ones)."""
+    found = []
+    for c in containers:
+        if c["status"] != "running":
+            continue
+        rc, out = cx(c["vmid"], "hostname -I 2>/dev/null; echo ---; ss -ltnpH 2>/dev/null; "
+                                "if test -f /var/lib/webmanager/webmanager.sqlite3; then echo WEBMANAGER-FOUND; fi", 30)
+        if rc != 0 or "---" not in out:
+            continue
+        if "WEBMANAGER-FOUND" in out:
+            c["_webmanager"] = True
+        ips_part, _, ss_part = out.partition("---")
+        ip = next((x for x in ips_part.split() if re.match(r"^\d+\.\d+\.\d+\.\d+$", x) and not x.startswith("127.")), None)
+        if not ip:
+            continue
+        seen = set()
+        for line in ss_part.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local = parts[3]
+            addr, _, port = local.rpartition(":")
+            if not port.isdigit() or addr.startswith("127.") or addr in ("[::1]", "::1") or "%lo" in addr:
+                continue
+            port = int(port)
+            if port in IGNORE_PORTS or port in seen:
+                continue
+            seen.add(port)
+            m = re.search(r'users:\(\("([^"]+)"', line)
+            found.append({"key": f"{c['vmid']}:{port}", "vmid": c["vmid"], "container": c["name"], "ip": ip,
+                          "port": port, "proc": m.group(1) if m else None})
+    return found
+
+
+WEBMANAGER_SITES_PY = r"""
+import json, sqlite3
+env = {}
+try:
+    for line in open('/etc/webmanager/webmanager.env'):
+        if '=' in line and not line.lstrip().startswith('#'):
+            k, v = line.rstrip('\n').split('=', 1)
+            env[k.strip()] = v.strip().strip('"')
+except OSError:
+    pass
+base = env.get('WEBMANAGER_SITE_BASE_DOMAIN', '')
+scheme = env.get('WEBMANAGER_SITE_PUBLIC_SCHEME', 'http') or 'http'
+db = sqlite3.connect('file:/var/lib/webmanager/webmanager.sqlite3?mode=ro', uri=True)
+db.row_factory = sqlite3.Row
+doms = {r['id']: r['name'] for r in db.execute('SELECT id, name FROM domains')}
+out = []
+for s in db.execute('SELECT * FROM sites'):
+    keys = s.keys()
+    hosts = []
+    d = doms.get(s['domain_id']) if 'domain_id' in keys and s['domain_id'] else base
+    if d:
+        hosts.append(d if ('use_domain_root' in keys and s['use_domain_root']) else s['slug'] + '.' + d)
+    try:
+        for a in db.execute('SELECT a.use_domain_root, a.hostname_prefix, d.name FROM site_domain_aliases a '
+                            'JOIN domains d ON d.id = a.domain_id WHERE a.site_id = ?', (s['id'],)):
+            hosts.append(a[2] if a[0] else (a[1] or s['slug']) + '.' + a[2])
+    except sqlite3.Error:
+        pass
+    out.append({'name': s['name'], 'status': s['status'] if 'status' in keys else None,
+                'hosts': list(dict.fromkeys(hosts)), 'scheme': scheme})
+print(json.dumps(out))
+"""
+
+
+def discover_webmanager(containers):
+    """Sites hosted by any WebManager running in this host's containers (read-only look at its database)."""
+    found = []
+    for c in containers:
+        if not c.get("_webmanager"):
+            continue
+        rc, out = cx(c["vmid"], f"python3 - <<'PYEOF'\n{WEBMANAGER_SITES_PY}\nPYEOF", 60)
+        try:
+            sites = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            log(f"WebManager in {c['name']}: could not read sites: {out[-200:]}")
+            continue
+        found.append({"container": c["name"], "vmid": c["vmid"], "sites": sites})
+    return found
+
+
+def discover_public():
+    """Public hostnames served by this connector's Cloudflare tunnel (from cloudflared's metrics server)."""
+    out = []
+    for port in (20241, 20242, 20243):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/config", timeout=3) as r:
+                cfg = json.loads(r.read().decode())
+        except (OSError, ValueError):
+            continue
+        for rule in (cfg.get("config") or cfg).get("ingress", []):
+            h = rule.get("hostname") or ""
+            if h and "*" not in h:
+                out.append({"host": h, "service": rule.get("service")})
+        break
+    return out
+
+
+def check_services(services):
+    def one(sv):
+        t0 = time.time()
+        try:
+            with socket.create_connection((sv["ip"], sv["port"]), timeout=3):
+                return {**sv, "ok": True, "ms": round((time.time() - t0) * 1000, 1)}
+        except OSError as e:
+            return {**sv, "ok": False, "ms": None, "err": str(e)[:80]}
+    if not services:
+        return []
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return list(ex.map(one, services))
+
+
 def autofix(s, host, containers):
     """Cheap, safe fixes done without Claude. Anything harder goes to Claude, at most every few hours."""
     for c in containers:
@@ -259,6 +485,11 @@ def autofix(s, host, containers):
         if c["maxdisk"] and c["disk"] and c["disk"] / c["maxdisk"] * 100 >= CFG["disk_warn_pct"]:
             if cooled(s, f"disk:{vmid}", 86400):
                 event("warn", f"{c['name']} ({vmid}) disk is {c['disk'] / c['maxdisk'] * 100:.0f}% full", s)
+    for c in containers:
+        b = c.get("backup") or {}
+        if b.get("covered") and b.get("last") and now_ms() - b["last"]["t"] > 26 * 3600e3:
+            if cooled(s, f"backupage:{c['vmid']}", 86400):
+                event("warn", f"{c['name']} ({c['vmid']}): last backup is {round((now_ms() - b['last']['t']) / 3600e3)} h old", s)
     for x in host["storage"]:
         if x["total"] and x["used"] and x["used"] / x["total"] * 100 >= CFG["disk_warn_pct"]:
             if cooled(s, f"storage:{x['name']}", 86400):
@@ -284,6 +515,11 @@ def build_report(s, host, containers):
         "agent": CFG["name"], "agentVersion": VERSION, "generatedAt": now_ms(),
         "host": host, "containers": containers, "pending": pending,
         "events": events, "updateRuns": s["updateRuns"][-20:],
+        "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t")},
+        "services": s.get("serviceChecks", []),
+        "public": (s.get("slow") or {}).get("public", []),
+        "webmanager": (s.get("slow") or {}).get("webmanager", []),
+        "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300},
         "autoTasks": [{"t": t["t"], "status": t["status"], "text": t["text"][:300], "output": t.get("output", "")[-4000:]}
                       for t in internal[-5:]],
         "taskResults": tasks, "acked": list(s["handled"].keys()),
@@ -303,7 +539,17 @@ def cmd_report(send=True):
     with state() as s:
         try:
             host, containers = collect(s)
+            try:
+                slow = collect_slow(s, host["node"], host, containers)
+            except Exception as e:
+                log(f"slow collect failed: {e}")
+                slow = s.get("slow") or {}
+            for c in containers:
+                b = (slow.get("backups") or {}).get(str(c["vmid"])) or {}
+                c["backup"] = {**b, "covered": any(c["vmid"] in j.get("covers", []) for j in slow.get("jobs", []))}
+                c["snapshots"] = (slow.get("snapshots") or {}).get(str(c["vmid"]), [])
             s["lastCollect"] = {"host": host, "containers": containers}
+            s["serviceChecks"] = check_services(slow.get("services") or [])
             if s.get("hostDownSince"):
                 event("info", f"Proxmox host {CFG['host']} reachable again", s)
                 s.pop("hostDownSince", None)
@@ -356,8 +602,8 @@ def cmd_report(send=True):
             if tid in s["tasks"]:
                 continue
             s["tasks"][tid] = {"id": tid, "text": t["text"], "by": t.get("by"), "status": "running", "output": "",
-                               "t": now_ms()}
-            spawn("task", tid)
+                               "t": now_ms(), **({"action": t["action"]} if t.get("action") else {})}
+            spawn("ctaction" if t.get("action") else "task", tid)
 
 
 # ------------------------------------------------------------------ tasks (Claude)
@@ -741,6 +987,76 @@ def cmd_action(pid):
     cmd_report()
 
 
+# ------------------------------------------------------------------ direct actions from the dashboard
+
+def cmd_ctaction(tid):
+    with state() as s:
+        t = s["tasks"].get(tid)
+        if not t:
+            return
+        act, by = t["action"], t.get("by")
+    typ, vmid = act.get("type"), act.get("vmid")
+    out, ok = "", True
+    try:
+        if vmid is not None:
+            vmid = int(vmid)
+            rc, conf = ssh(f"pct config {vmid}")
+            if rc != 0:
+                raise RuntimeError(f"container {vmid} not found on this host")
+            name = (re.search(r"^hostname:\s*(\S+)", conf, re.M) or [None, str(vmid)])[1]
+            label = f"{name} ({vmid})"
+        if typ in ("start", "shutdown", "reboot"):
+            if typ == "shutdown" and vmid == CFG.get("self_vmid"):
+                raise RuntimeError("refusing to shut down this agent's own container")
+            if typ == "reboot" and vmid == CFG.get("self_vmid"):
+                rc, o = ssh(f"systemd-run --on-active=20 --unit=hl-selfreboot-{int(time.time())} pct reboot {vmid}")
+                out = "This agent's container reboots in 20 seconds."
+            else:
+                cmd = {"start": f"pct start {vmid}", "shutdown": f"pct shutdown {vmid} --timeout 120", "reboot": f"pct reboot {vmid} --timeout 120"}[typ]
+                rc, o = ssh(cmd, 300)
+                ok = rc == 0
+                rc2, stt = ssh(f"pct status {vmid}")
+                out = (o + "\n" if o else "") + stt
+        elif typ == "snapshot":
+            snap = "hlmanual" + time.strftime("%Y%m%d%H%M")
+            rc, o = ssh(f"pct snapshot {vmid} {snap} --description 'manual snapshot from the dashboard by {shlex.quote(str(by or 'admin'))[:60]}'", 600)
+            ok, out = rc == 0, (f"Snapshot {snap} created." if rc == 0 else o)
+        elif typ == "backup":
+            with state() as s:
+                jobs = (s.get("slow") or {}).get("jobs") or []
+            storage = next((j["storage"] for j in jobs if vmid in j.get("covers", [])), None) or next((j["storage"] for j in jobs), None)
+            if not storage:
+                raise RuntimeError("no backup storage found (no backup job is configured)")
+            rc, o = ssh(f"vzdump {vmid} --storage {shlex.quote(storage)} --mode snapshot --notes-template '{{{{guestname}}}} (manual)' 2>&1 | tail -15", 7200)
+            ok, out = rc == 0 and "ERROR" not in o, o
+            with state() as s:
+                s.pop("slow", None)  # refresh the backup list on the next report
+        elif typ == "update":
+            with open(UPDATE_LOCK, "w") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                out = update_container(vmid, name, mode="full")
+            ok = "ROLLED BACK" not in out and "BROKEN" not in out and "failed" not in out
+        elif typ == "update-all":
+            cmd_update()
+            with state() as s:
+                runs = s["updateRuns"]
+                out = runs[-1]["summary"] if runs else "done"
+        elif typ == "check-updates":
+            n = check_host_updates()
+            out = f"{n} host package update(s) available." if n else "The host is up to date."
+        else:
+            raise RuntimeError(f"unknown action {typ}")
+    except Exception as e:
+        ok, out = False, str(e)
+    with state() as s:
+        t = s["tasks"].get(tid)
+        if t:
+            t["status"] = "done" if ok else "failed"
+            t["output"] = (out or "done")[-20000:]
+        event("info" if ok else "error", f"{t['text'] if t else typ} ({'done' if ok else 'failed'}) — requested by {by}", s)
+    cmd_report()
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -759,6 +1075,8 @@ def main():
         cmd_action(sys.argv[2])
     elif cmd == "task" and len(sys.argv) > 2:
         cmd_task(sys.argv[2])
+    elif cmd == "ctaction" and len(sys.argv) > 2:
+        cmd_ctaction(sys.argv[2])
     else:
         print(__doc__)
         sys.exit(2)

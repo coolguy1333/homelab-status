@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Homelab Status</title>
-  <meta name="description" content="Self-hosted uptime and status monitoring">
+  <meta name="description" content="Homelab status: hosts, containers, updates, backups and uptime">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
-  <script src="infra.js" defer></script>
+  <script src="dashboard.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -15,68 +15,81 @@
     <div class="brand">
       <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="currentColor"/><path d="M5 17h5l3-7 5 13 3-6h6" fill="none" stroke="var(--bg)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <h1 id="siteTitle">Homelab Status</h1>
+      <span id="headStatus" class="head-status" hidden></span>
     </div>
     <nav class="actions">
       <button id="themeBtn" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">◐</button>
       <button id="settingsBtn" class="btn ghost" title="Settings" hidden>⚙<span class="lbl"> Settings</span></button>
-      <button id="addBtn" class="btn primary" title="Add monitor" hidden>+<span class="lbl"> Add monitor</span></button>
       <span id="userChip" class="user-chip" hidden></span>
       <button id="loginBtn" class="btn ghost">Sign in</button>
     </nav>
   </header>
 
-  <main id="app">
-    <section id="locked" class="card locked" hidden>
-      <h2>This dashboard is private</h2>
-      <p>Sign in to view monitors.</p>
-      <button class="btn primary" data-action="login">Sign in</button>
-    </section>
+  <div class="shell">
+    <nav id="sidenav" class="sidenav" aria-label="Sections" hidden>
+      <a href="#overview" data-view="overview"><span class="ni">◉</span><span class="nl">Overview</span><span class="nb" data-badge="overview"></span></a>
+      <a href="#containers" data-view="containers"><span class="ni">▦</span><span class="nl">Containers</span><span class="nb" data-badge="containers"></span></a>
+      <a href="#updates" data-view="updates"><span class="ni">⟳</span><span class="nl">Updates</span><span class="nb" data-badge="updates"></span></a>
+      <a href="#backups" data-view="backups"><span class="ni">⛁</span><span class="nl">Backups</span><span class="nb" data-badge="backups"></span></a>
+      <a href="#uptime" data-view="uptime"><span class="ni">↗</span><span class="nl">Uptime</span><span class="nb" data-badge="uptime"></span></a>
+      <a href="#ask" data-view="ask"><span class="ni">✦</span><span class="nl">Ask agents</span><span class="nb" data-badge="ask"></span></a>
+      <a href="#activity" data-view="activity"><span class="ni">≡</span><span class="nl">Activity</span><span class="nb" data-badge="activity"></span></a>
+    </nav>
 
-    <section id="overall" class="overall" aria-live="polite">
-      <div class="overall-dot"></div>
-      <div>
-        <div class="overall-title">Loading…</div>
-        <div class="overall-sub"></div>
-      </div>
-    </section>
+    <main id="app">
+      <section id="locked" class="card locked" hidden>
+        <h2>This dashboard is private</h2>
+        <p>Sign in to view it.</p>
+        <button class="btn primary" data-action="login">Sign in</button>
+      </section>
 
-    <section id="self" class="card self" hidden></section>
+      <section class="view" data-view="overview" hidden><div id="v-overview"></div></section>
+      <section class="view" data-view="containers" hidden><div id="v-containers"></div></section>
+      <section class="view" data-view="updates" hidden><div id="v-updates"></div></section>
+      <section class="view" data-view="backups" hidden><div id="v-backups"></div></section>
+      <section class="view" data-view="ask" hidden><div id="v-ask"></div></section>
+      <section class="view" data-view="activity" hidden><div id="v-activity"></div></section>
 
-    <section id="infraSection" hidden>
-      <div class="section-head">
-        <h2>Proxmox hosts</h2>
-        <span class="muted" id="infraSub"></span>
-      </div>
-      <div id="infraList" class="infra-list"></div>
-    </section>
-
-    <section id="peers" class="peers-section" hidden>
-      <h2>Other servers</h2>
-      <div id="peerList" class="peer-list"></div>
-    </section>
-
-    <section id="monitorSection" hidden>
-      <div class="section-head">
-        <h2>Monitors</h2>
-        <div class="filters">
-          <input id="search" type="search" placeholder="Search…" aria-label="Filter monitors">
-          <select id="statusFilter" aria-label="Filter by status">
-            <option value="">All</option>
-            <option value="up">Up</option>
-            <option value="down">Down</option>
-            <option value="pending">Pending</option>
-            <option value="paused">Paused</option>
-          </select>
-        </div>
-      </div>
-      <div id="monitors" class="monitor-list"></div>
-      <div id="empty" class="card empty" hidden>
-        <p>No monitors yet.</p>
-        <p class="muted" id="emptySync" hidden>Monitors from your other servers appear here on their own once they sync.</p>
-        <button class="btn primary" data-action="add">+ Add your first monitor</button>
-      </div>
-    </section>
-  </main>
+      <section class="view" data-view="uptime" hidden>
+        <div class="page-head"><h2>Uptime</h2><p class="muted">Public sites are checked from the internet by this server. Internal services are checked on the LAN by the agents.</p></div>
+        <section id="overall" class="overall" aria-live="polite">
+          <div class="overall-dot"></div>
+          <div>
+            <div class="overall-title">Loading…</div>
+            <div class="overall-sub"></div>
+          </div>
+        </section>
+        <section id="monitorSection" hidden>
+          <div class="section-head">
+            <h3>Websites &amp; public endpoints</h3>
+            <div class="filters">
+              <input id="search" type="search" placeholder="Search…" aria-label="Filter monitors">
+              <select id="statusFilter" aria-label="Filter by status">
+                <option value="">All</option>
+                <option value="up">Up</option>
+                <option value="down">Down</option>
+                <option value="pending">Pending</option>
+                <option value="paused">Paused</option>
+              </select>
+              <button id="addBtn" class="btn primary small" title="Add monitor" hidden>+ Add monitor</button>
+            </div>
+          </div>
+          <div id="monitors" class="monitor-list"></div>
+          <div id="empty" class="card empty" hidden>
+            <p>No monitors yet.</p>
+            <p class="muted" id="emptySync" hidden>Monitors from your other servers appear here on their own once they sync.</p>
+            <button class="btn primary" data-action="add">+ Add your first monitor</button>
+          </div>
+        </section>
+        <div id="v-services"></div>
+        <section id="self" class="card self" hidden></section>
+        <section id="peers" class="peers-section" hidden>
+          <h3>Other servers</h3>
+          <div id="peerList" class="peer-list"></div>
+        </section>
+      </section>
+    </main>
+  </div>
 
   <footer class="footer">
     <span id="footerInfo"></span>

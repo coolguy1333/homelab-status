@@ -126,7 +126,6 @@ function renderOverall(d) {
   const problems = [];
   if (c.down) problems.push(`${c.down} monitor${c.down > 1 ? 's' : ''} down`);
   if (peersDown) problems.push(`${peersDown} server${peersDown > 1 ? 's' : ''} unreachable`);
-  if (typeof Infra !== 'undefined') problems.push(...Infra.problems());
   let cls = 'ok', title = 'All systems operational';
   if (problems.length) { cls = 'bad'; title = problems.join(' · '); }
   else if (c.pending) { cls = 'warn'; title = 'Some checks are pending'; }
@@ -235,7 +234,7 @@ function monitorRow(m) {
     <div class="monitor-row" data-action="toggle" role="button" tabindex="0" aria-expanded="${open}">
       <span class="dot ${m.status}" title="${esc(m.status)}"></span>
       <span style="min-width:0">
-        <div class="m-name">${esc(m.name)}</div>
+        <div class="m-name">${esc(m.name)}${m.auto ? ' <span class="badge auto" title="Added automatically: served by the Cloudflare tunnel">auto</span>' : ''}</div>
         <div class="m-sub">${sub}</div>
       </span>
       <span class="m-bars">${recentBars(m.recent)}</span>
@@ -358,14 +357,14 @@ function render() {
   $('#locked').hidden = !d.locked;
   $('#overall').hidden = !!d.locked;
   $('#monitorSection').hidden = !!d.locked;
-  if (d.locked) { $('#self').hidden = true; $('#peers').hidden = true; $('#infraSection').hidden = true; document.title = d.title; return; }
+  if (d.locked) { $('#self').hidden = true; $('#peers').hidden = true; document.title = d.title; if (typeof Dash !== 'undefined') Dash.render(d); return; }
   renderOverall(d);
   renderSelf(d);
   renderPeers(d);
   renderMonitors(d);
-  if (typeof Infra !== 'undefined') Infra.render(d);
   $('#empty [data-action="add"]').hidden = !d.authed;
   $('#emptySync').hidden = !d.sync;
+  if (typeof Dash !== 'undefined') Dash.render(d); // last: it sets the page title when the hosts view is on
 }
 
 function renderUser(d) {
@@ -444,7 +443,7 @@ function attachChartHover(el) {
 async function refresh() {
   try {
     state.data = await api('api/status');
-    await Promise.all([...[...state.open].map(loadDetail), typeof Infra !== 'undefined' ? Infra.load(state.data) : null]);
+    await Promise.all([...[...state.open].map(loadDetail), typeof Dash !== 'undefined' ? Dash.load(state.data) : null]);
     render();
   } catch (err) {
     const el = $('#overall');

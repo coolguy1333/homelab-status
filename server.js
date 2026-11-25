@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * Uptime Monitor - self-hosted uptime & status dashboard.
+ * Homelab Status - hosts, containers, updates, backups and uptime (based on Uptime Monitor).
  * Zero dependencies: needs only Node.js 18+.
  *   node server.js
  * See README.md for configuration.
@@ -91,6 +91,32 @@ if (PEER_TOKEN) {
     }
   }
 }
+// Public hostnames served by the agents' Cloudflare tunnels become HTTP monitors automatically.
+// Deleting one of those monitors remembers the hostname so it isn't added back.
+infra.onPublic = (list, agent) => {
+  const dismissed = new Set(store.settings.autoDismissed || []);
+  const norm = u => String(u || '').toLowerCase().replace(/\/+$/, '');
+  let added = 0;
+  for (const item of list.slice(0, 200)) {
+    const host = String(item && item.host || '').toLowerCase();
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host) || dismissed.has(host)) continue;
+    const target = /^https?:\/\//.test(item.url || '') ? String(item.url) : `https://${host}/`;
+    const existing = store.monitors.find(m => m.autoHost === host || norm(m.target) === norm(target));
+    if (existing) {
+      // A tunnel hostname that turns out to be a WebManager site: give it the site's name.
+      if (existing.autoHost && item.name && existing.name === host) { existing.name = `${String(item.name).slice(0, 80)} (${host})`; store.saveMonitors(); }
+      continue;
+    }
+    if (store.monitors.length >= 1000) break;
+    const name = item.name ? `${String(item.name).slice(0, 80)} (${host})` : host;
+    const m = newMonitor({ name, type: 'http', target, acceptedStatus: '200-499', interval: 120, timeout: 15, retries: 2, autoHost: host, autoBy: agent });
+    store.monitors.push(m);
+    scheduler.schedule(m, 1000 + added * 400);
+    added++;
+  }
+  if (added) { store.saveMonitors(); statusCache.clear(); console.log(`[infra] Added ${added} monitor(s) for tunnel hostnames reported by ${agent}`); }
+};
+
 // Drop history left behind by deleted monitors or peers removed from PEERS.
 {
   const keep = new Set([...store.monitors.map(m => m.id), ...PEER_URLS.map(u => peerHub.peerId(u))]);
@@ -100,11 +126,8 @@ if (PEER_TOKEN) {
 
 if (store.firstRun) {
   // With monitor sync on, a new server gets its monitors from its peers instead of example ones.
-  store.monitors = SYNC_MONITORS ? [] : [
-    newMonitor({ name: 'Example website', type: 'http', target: 'https://example.com' }),
-    newMonitor({ name: 'Cloudflare DNS (ping)', type: 'ping', target: '1.1.1.1' }),
-    newMonitor({ name: 'Google DNS (TCP 53)', type: 'tcp', target: '8.8.8.8', port: 53 }),
-  ];
+  // No example monitors: the agents add your tunnel hostnames and WebManager sites on their own.
+  store.monitors = [];
   store.saveMonitors();
   store.saveSettings();
 }
@@ -252,6 +275,7 @@ function monitorSummary(m, authed) {
     uptime: uptimeSet(w => store.uptime(m.id, w)),
     recent: h.raw.slice(-60).map(c => ({ t: c.t, ok: c.ok, ms: c.ms, msg: c.msg })),
     cert: h.cert || null,
+    auto: m.autoHost ? { host: m.autoHost, by: m.autoBy || null } : null,
   };
   if (showTargets(authed)) { out.target = m.target; out.port = m.port; }
   if (authed) out.config = m;
@@ -410,7 +434,7 @@ function baseUrl(req) {
 // app.js?v=<content hash> from index.html makes every release a new URL.
 const ASSET_VERSION = (() => {
   const h = crypto.createHash('sha1');
-  for (const f of ['app.js', 'infra.js', 'style.css']) { try { h.update(fs.readFileSync(path.join(PUBLIC_DIR, f))); } catch { /* missing file: served as 404 later */ } }
+  for (const f of ['app.js', 'dashboard.js', 'style.css']) { try { h.update(fs.readFileSync(path.join(PUBLIC_DIR, f))); } catch { /* missing file: served as 404 later */ } }
   return h.digest('hex').slice(0, 10);
 })();
 
@@ -424,7 +448,7 @@ function serveStatic(req, res, pathname) {
     if (err) return send(res, 404, 'Not found');
     const ext = path.extname(file);
     if (file === path.join(PUBLIC_DIR, 'index.html')) {
-      data = Buffer.from(data.toString('utf8').replace(/((?:src|href)="(?:app\.js|infra\.js|style\.css))"/g, `$1?v=${ASSET_VERSION}"`));
+      data = Buffer.from(data.toString('utf8').replace(/((?:src|href)="(?:app\.js|dashboard\.js|style\.css))"/g, `$1?v=${ASSET_VERSION}"`));
     }
     res.writeHead(200, {
       ...SECURITY_HEADERS,
@@ -661,6 +685,10 @@ async function handleApi(req, res, url) {
     }
     if (method === 'DELETE') {
       if (needAuth()) return;
+      if (m.autoHost) {
+        store.settings.autoDismissed = [...new Set([...(store.settings.autoDismissed || []), m.autoHost])].slice(-500);
+        store.saveSettings();
+      }
       store.monitors.splice(idx, 1);
       scheduler.remove(id);
       store.deleteHistory(id);
@@ -686,10 +714,10 @@ async function handleApi(req, res, url) {
   // it names hosts, containers and IPs, and lets you send the agents work.
   if (p === '/api/infra' && method === 'GET') {
     if (needAuth()) return;
-    return send(res, 200, { agents: infra.summary(), serverTime: Date.now() });
+    return send(res, 200, { agents: infra.summary(), services: infra.services(), serverTime: Date.now() });
   }
 
-  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks)(?:\/([a-f0-9]{12})\/cancel)?$/);
+  const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions)(?:\/([a-f0-9]{12})\/cancel)?$/);
   if (im) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
     if (needAuth() || needJson()) return;
@@ -700,6 +728,8 @@ async function handleApi(req, res, url) {
       return send(res, 200, { ok: true });
     }
     if (im[3]) { infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
+    if (im[2] === 'actions') return send(res, 201, infra.addAction(im[1], String(body.type || ''), body.vmid, who));
+    if (im[1] === '_all') return send(res, 201, { tasks: infra.addGroupTask(body.text, who) });
     return send(res, 201, infra.addTask(im[1], body.text, who));
   }
 

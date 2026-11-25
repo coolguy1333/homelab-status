@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.1.0 — Homelab Status
+
+- New layout: sidebar with Overview, Containers, Updates, Backups, Uptime, Ask agents, and Activity.
+- Overview: a "needs attention" list, key numbers, a card per Proxmox host, and recent activity.
+- Containers: every LXC on both hosts with CPU, memory, disk, services, updates, and last backup. Click a row
+  for details and one-click actions: start, shut down, reboot, snapshot, back up now, update now.
+- Updates: approvals, the nightly schedule and run history, "run now", and per-container update status.
+- Backups: Proxmox backup jobs, the last backup per container (age, size, PBS verification), and failed runs.
+- Uptime: tunnel hostnames and WebManager sites become monitors automatically. Internal services found in
+  containers are checked on the LAN by the agents.
+- Ask agents: one agent at a time, or the Datacenter box that sends one message to every agent.
+- Alerts (webhooks) for agents going offline, services going down or recovering, failed backups, rollbacks,
+  and new approvals.
+
 ## 1.2.0
 
 ### Added
