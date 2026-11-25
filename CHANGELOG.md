@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.1
+
+- Fixed: short pages (e.g. Containers) were stretched to the sidebar's height, leaving big empty gaps.
+- Fixed: "Ask about <container>" opened the chat with an empty box; it now starts a new chat with the question filled in.
+- Fixed: Approve/Deny buttons swapped DOM elements on every refresh (both used the same key).
+- Agent sync: client disconnects are now detected on the response (the old request listener never fired).
+
 ## 2.5.0
 
 - Smooth refreshes: the page is patched in place instead of being redrawn every 10 seconds. Scroll positions,

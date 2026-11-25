@@ -719,8 +719,9 @@ async function handleApi(req, res, url) {
     const body = await readBody(req, 512 * 1024);
     infra.applyResults(name, body);
     const wait = Math.max(0, Math.min(25, Number(body.wait) || 0)) * 1000;
+    // Watch the response, not the request: req 'close' already fired once the body was read.
     let closed = false;
-    req.on('close', () => { closed = true; });
+    res.on('close', () => { closed = true; });
     const out = await infra.waitFor(name, wait);
     if (closed) return;
     return send(res, 200, { ok: true, ...out });

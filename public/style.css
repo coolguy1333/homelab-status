@@ -279,7 +279,9 @@ label.check input { width: auto; }
 body.with-nav .shell { display: grid; grid-template-columns: 210px minmax(0, 1fr); max-width: 1440px; margin: 0 auto; }
 body.with-nav main { max-width: none; margin: 0; padding: 22px 28px 48px; width: 100%; }
 body.with-nav .topbar { padding-left: max(16px, calc((100% - 1440px) / 2 + 20px)); padding-right: max(16px, calc((100% - 1440px) / 2 + 20px)); }
-.view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; }
+.view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; align-content: start; }
+/* Short pages must not stretch their rows to fill the sidebar's full height (big gaps on Containers). */
+main, .view > [id^="v-"] { align-content: start; }
 .sidenav { position: sticky; top: 57px; align-self: start; height: calc(100vh - 57px); padding: 18px 10px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); }
 .sidenav a { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 550; }
 .sidenav a:hover { background: var(--panel-2); color: var(--text); }

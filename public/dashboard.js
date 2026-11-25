@@ -491,10 +491,10 @@ const Dash = (() => {
       const nSec = pk.filter(x => x.security).length;
       const act = dec ? `<span class="muted">${dec.decision === 'approve' ? `Approved${dec.packages ? ` (${dec.packages.length} selected)` : ''}` : 'Denied'} by ${esc(dec.by)} ${esc(ago(dec.at))} — ${dec.acked ? 'agent is on it' : 'sending to the agent…'}</span>`
         : pk.length
-          ? `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}" ${sel.size ? '' : 'disabled'}>${sel.size === pk.length ? `Approve all ${pk.length}` : `Approve ${sel.size} selected`}</button>
-             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`
-          : `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Approve</button>
-             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`;
+          ? `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-pid="${esc(p.id)}" ${sel.size ? '' : 'disabled'}>${sel.size === pk.length ? `Approve all ${pk.length}` : `Approve ${sel.size} selected`}</button>
+             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-pid="${esc(p.id)}">Deny</button>`
+          : `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-pid="${esc(p.id)}">Approve</button>
+             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-pid="${esc(p.id)}">Deny</button>`;
       const picker = pk.length && !dec ? `<div class="pkg-pick" data-sel="${esc(selKey)}">
           <div class="pkg-tools"><span class="muted">${sel.size} of ${pk.length} selected</span>
             <button class="linkbtn" data-pick="all">All</button>${nSec ? `<button class="linkbtn" data-pick="security">Security only (${nSec})</button>` : ''}<button class="linkbtn" data-pick="none">None</button></div>
@@ -857,7 +857,8 @@ const Dash = (() => {
     const row = e.target.closest('tr.crow');
     if (row) { const id = row.dataset.ct; if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id); rerender(); return; }
     const ask = e.target.closest('[data-ask]');
-    if (ask) { st.askAgent = ask.dataset.ask; st.drafts[ask.dataset.ask] = ask.dataset.prefill; location.hash = '#ask'; setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }, 50); return; }
+    // Start a fresh chat with the question pre-filled (drafts are keyed "<agent>:<chat id or new>").
+    if (ask) { st.askAgent = ask.dataset.ask; st.chatSel[ask.dataset.ask] = 'new'; st.drafts[`${ask.dataset.ask}:new`] = ask.dataset.prefill; location.hash = '#ask'; setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }, 50); return; }
     const chatBtn = e.target.closest('[data-newchat], [data-delchat], [data-renamechat], [data-delmsg], [data-delgroup], .chat-item');
     if (chatBtn) {
       const scope = st.askAgent;
@@ -936,7 +937,7 @@ const Dash = (() => {
     const cancel = e.target.closest('[data-cancel]');
     try {
       if (dec) {
-        const { agent, id } = dec.dataset;
+        const { agent, pid: id } = dec.dataset;
         const selNow = st.sel.get(`${agent}:${id}`);
         const what = dec.closest('.approval').querySelector('b').textContent + (dec.dataset.decide === 'approve' && selNow ? ` (${selNow.size} package${selNow.size === 1 ? '' : 's'})` : '');
         if (!confirm(`${dec.dataset.decide === 'approve' ? 'Approve' : 'Deny'}: ${what}?`)) return;
