@@ -8,7 +8,7 @@ const Dash = (() => {
   const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity'];
   const st = {
     data: null, error: null, loading: false,
-    open: new Set(), expanded: new Set(),
+    open: new Set(), expanded: new Set(), sel: new Map(),
     drafts: {}, askAgent: null,
     filters: { host: '', status: '', q: '', level: '', ahost: '' },
   };
@@ -59,6 +59,11 @@ const Dash = (() => {
       if (!p.reachable) push('err', `Backup server ${p.storage} (${p.server}) is not reachable`, 'backups');
       if (p.verifyFailed) push('err', `${p.verifyFailed} backup(s) on ${p.storage} failed verification`, 'backups');
       if (p.total && p.used / p.total >= 0.85) push('warn', `Backup datastore ${p.datastore} is ${Math.round(p.used / p.total * 100)}% full`, 'backups');
+      const dd = p.details;
+      if (dd) {
+        for (const g of dd.gc || []) if (g.state && !/^ok$/i.test(g.state)) push('warn', `Backup server garbage collection on ${g.store}: ${g.state}`, 'backups');
+        for (const j of dd.jobs || []) if (j.state && !/^ok$/i.test(j.state)) push('warn', `Backup server ${j.type} job ${j.id}: ${j.state}`, 'backups');
+      }
     }
     for (const c of containers()) {
       if (c.onboot && c.status !== 'running') push('err', `${c.name} (${c.vmid}) on ${c.host} is ${c.status}`, 'containers');
@@ -132,6 +137,34 @@ const Dash = (() => {
       else i++;
     }
     return `<div class="md">${out.join('')}</div>`;
+  }
+
+  // ------------------------------------------------------------ answers: usage line + hand-off plan
+  const HANDOFF = /^#{1,3}\s*Handoff plan for Claude Code\s*$/im;
+  const kTok = n => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n || 0));
+  const usageTotal = u => (u ? (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) : 0);
+  function usageLine(u) {
+    if (!u) return '';
+    return `<span class="usage-line" title="${esc(`input ${u.input || 0} · output ${u.output || 0} · cache read ${u.cacheRead || 0} · cache write ${u.cacheWrite || 0}${u.model ? ` · ${u.model}` : ''}`)}">${kTok(usageTotal(u))} tokens${u.cost ? ` · $${Number(u.cost).toFixed(2)}` : ''}${u.turns ? ` · ${u.turns} step${u.turns > 1 ? 's' : ''}` : ''}${u.ms ? ` · ${duration(u.ms / 1000)}` : ''}</span>`;
+  }
+  function answer(output, id) {
+    const text = String(output || '');
+    const m = text.match(HANDOFF);
+    if (!m) return md(text);
+    const main = text.slice(0, m.index).trim();
+    const plan = text.slice(m.index + m[0].length).trim();
+    return `${main ? md(main) : ''}
+      <div class="handoff">
+        <div class="handoff-head"><b>⇢ Plan for Claude Code</b><span class="muted">The agent couldn't (or isn't allowed to) finish this. Paste the plan into Claude Code on your PC.</span>
+          <button class="btn small primary" data-copy-plan="${esc(id)}">Copy plan</button></div>
+        ${md(plan)}
+      </div>`;
+  }
+  const plans = new Map(); // task id -> plan text for the copy button
+  function rememberPlan(t) {
+    const text = String(t.output || '');
+    const m = text.match(HANDOFF);
+    if (m) plans.set(t.id, `Fix this in my homelab. You can SSH to the connector containers over Tailscale (connector1 100.111.125.58 on host GOD 192.168.10.23, connector2 100.73.184.67 on host HELP 192.168.10.81) and from there reach the Proxmox hosts as root via the agent user's key.\n\nThe ${t.agentName || 'agent'} agent wrote this plan:\n\n${text.slice(m.index + m[0].length).trim()}`);
   }
 
   // ------------------------------------------------------------ small pieces
@@ -208,6 +241,24 @@ const Dash = (() => {
     return [...m.values()];
   }
 
+  function pbsDetails(d) {
+    if (!d) return '<p class="hint">Add a read-only PBS API token to see garbage collection, verify jobs and the server\'s own health.</p>';
+    const okState = v => !v || /^ok$/i.test(v);
+    // PBS leaves last-run-state empty for some job types: fall back to the newest failed task for that job.
+    const failedFor = id => (d.failedTasks || []).find(t => t.id && id && String(t.id).includes(id) && Date.now() - t.t < 48 * 3600e3);
+    const jobs = [...(d.gc || []).map(g => ({ type: 'garbage collection', id: g.store, state: g.state, last: g.last, next: g.next })), ...(d.jobs || [])]
+      .map(j => { if (j.state) return j; const f = failedFor(j.id); return f ? { ...j, state: `failed: ${f.status || 'error'}`, last: f.t } : j; });
+    const recentFails = (d.failedTasks || []).filter(t => Date.now() - t.t < 7 * 86400e3);
+    return `<div class="host-meters">
+        <div class="kv"><span>CPU</span>${cpuMeter(d.cpu)}</div>
+        <div class="kv"><span>Memory</span>${meter(d.memory && d.memory.used, d.memory && d.memory.total)}</div>
+        <div class="kv"><span>System disk</span>${meter(d.root && d.root.used, d.root && d.root.total)}</div>
+      </div>
+      ${jobs.length ? `<table class="mini pbs-jobs"><tbody>${jobs.map(j => `<tr><td>${dot(okState(j.state) ? 'up' : 'down')}${esc(j.type)}</td><td class="muted">${esc(j.id || '')}</td><td class="${okState(j.state) ? 'pct-good' : 'pct-bad'}">${esc(j.state || 'not run yet')}</td><td class="muted">${j.last ? esc(ago(j.last)) : ''}</td><td class="muted">${j.next ? `next ${esc(fmtTime(j.next))}` : ''}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${recentFails.length ? details(`pbsfail`, `<span class="pct-bad">${recentFails.length} failed PBS task${recentFails.length > 1 ? 's' : ''} in the last 7 days</span>`, `<ul class="events">${recentFails.map(t => `<li><time>${esc(fmtDate(t.t))}</time>${tag('down', t.type || 'task')}<span>${esc(t.id || '')} — ${esc(t.status || '')}</span></li>`).join('')}</ul>`) : ''}
+      <div class="meta"><span>PBS <b>${esc(d.version || '?')}</b></span>${d.uptime ? `<span>Up <b>${esc(duration(d.uptime).split(' ').slice(0, 2).join(' '))}</b></span>` : ''}</div>`;
+  }
+
   function pbsCard(p) {
     const verPct = p.count ? Math.round((p.verifiedOk / p.count) * 100) : null;
     return `<div class="card host">
@@ -221,6 +272,7 @@ const Dash = (() => {
         <div><b>${p.last24h}</b><span>in last 24 h</span></div>
         <div><b class="${p.verifyFailed ? 'pct-bad' : verPct === 100 ? 'pct-good' : ''}">${verPct == null ? '—' : `${verPct}%`}</b><span>verified${p.verifyFailed ? ` · ${p.verifyFailed} failed` : ''}</span></div>
       </div>
+      ${pbsDetails(p.details)}
       <div class="meta">
         <span>Newest <b>${p.last ? esc(ago(p.last)) : '—'}</b></span>
         <span>Oldest <b>${p.oldest ? esc(new Date(p.oldest).toLocaleDateString()) : '—'}</b></span>
@@ -365,13 +417,27 @@ const Dash = (() => {
     for (const a of ag) for (const p of (a.report.pending || [])) pend.push({ a, p });
     const pendHtml = pend.length ? pend.map(({ a, p }) => {
       const dec = a.decisions[p.id];
-      const act = dec ? `<span class="muted">${dec.decision === 'approve' ? 'Approved' : 'Denied'} by ${esc(dec.by)} ${esc(ago(dec.at))} — ${dec.acked ? 'agent is on it' : 'sending to the agent…'}</span>`
-        : `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Approve</button>
-           <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`;
+      const pk = p.packages || [];
+      const selKey = `${a.name}:${p.id}`;
+      if (pk.length && !st.sel.has(selKey)) st.sel.set(selKey, new Set(pk.map(x => x.name)));
+      const sel = st.sel.get(selKey) || new Set();
+      const nSec = pk.filter(x => x.security).length;
+      const act = dec ? `<span class="muted">${dec.decision === 'approve' ? `Approved${dec.packages ? ` (${dec.packages.length} selected)` : ''}` : 'Denied'} by ${esc(dec.by)} ${esc(ago(dec.at))} — ${dec.acked ? 'agent is on it' : 'sending to the agent…'}</span>`
+        : pk.length
+          ? `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}" ${sel.size ? '' : 'disabled'}>${sel.size === pk.length ? `Approve all ${pk.length}` : `Approve ${sel.size} selected`}</button>
+             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`
+          : `<button class="btn small primary" data-decide="approve" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Approve</button>
+             <button class="btn small danger" data-decide="deny" data-agent="${esc(a.name)}" data-id="${esc(p.id)}">Deny</button>`;
+      const picker = pk.length && !dec ? `<div class="pkg-pick" data-sel="${esc(selKey)}">
+          <div class="pkg-tools"><span class="muted">${sel.size} of ${pk.length} selected</span>
+            <button class="linkbtn" data-pick="all">All</button>${nSec ? `<button class="linkbtn" data-pick="security">Security only (${nSec})</button>` : ''}<button class="linkbtn" data-pick="none">None</button></div>
+          ${details(`pk:${selKey}`, 'Choose packages', `<div class="pkg-list">${pk.map(x => `<label class="pkg"><input type="checkbox" data-pkg="${esc(x.name)}" ${sel.has(x.name) ? 'checked' : ''}><span class="pkg-name">${esc(x.name)}</span>${x.security ? '<span class="tag down">security</span>' : ''}<span class="muted">${esc(x.old)} → ${esc(x.new)}</span></label>`).join('')}</div>`)}
+        </div>` : '';
       return `<div class="card approval">
         <div class="ap-head"><span class="pill ${p.kind === 'host-reboot' ? 'bad' : p.kind === 'host-update' ? 'warn' : ''}">${esc({ 'host-update': 'host update', 'host-reboot': 'host reboot', 'risky-update': 'held update' }[p.kind] || p.kind)}</span>
           <b>${esc(p.summary)}</b><span class="muted">${esc(hostOf(a))} · ${esc(ago(p.t))}</span></div>
-        ${p.details ? details(`pd:${a.name}:${p.id}`, 'Details', `<pre>${esc(p.details)}</pre>`) : ''}
+        ${picker}
+        ${p.details ? details(`pd:${a.name}:${p.id}`, pk.length ? 'Why / full details' : 'Details', `<pre>${esc(p.details)}</pre>`) : ''}
         <div class="ap-actions">${act}</div></div>`;
     }).join('') : '<div class="card empty"><p class="muted">Nothing is waiting for approval.</p></div>';
 
@@ -509,14 +575,14 @@ const Dash = (() => {
     const picker = `<div class="seg big" data-askpick>
       <button class="${st.askAgent === '_all' ? 'on' : ''}" data-val="_all">◎ Datacenter <span class="muted">all agents</span></button>
       ${ag.map(x => `<button class="${x.name === st.askAgent ? 'on' : ''}" data-val="${esc(x.name)}">${dot(x.online ? 'up' : 'down')}${esc(hostOf(x))} <span class="muted">${esc(x.name)}</span></button>`).join('')}</div>`;
-    if (st.askAgent === '_all') return viewAskAll(ag, picker);
+    if (st.askAgent === '_all') return viewAskAll(ag, picker) + usagePanel(ag);
     const a = ag.find(x => x.name === st.askAgent);
     const tasks = (a.tasks || []).filter(t => !t.action); // one-click actions show on the Containers/Updates pages
     const convo = tasks.map(t => `<div class="msg">
       <div class="q"><div class="q-meta">${esc(t.by || '')} · ${esc(ago(t.createdAt))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : t.status === 'cancelled' ? '' : 'restart', t.status)}
         ${t.status === 'queued' ? `<button class="btn small ghost" data-cancel="${esc(t.id)}" data-agent="${esc(a.name)}">Cancel</button>` : ''}</div>
         <div class="q-text">${esc(t.text)}</div></div>
-      ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''}</div>${md(t.output)}</div>`
+      ${t.output ? `<div class="ans"><div class="ans-meta">✦ ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
         : `<div class="ans pending">${t.status === 'queued' ? (a.live ? 'Sending to the agent…' : 'Waiting for the agent to come online…') : t.status === 'running' ? `Working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}… answers usually take 1–3 minutes` : ''}</div>`}
     </div>`).join('');
     const auto = ((a.report && a.report.autoTasks) || []).slice().reverse();
@@ -527,10 +593,41 @@ const Dash = (() => {
         <div class="ask-actions"><span class="muted">Sent to ${esc(a.name)} on ${esc(hostOf(a))}${a.online ? '' : ' — <span class="pct-bad">agent is offline, it will run when it is back</span>'}</span><button class="btn primary" type="submit">Send</button></div>
       </form>
       <div class="convo">${convo || '<p class="muted center">No questions yet.</p>'}</div>
+      ${usagePanel(ag.filter(x => x.name === a.name))}
       ${auto.length ? details(`auto:${a.name}`, `Automatic fixes the agent started itself (${auto.length})`, auto.map(t => `<div class="msg"><div class="q"><div class="q-meta">${esc(ago(t.t))} ${tag(t.status === 'done' ? 'up' : t.status === 'failed' ? 'down' : 'restart', t.status)}</div><div class="q-text">${esc(t.text)}</div></div>${t.output ? `<div class="ans">${md(t.output)}</div>` : ''}</div>`).join(''), 'card pad') : ''}`;
   }
 
   const statusTag = s => tag(s === 'done' ? 'up' : s === 'failed' ? 'down' : s === 'cancelled' ? '' : 'restart', s);
+
+  // How much Claude the agents used (from each run's own token report).
+  function usagePanel(list) {
+    const sum = key => {
+      const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+      for (const a of list) { const u = a.report && a.report.usage && a.report.usage[key]; if (u) for (const k in o) o[k] += u[k] || 0; }
+      return o;
+    };
+    const today = sum('today'), week = sum('week'), month = sum('month');
+    const days = new Map();
+    for (const a of list) for (const [d, v] of Object.entries((a.report && a.report.usage && a.report.usage.daily) || {})) {
+      const cur = days.get(d) || { tokens: 0, cost: 0, runs: 0 };
+      cur.tokens += usageTotal(v); cur.cost += v.cost || 0; cur.runs += v.runs || 0;
+      days.set(d, cur);
+    }
+    const keys = [];
+    for (let i = 29; i >= 0; i--) keys.push(new Date(Date.now() - i * 86400e3).toLocaleDateString('en-CA'));
+    const max = Math.max(1, ...keys.map(k => (days.get(k) || {}).tokens || 0));
+    const bars = keys.map(k => { const v = days.get(k) || { tokens: 0, cost: 0, runs: 0 }; return `<span style="height:${Math.max(2, (v.tokens / max) * 100)}%" class="${v.tokens ? '' : 'none'}" title="${esc(`${k}: ${kTok(v.tokens)} tokens · ${v.runs} run(s) · $${v.cost.toFixed(2)}`)}"></span>`; }).join('');
+    const recent = [];
+    for (const a of list) for (const r of ((a.report && a.report.usage && a.report.usage.recent) || [])) recent.push({ ...r, agent: a.name });
+    recent.sort((x, y) => y.t - x.t);
+    const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices</div></div>`;
+    return `<h3 class="sec-title">Claude usage by ${list.length > 1 ? 'the agents' : esc(list[0] ? list[0].name : 'agent')}</h3>
+      <div class="kpis">${tile('Today', today)}${tile('Last 7 days', week)}${tile('Last 30 days', month)}</div>
+      <div class="card pad"><div class="usage-bars">${bars}</div><div class="bars-legend"><span>30 days ago</span><span>Today</span></div>
+        <p class="hint">Tokens the agents used: answers, auto-fixes and nightly update reviews. This counts against your Claude plan's limits; your plan's overall usage is on claude.ai → Settings → Usage.</p>
+        ${recent.length ? details(`usage:${list.map(a => a.name).join(',')}`, `Recent runs (${recent.length})`, `<table class="mini"><tbody>${recent.slice(0, 25).map(r => `<tr><td class="muted">${esc(ago(r.t))}</td><td>${esc(r.agent)}</td><td>${tag(r.kind === 'review' ? '' : r.kind === 'autofix' ? 'restart' : 'up', r.kind || 'task')}</td><td class="wrap">${esc(r.label || '')}</td><td class="num">${kTok(usageTotal(r))}</td><td class="num">$${Number(r.cost || 0).toFixed(2)}</td></tr>`).join('')}</tbody></table>`) : ''}
+      </div>`;
+  }
 
   // One question to every agent; each answers for its own host.
   function viewAskAll(ag, picker) {
@@ -546,7 +643,7 @@ const Dash = (() => {
       return `<div class="msg">
         <div class="q"><div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${statusTag(overall)}</div><div class="q-text">${esc(g.text)}</div></div>
         ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => t.output
-          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)}</div>${md(t.output)}</div>`
+          ? `<div class="ans"><div class="ans-meta">✦ ${esc(hostOf(a))} · ${esc(a.name)}${t.finishedAt ? ` · ${esc(ago(t.finishedAt))}` : ''} ${statusTag(t.status)} ${usageLine(t.usage)}</div>${(rememberPlan({ ...t, agentName: a.name }), answer(t.output, t.id))}</div>`
           : `<div class="ans pending">✦ ${esc(hostOf(a))}: ${t.status === 'queued' ? (a.live ? 'sending…' : 'waiting for the agent to come online…') : t.status === 'running' ? `working on it${t.startedAt ? ` (${esc(duration((Date.now() - t.startedAt) / 1000))})` : ''}…` : esc(t.status)}</div>`).join('')}
       </div>`;
     }).join('');
@@ -639,6 +736,16 @@ const Dash = (() => {
     if (el.open) st.open.add(el.dataset.key); else st.open.delete(el.dataset.key);
   }, true);
 
+  document.addEventListener('change', e => {
+    const cb = e.target.closest && e.target.closest('input[data-pkg]');
+    if (!cb) return;
+    const key = cb.closest('[data-sel]').dataset.sel;
+    const set = st.sel.get(key) || new Set();
+    if (cb.checked) set.add(cb.dataset.pkg); else set.delete(cb.dataset.pkg);
+    st.sel.set(key, set);
+    rerender();
+  });
+
   document.addEventListener('input', e => {
     const t = e.target;
     if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; const pos = t.selectionStart; $('#v-containers').innerHTML = viewContainers(); const n = $('[data-filter-input="q"]'); n.focus(); n.setSelectionRange(pos, pos); return; }
@@ -659,6 +766,29 @@ const Dash = (() => {
     if (row) { const id = row.dataset.ct; if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id); rerender(); return; }
     const ask = e.target.closest('[data-ask]');
     if (ask) { st.askAgent = ask.dataset.ask; st.drafts[ask.dataset.ask] = ask.dataset.prefill; location.hash = '#ask'; setTimeout(() => { const ta = $('.ask-form textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }, 50); return; }
+    const pick = e.target.closest('[data-pick]');
+    if (pick) {
+      const key = pick.closest('[data-sel]').dataset.sel;
+      const [agent, ...rest] = key.split(':');
+      const id = rest.join(':');
+      const a = agents().find(x => x.name === agent);
+      const p = ((a && a.report && a.report.pending) || []).find(x => x.id === id);
+      const pk = (p && p.packages) || [];
+      st.sel.set(key, new Set(pick.dataset.pick === 'all' ? pk.map(x => x.name) : pick.dataset.pick === 'security' ? pk.filter(x => x.security).map(x => x.name) : []));
+      rerender();
+      return;
+    }
+    const cp = e.target.closest('[data-copy-plan]');
+    if (cp) {
+      const text = plans.get(cp.dataset.copyPlan) || '';
+      try { await navigator.clipboard.writeText(text); }
+      catch {
+        const ta = document.createElement('textarea'); ta.value = text; document.body.append(ta); ta.select();
+        document.execCommand('copy'); ta.remove();
+      }
+      toast('Plan copied. Paste it into Claude Code.');
+      return;
+    }
     const act = e.target.closest('[data-act]');
     if (act) {
       const { agent, vmid, name } = act.dataset;
@@ -686,10 +816,14 @@ const Dash = (() => {
     try {
       if (dec) {
         const { agent, id } = dec.dataset;
-        const what = dec.closest('.approval').querySelector('b').textContent;
+        const selNow = st.sel.get(`${agent}:${id}`);
+        const what = dec.closest('.approval').querySelector('b').textContent + (dec.dataset.decide === 'approve' && selNow ? ` (${selNow.size} package${selNow.size === 1 ? '' : 's'})` : '');
         if (!confirm(`${dec.dataset.decide === 'approve' ? 'Approve' : 'Deny'}: ${what}?`)) return;
         dec.disabled = true;
-        await api(`api/infra/${encodeURIComponent(agent)}/decision`, { method: 'POST', body: { id, decision: dec.dataset.decide } });
+        const sel = st.sel.get(`${agent}:${id}`);
+        const body = { id, decision: dec.dataset.decide };
+        if (dec.dataset.decide === 'approve' && sel) body.packages = [...sel];
+        await api(`api/infra/${encodeURIComponent(agent)}/decision`, { method: 'POST', body });
         toast(dec.dataset.decide === 'approve' ? `Approved. ${agent} is starting on it.` : 'Denied.');
       } else if (cancel) {
         await api(`api/infra/${encodeURIComponent(cancel.dataset.agent)}/tasks/${cancel.dataset.cancel}/cancel`, { method: 'POST', body: {} });

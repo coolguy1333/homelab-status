@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.3.0
+
+- Approve only part of an update: tick individual packages, or use the "Security only", "All" and "None"
+  shortcuts. Works for host updates and held-back container updates. The agent installs exactly the packages
+  selected.
+- Hand-off plans: when an agent can't fix something, or isn't allowed to, its answer ends with a
+  "Plan for Claude Code" box and a Copy button.
+- Claude usage on the Ask page: tokens, runs, and the API-price equivalent for today, 7 days, and 30 days,
+  a 30-day chart, recent runs, and the cost of each answer.
+- Backup server details from a read-only PBS API token, with the certificate pinned by fingerprint: CPU, memory,
+  system disk, garbage collection, verify, prune and sync jobs, and failed PBS tasks.
+- Agents log an event when a container is removed from, or added to, a host.
+
 ## 2.2.0
 
 - Requests reach the agents instantly. They keep a connection open (`/api/agent/sync`) instead of checking every

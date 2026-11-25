@@ -740,7 +740,7 @@ async function handleApi(req, res, url) {
     const who = user.email || user.name || 'admin';
     const body = await readBody(req, 64 * 1024);
     if (im[2] === 'decision') {
-      infra.decide(im[1], String(body.id || ''), String(body.decision || ''), who);
+      infra.decide(im[1], String(body.id || ''), String(body.decision || ''), who, Array.isArray(body.packages) ? body.packages.slice(0, 1000) : null);
       return send(res, 200, { ok: true });
     }
     if (im[3]) { infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }

@@ -18,6 +18,8 @@ import os
 import re
 import secrets
 import shlex
+import ssl
+import hashlib as _hashlib
 import socket
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -27,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -170,19 +172,73 @@ def cx(vmid, cmd, timeout=300):
     return ssh(f"pct exec {int(vmid)} -- sh -c {shlex.quote(cmd)}", timeout)
 
 
-def claude(prompt, timeout=1800):
-    """Run Claude non-interactively in ~/agent (where CLAUDE.md describes the setup)."""
+LAST_USAGE = {}
+
+
+def claude(prompt, timeout=1800, kind="task", label=""):
+    """Run Claude non-interactively in ~/agent (where CLAUDE.md describes the setup).
+    Returns (rc, text). Token usage of the run is recorded (see record_usage) and left in LAST_USAGE."""
+    global LAST_USAGE
+    LAST_USAGE = {}
     try:
-        p = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "text"], cwd=BASE,
+        p = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "json"], cwd=BASE,
                            capture_output=True, text=True, timeout=timeout)
-        out = (p.stdout or "").strip()
-        if p.returncode != 0:
-            out = (out + "\n" + (p.stderr or "")).strip()
-        return p.returncode, out
     except subprocess.TimeoutExpired:
         return 124, f"Claude did not finish within {timeout // 60} minutes."
     except FileNotFoundError:
         return 127, "claude is not installed"
+    raw = (p.stdout or "").strip()
+    try:
+        d = json.loads(raw.splitlines()[-1] if raw else "{}")
+    except ValueError:
+        d = {}
+    if not d:
+        return p.returncode or 1, (raw + "\n" + (p.stderr or "")).strip() or "no output"
+    u = d.get("usage") or {}
+    models = list((d.get("modelUsage") or {}).keys())
+    LAST_USAGE = {
+        "t": now_ms(), "kind": kind, "label": label[:120],
+        "input": u.get("input_tokens", 0), "output": u.get("output_tokens", 0),
+        "cacheRead": u.get("cache_read_input_tokens", 0), "cacheWrite": u.get("cache_creation_input_tokens", 0),
+        "cost": round(float(d.get("total_cost_usd") or 0), 4), "model": models[0] if models else None,
+        "turns": d.get("num_turns"), "ms": d.get("duration_ms"), "error": bool(d.get("is_error")),
+    }
+    record_usage(LAST_USAGE)
+    text = d.get("result") or ""
+    rc = 0 if not d.get("is_error") and p.returncode == 0 else 1
+    if rc and not text:
+        text = f"Claude stopped: {d.get('subtype') or d.get('api_error_status') or 'error'}"
+    return rc, text.strip()
+
+
+def record_usage(u):
+    day = time.strftime("%Y-%m-%d")
+    with state() as s:
+        daily = s.setdefault("usageDaily", {})
+        d = daily.setdefault(day, {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0})
+        d["runs"] += 1
+        for k in ("input", "output", "cacheRead", "cacheWrite"):
+            d[k] += int(u.get(k) or 0)
+        d["cost"] = round(d["cost"] + float(u.get("cost") or 0), 4)
+        for k in sorted(daily)[:-90]:
+            daily.pop(k)
+        runs = s.setdefault("usageRuns", [])
+        runs.append(u)
+        s["usageRuns"] = runs[-50:]
+
+
+def usage_report(s):
+    daily = s.get("usageDaily", {})
+    def total(days):
+        keys = [time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400)) for i in range(days)]
+        out = {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0}
+        for k in keys:
+            for f in out:
+                out[f] += (daily.get(k) or {}).get(f, 0)
+        out["cost"] = round(out["cost"], 2)
+        return out
+    return {"today": total(1), "week": total(7), "month": total(30),
+            "daily": {k: daily[k] for k in sorted(daily)[-30:]}, "recent": s.get("usageRuns", [])[-15:]}
 
 
 def spawn(*args):
@@ -353,6 +409,78 @@ def collect_slow(s, node, host, containers, force=False):
 IGNORE_PORTS = {25, 111, 631, 5355}  # mail relay, rpcbind, cups, llmnr: noise, not services
 
 
+def pbs_api(path, timeout=10):
+    """GET from the Proxmox Backup Server API with the read-only token in config.json ("pbs").
+    The server's self-signed certificate is accepted only if its SHA-256 fingerprint matches."""
+    pc = CFG.get("pbs") or {}
+    if not pc.get("token_id") or not pc.get("secret") or not pc.get("server"):
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    import http.client
+    conn = http.client.HTTPSConnection(pc["server"], int(pc.get("port", 8007)), timeout=timeout, context=ctx)
+    try:
+        conn.connect()
+        der = conn.sock.getpeercert(binary_form=True)
+        fp = ":".join(f"{b:02x}" for b in _hashlib.sha256(der).digest())
+        want = str(pc.get("fingerprint", "")).lower()
+        if not want or fp != want:
+            raise RuntimeError("PBS certificate fingerprint does not match the one in config.json")
+        conn.request("GET", "/api2/json/" + path.lstrip("/"),
+                     headers={"Authorization": f"PBSAPIToken={pc['token_id']}:{pc['secret']}"})
+        r = conn.getresponse()
+        body = r.read().decode()
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}: {body[:120]}")
+        return json.loads(body).get("data")
+    finally:
+        conn.close()
+
+
+def pbs_details(datastore):
+    """Extra PBS facts (needs the API token with the Audit role). Missing pieces are simply left out."""
+    out, errors = {}, []
+    def get(key, path):
+        try:
+            v = pbs_api(path)
+            if v is not None:
+                out[key] = v
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+    get("node", "nodes/localhost/status")
+    get("version", "version")
+    get("usage", "status/datastore-usage")
+    get("gc", "admin/gc")
+    get("verify", "admin/verify")
+    get("prune", "admin/prune")
+    get("sync", "admin/sync")
+    get("failedTasks", "nodes/localhost/tasks?errors=1&limit=15")
+    if not out and not errors:
+        return None
+    n = out.get("node") or {}
+    res = {
+        "version": (out.get("version") or {}).get("version"),
+        "uptime": n.get("uptime"), "cpu": n.get("cpu"), "loadavg": n.get("loadavg"),
+        "memory": {"total": (n.get("memory") or {}).get("total"), "used": (n.get("memory") or {}).get("used")},
+        "root": {"total": (n.get("root") or {}).get("total"), "used": (n.get("root") or {}).get("used")},
+        "datastores": [{"store": d.get("store"), "total": d.get("total"), "used": d.get("used"),
+                        "estimatedFull": d.get("estimated-full-date"), "error": d.get("error")}
+                       for d in (out.get("usage") or [])],
+        "gc": [{"store": g.get("store"), "state": g.get("last-run-state"), "last": (g.get("last-run-endtime") or 0) * 1000 or None,
+                "next": (g.get("next-run") or 0) * 1000 or None, "removed": g.get("removed-bytes"), "pending": g.get("pending-bytes")}
+               for g in (out.get("gc") or [])],
+        "jobs": [{"type": typ, "id": j.get("id"), "store": j.get("store"), "schedule": j.get("schedule"),
+                  "state": j.get("last-run-state"), "last": (j.get("last-run-endtime") or 0) * 1000 or None,
+                  "next": (j.get("next-run") or 0) * 1000 or None}
+                 for typ in ("verify", "prune", "sync") for j in (out.get(typ) or [])],
+        "failedTasks": [{"t": (x.get("starttime") or 0) * 1000, "type": x.get("worker_type"), "id": x.get("worker_id"),
+                         "status": x.get("status")} for x in (out.get("failedTasks") or [])][:15],
+        "errors": errors[:5],
+    }
+    return res
+
+
 def pbs_summary(st, items):
     """A Proxmox Backup Server storage as the cluster sees it (no extra credentials needed)."""
     try:
@@ -389,6 +517,7 @@ def pbs_summary(st, items):
         "unverified": sum(1 for v in ver if not v),
         "staleGuests": sum(1 for g in guests.values() if g["last"] < now_ms() - 3 * 86400e3),
         "checkedAt": now_ms(),
+        "details": pbs_details(cfg.get("datastore")) if (CFG.get("pbs") or {}).get("server") == server else None,
     }
 
 
@@ -558,7 +687,7 @@ def queue_internal_task(s, text):
 # ------------------------------------------------------------------ report
 
 def build_report(s, host, containers):
-    tasks = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:]}
+    tasks = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage")}
              for t in s["tasks"].values() if not t.get("internal")]
     pending = sorted(s["pending"].values(), key=lambda p: p["t"])
     internal = [t for t in s["tasks"].values() if t.get("internal")]
@@ -572,6 +701,7 @@ def build_report(s, host, containers):
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
         "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300},
+        "usage": usage_report(s),
         "autoTasks": [{"t": t["t"], "status": t["status"], "text": t["text"][:300], "output": t.get("output", "")[-4000:]}
                       for t in internal[-5:]],
         "taskResults": tasks, "acked": list(s["handled"].keys()),
@@ -582,7 +712,7 @@ def sync(url, wait=0):
     """Quick channel: send task progress, then wait up to `wait` s for new work from the dashboard."""
     with state() as s:
         cutoff = now_ms() - 15 * 60e3
-        results = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:]}
+        results = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage")}
                    for t in s["tasks"].values() if not t.get("internal") and t.get("u", t["t"]) > cutoff]
         acked = list(s["handled"].keys())
     data = json.dumps({"taskResults": results, "acked": acked, "wait": wait}).encode()
@@ -651,6 +781,15 @@ def cmd_report(send=True):
                 b = (slow.get("backups") or {}).get(str(c["vmid"])) or {}
                 c["backup"] = {**b, "covered": any(c["vmid"] in j.get("covers", []) for j in slow.get("jobs", []))}
                 c["snapshots"] = (slow.get("snapshots") or {}).get(str(c["vmid"]), [])
+            prev = {c["vmid"]: c["name"] for c in (s.get("lastCollect") or {}).get("containers", [])}
+            now_ids = {c["vmid"]: c["name"] for c in containers}
+            if prev:
+                for v, n in prev.items():
+                    if v not in now_ids:
+                        event("warn", f"Container {n} ({v}) is no longer on this host (deleted or migrated)", s)
+                for v, n in now_ids.items():
+                    if v not in prev:
+                        event("info", f"New container on this host: {n} ({v})", s)
             s["lastCollect"] = {"host": host, "containers": containers}
             s["serviceChecks"] = check_services(slow.get("services") or [])
             if s.get("hostDownSince"):
@@ -700,7 +839,11 @@ def handle_replies(replies):
             if d["decision"] == "approve":
                 item["approvedBy"] = d.get("by")
                 item["status"] = "approved"
-                event("info", f"Approved by {d.get('by')}: {item['summary']}", s)
+                known = {p["name"] for p in item.get("packages") or []}
+                sel = [n for n in (d.get("packages") or []) if n in known]
+                if sel:
+                    item["selected"] = sel
+                event("info", f"Approved by {d.get('by')}: {item['summary']}" + (f" — only {len(sel)} selected package(s)" if sel else ""), s)
                 spawn("action", did)
             else:
                 event("info", f"Denied by {d.get('by')}: {item['summary']}", s)
@@ -727,14 +870,25 @@ def cmd_task(tid):
               "Do what is asked; if it is a question, answer it from real data you look up. "
               "Your reply is shown on a web dashboard that renders Markdown: use short headings, bullet lists, "
               "**bold** for key facts, `code` for commands/paths, and tables where they help. Keep it concise. "
-              "End with what you changed (or 'No changes made') and any snapshot you took.")
-    rc, out = claude(prompt)
+              "End with what you changed (or 'No changes made') and any snapshot you took.\n\n"
+              "If you could NOT fully solve it — because the fix is outside what you may do (host changes the owner "
+              "did not explicitly ask for, the other Proxmox host, VMs, the backup server, the router/firewall, "
+              "Cloudflare), you lack access, or you are not confident — finish with a section headed exactly "
+              "`## Handoff plan for Claude Code`. Write it so the owner can paste it straight into Claude Code on "
+              "their PC, which can SSH into both connector containers over Tailscale and from there reach the "
+              "Proxmox hosts as root. Include: the problem and the evidence you found; numbered steps with the exact "
+              "commands and which machine each runs on; risks, and how to undo each step; how to verify it worked. "
+              "Never include passwords, tokens or keys. Leave the section out if you fixed everything.")
+    rc, out = claude(prompt, kind="autofix" if internal else "task", label=text[:120])
+    usage = dict(LAST_USAGE)
     with state() as s:
         t = s["tasks"].get(tid)
         if t:
             t["status"] = "done" if rc == 0 else "failed"
             t["output"] = out[-20000:] or "(no output)"
             t["u"] = now_ms()
+            if usage:
+                t["usage"] = {k: usage.get(k) for k in ("input", "output", "cacheRead", "cacheWrite", "cost", "model", "turns", "ms")}
         if internal:
             event("info" if rc == 0 else "error", f"Auto-fix finished: {out.strip().splitlines()[-1][:300] if out.strip() else 'no output'}", s)
     sync_now()    # answer onto the dashboard right away
@@ -781,7 +935,7 @@ def risk_review(name, pkgs, removals):
               "breaking upgrades. Normal point releases and security fixes are 'low'. You may inspect the container "
               "with read-only commands if it helps (ssh to the host, pct exec). Do not change anything.\n"
               'Reply with ONLY a JSON object: {"risk": "low" or "high", "reasons": ["..."]}')
-    rc, out = claude(prompt, timeout=600)
+    rc, out = claude(prompt, timeout=600, kind="review", label=f"update review: {name}")
     m = re.search(r"\{.*\}", out, re.S)
     if rc == 0 and m:
         try:
@@ -852,7 +1006,7 @@ def set_container(vmid, **kw):
         s["containers"].setdefault(str(vmid), {}).update(kw)
 
 
-def update_container(vmid, name, mode="auto"):
+def update_container(vmid, name, mode="auto", only=None):
     """mode: auto (nightly), full (approved). Returns a short result string for the run summary."""
     is_self = vmid == CFG.get("self_vmid")
     label = f"{name} ({vmid})"
@@ -896,6 +1050,7 @@ def update_container(vmid, name, mode="auto"):
                 s["pending"].pop(k)
             if pid not in s["pending"]:
                 add_pending(s, {"id": pid, "kind": "risky-update", "vmid": vmid,
+                                "packages": [{k: p[k] for k in ("name", "old", "new", "security")} for p in others[:400]],
                                 "summary": f"Install {len(others)} held-back update(s) on {label}",
                                 "details": "Why they were held back:\n- " + "\n- ".join(reasons or ["(no reason given)"]) +
                                            "\n\nPackages:\n" + "\n".join(f"{p['name']} {p['old']} -> {p['new']}" for p in others[:200]) +
@@ -918,7 +1073,16 @@ def update_container(vmid, name, mode="auto"):
             return f"{label}: snapshot failed, nothing installed"
 
     pre = health(vmid)
-    if plan == "full":
+    if only:
+        wanted = [p for p in pkgs if p["name"] in set(only)]
+        if not wanted:
+            set_container(vmid, lastUpdate={"t": now_ms(), "result": "ok", "msg": "selected packages were already up to date"})
+            return f"{label}: selected packages already up to date"
+        names = " ".join(shlex.quote(p["name"]) for p in wanted)
+        cmd = f"{APT_ENV} apt-get {APT_OPTS} install --only-upgrade {names} 2>&1 | tail -30"
+        what = f"{len(wanted)} selected update(s)"
+        plan = "selected"
+    elif plan == "full":
         cmd = f"{APT_ENV} apt-get {APT_OPTS} dist-upgrade 2>&1 | tail -30"
         what = f"{len(pkgs)} update(s)"
     else:
@@ -937,7 +1101,7 @@ def update_container(vmid, name, mode="auto"):
             event("info", f"{label}: updated ({what}); rebooting this agent's container in 90 s")
         result = "ok" if apt_ok else "failed"
         set_container(vmid, lastUpdate={"t": now_ms(), "result": result, "msg": f"{what}; {out[-200:] if not apt_ok else 'done'}"},
-                      updates={"count": 0 if plan == "full" else len(pkgs) - len(sec), "security": 0, "checkedAt": now_ms()})
+                      updates={"count": 0 if plan == "full" else len(pkgs) - (len(only) if plan == "selected" else len(sec)), "security": 0, "checkedAt": now_ms()})
         if snap:
             prune_snapshots(vmid)
         return f"{label}: {what} installed{' (reboot scheduled)' if needs_reboot else ''}"
@@ -973,10 +1137,10 @@ def update_container(vmid, name, mode="auto"):
         return f"{label}: BROKEN after update, no snapshot"
 
     result = "ok" if apt_ok else "failed"
-    remaining = 0 if plan == "full" else len(pkgs) - len(sec)
+    remaining = 0 if plan == "full" else len(pkgs) - (len(only) if plan == "selected" else len(sec))
     set_container(vmid, lastUpdate={"t": now_ms(), "result": result, "msg": f"{what}" + ("" if apt_ok else f": {out[-200:]}")},
                   updates={"count": remaining, "security": 0, "checkedAt": now_ms()},
-                  **({"blocked": None} if mode == "full" else {}))
+                  **({"blocked": None} if mode == "full" and plan == "full" else {}))
     if plan == "full":
         with state() as s:
             for k in [k for k, v in s["pending"].items() if v.get("kind") == "risky-update" and v.get("vmid") == vmid]:
@@ -996,6 +1160,7 @@ def check_host_updates():
         if pkgs:
             pid = "host-update-" + hashlib.sha1(json.dumps([(p['name'], p['new']) for p in pkgs]).encode()).hexdigest()[:8]
             add_pending(s, {"id": pid, "kind": "host-update",
+                            "packages": [{k: p[k] for k in ("name", "old", "new", "security")} for p in pkgs[:600]],
                             "summary": f"Update the Proxmox host ({len(pkgs)} package(s), {sum(p['security'] for p in pkgs)} security)",
                             "details": "\n".join(f"{p['name']} {p['old']} -> {p['new']}" for p in pkgs[:300]) +
                                        "\n\nApproving runs `apt full-upgrade` on the host (keeping config files). "
@@ -1066,8 +1231,14 @@ def cmd_action(pid):
     kind = item.get("kind")
     try:
         if kind == "host-update":
-            event("info", "Updating the Proxmox host (approved)")
-            rc, out = ssh(f"apt-get update -q >/dev/null 2>&1; {APT_ENV} apt-get {APT_OPTS} dist-upgrade 2>&1 | tail -40", 3600)
+            sel = item.get("selected")
+            if sel:
+                event("info", f"Updating {len(sel)} selected package(s) on the Proxmox host (approved)")
+                names = " ".join(shlex.quote(n) for n in sel)
+                rc, out = ssh(f"apt-get update -q >/dev/null 2>&1; {APT_ENV} apt-get {APT_OPTS} install --only-upgrade {names} 2>&1 | tail -40", 3600)
+            else:
+                event("info", "Updating the Proxmox host (approved)")
+                rc, out = ssh(f"apt-get update -q >/dev/null 2>&1; {APT_ENV} apt-get {APT_OPTS} dist-upgrade 2>&1 | tail -40", 3600)
             event("info" if "E: " not in out else "error", f"Host update finished: {out.strip().splitlines()[-1][:300] if out.strip() else 'no output'}")
             with state() as s:
                 s["pending"].pop(pid, None)
@@ -1087,7 +1258,7 @@ def cmd_action(pid):
             name = out.strip() or str(vmid)
             with open(UPDATE_LOCK, "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
-                r = update_container(vmid, name, mode="full")
+                r = update_container(vmid, name, mode="full", only=item.get("selected"))
             event("info", f"Approved update: {r}")
             with state() as s:
                 s["pending"].pop(pid, None)
