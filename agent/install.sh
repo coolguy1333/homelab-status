@@ -87,11 +87,16 @@ EOF
 # ---- firewall: this container may reach only its Proxmox host, DNS, and the internet.
 command -v nft >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null
 DNS=$(awk '/^nameserver/{print $2}' /etc/resolv.conf | grep -E '^[0-9.]+$' | paste -sd, -)
+# This container's own LAN subnet (e.g. 192.168.10.0/24). Tunnels (cloudflared, playit) on the connectors
+# forward to services there, so the subnet stays reachable; every other private network is blocked.
+LAN=$(ip -4 -o route show scope link dev eth0 2>/dev/null | awk '{print $1}' | grep -E '^[0-9.]+/[0-9]+$' | head -1)
+LAN_RULE=""
+[ -n "$LAN" ] && LAN_RULE="ip daddr $LAN accept"
 DNS_RULES=""
 [ -n "$DNS" ] && DNS_RULES="ip daddr { $DNS } meta l4proto { udp, tcp } th dport 53 accept"
 cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
-# Managed by homelab agent install.sh. Egress: own Proxmox host ($HOST) + DNS + internet only.
+# Managed by homelab agent install.sh. Egress: own LAN subnet ($LAN) + DNS + internet; other private networks blocked.
 flush ruleset
 table inet hl {
   set private4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } }
@@ -100,6 +105,7 @@ table inet hl {
     oif lo accept
     ct state established,related accept
     ip daddr $HOST tcp dport { 22, 8006 } accept
+    $LAN_RULE
     $DNS_RULES
     udp dport { 67, 68 } accept
     ip daddr @private4 counter reject with icmp type admin-prohibited
