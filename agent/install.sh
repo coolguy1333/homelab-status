@@ -12,7 +12,8 @@ A=/home/agent/agent
 
 install -d -o agent -g agent -m 700 "$A" "$A/logs"
 install -o agent -g agent -m 755 "$HERE/hl_agent.py" "$A/hl_agent.py"
-sed -e "s/__NAME__/$NAME/g" -e "s/__HOST__/$HOST/g" -e "s/__SELF_VMID__/$VMID/g" "$HERE/CLAUDE.md.tmpl" > "$A/CLAUDE.md"
+PBS_IP=$(python3 -c "import json;print((json.load(open('$A/config.json')).get('pbs') or {}).get('server','192.168.10.245'))" 2>/dev/null || echo 192.168.10.245)
+sed -e "s/__NAME__/$NAME/g" -e "s/__HOST__/$HOST/g" -e "s/__SELF_VMID__/$VMID/g" -e "s/__PBS__/$PBS_IP/g" "$HERE/CLAUDE.md.tmpl" > "$A/CLAUDE.md"
 chown agent:agent "$A/CLAUDE.md"
 
 # config.json: keep the token if one exists; set the host, vmid, and (if given) site URLs.

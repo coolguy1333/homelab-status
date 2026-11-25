@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -882,7 +882,7 @@ def cmd_task(tid):
               "**bold** for key facts, `code` for commands/paths, and tables where they help. Keep it concise. "
               "End with what you changed (or 'No changes made') and any snapshot you took.\n\n"
               "If you could NOT fully solve it — because the fix is outside what you may do (host changes the owner "
-              "did not explicitly ask for, the other Proxmox host, VMs, the backup server, the router/firewall, "
+              "did not explicitly ask for, the other Proxmox host, VMs, deleting backups, the router/firewall, "
               "Cloudflare), you lack access, or you are not confident — finish with a section headed exactly "
               "`## Handoff plan for Claude Code`. Write it so the owner can paste it straight into Claude Code on "
               "their PC, which can SSH into both connector containers over Tailscale and from there reach the "

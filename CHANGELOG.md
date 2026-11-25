@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.5.1
+
+- Agent 1.7: both agents can work on the backup server (PBS) over SSH: read everything, and change it only when
+  asked. Deleting backups, datastores, retention settings or disks needs an explicit request.
+
 ## 2.5.0
 
 - Smooth refreshes: the page is patched in place instead of being redrawn every 10 seconds. Scroll positions,
