@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.10.1
+
+- Fixed: the sidebar scrolled away. On pages shorter than the window the footer made the page scroll and the sidebar
+  went with it; the sidebar also sat 5 px too low (it assumed a 57 px header; the header is 62 px). The sidebar now
+  follows the real header height and the footer is part of the main column, so the sidebar never moves.
+- Fixed: on 360 px phones the Uptime toolbar and internal-service rows pushed the page sideways.
+- Fixed: core-server cards said "up for just now" / "state for just now"; they now say e.g. "up for 6s" / "degraded for 3m".
+- Fixed: a core server went DOWN / Degraded (with an alert, then a "back up" alert) after a single missed check.
+  It now takes two in a row, like internal services; recovery still shows at once.
+- Backups and Updates on phones show the host under each container name (the Host column is hidden there), and
+  "Not covered" names the host when the same container name exists on both hosts.
+- Empty-table messages wrap instead of being cut off.
+
 ## 2.10.0
 
 Less Claude usage: things a script can do no longer go to Claude.

@@ -366,7 +366,7 @@ const Dash = (() => {
           <span class="core-state ${cls}">${c.status === 'up' ? 'Up' : c.status === 'down' ? 'DOWN' : c.status === 'degraded' ? 'Degraded' : 'Unknown'}</span></div>
         <div class="core-ports">${Object.entries(ports).map(([p, v]) => `<span class="${v != null ? 'pct-good' : 'pct-bad'}">:${esc(p)} ${v != null ? '✓' : '✗'}</span>`).join('')}
           ${ms.length ? `<span class="muted">${Math.min(...ms).toFixed(1)} ms</span>` : ''}
-          <span class="muted">${c.status === 'up' ? 'up' : 'state'} for ${esc(ago(c.since).replace(' ago', ''))}</span></div>
+          ${c.since ? `<span class="muted">${c.status === 'up' ? 'up' : c.status === 'down' ? 'down' : c.status === 'degraded' ? 'degraded' : 'unknown'} for ${esc(duration((Date.now() - c.since) / 1000).split(' ').slice(0, 2).join(' '))}</span>` : ''}</div>
         ${recentBars(c.recent || [], 48)}
         <div class="core-foot"><span>24 h ${pct(c.uptime24h)}</span><span class="muted">checked by ${by.length ? esc(by.map(([a]) => a).join(' + ')) : 'no agent right now'}</span></div>
       </div>`;
@@ -630,7 +630,7 @@ const Dash = (() => {
     const rows = cs.map(c => {
       const u = c.updates || {};
       const lu = c.lastUpdate;
-      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span></td><td>${esc(c.host)}</td>
+      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span><span class="sub-host muted">${esc(c.host)}</span></td><td>${esc(c.host)}</td>
         <td class="num">${u.count ?? '<span class="muted">—</span>'}</td><td class="num">${u.security ? `<span class="pct-bad">${u.security}</span>` : (u.count != null ? '0' : '')}</td>
         <td>${u.checkedAt ? esc(ago(u.checkedAt)) : '<span class="muted">tonight</span>'}</td>
         <td>${lu ? `<span class="${lu.result === 'ok' ? 'pct-good' : lu.result === 'held' ? 'pct-warn' : 'pct-bad'}">${esc(lu.result)}</span> <span class="muted">${esc(ago(lu.t))}</span>` : '<span class="muted">—</span>'}</td>
@@ -672,7 +672,7 @@ const Dash = (() => {
 
     const kpis = `<div class="kpis">
       ${kpi('Fresh backups', `${fresh}<span class="kpi-of">/${covered.length}</span>`, 'containers backed up in the last 26 h', fresh < covered.length ? 'warn' : '')}
-      ${kpi('Not covered', uncovered.length, uncovered.length ? esc(uncovered.map(c => c.name).join(', ')) : 'every container is in a job', uncovered.length ? 'warn' : '')}
+      ${kpi('Not covered', uncovered.length, uncovered.length ? esc(uncovered.map(c => (cs.filter(x => x.name === c.name).length > 1 ? `${c.name} (${c.host})` : c.name)).join(', ')) : 'every container is in a job', uncovered.length ? 'warn' : '')}
       ${kpi('Failed runs (24 h)', failed24, failed24 ? 'see runs below' : 'all good', failed24 ? 'bad' : '')}
       ${kpi('Container backups', bytes(total), 'total size kept (all versions)')}
       ${[...bstore.values()].map(s => kpi(`Storage ${s.name}`, `${Math.round(s.used / s.total * 100)}%`, `${bytes(s.used)} of ${bytes(s.total)}`, s.used / s.total > 0.9 ? 'bad' : s.used / s.total > 0.75 ? 'warn' : '')).join('')}
@@ -686,7 +686,7 @@ const Dash = (() => {
       const b = c.backup || {};
       const age = backupAge(c);
       const snaps = (c.snapshots || []).length;
-      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span></td><td>${esc(c.host)}</td>
+      return `<tr><td>${dot(c.status === 'running' ? 'up' : 'down')}<b>${esc(c.name)}</b> <span class="muted">${c.vmid}</span><span class="sub-host muted">${esc(c.host)}</span></td><td>${esc(c.host)}</td>
         <td>${b.covered ? '<span class="pct-good">yes</span>' : '<span class="pct-bad">no</span>'}</td>
         <td><span class="${ageCls(age)}">${b.last ? esc(ago(b.last.t)) : 'never'}</span></td>
         <td class="num">${b.last && b.last.size ? bytes(b.last.size) : '—'}</td>
