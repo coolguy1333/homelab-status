@@ -1,6 +1,6 @@
 {
   "name": "homelab-status",
-  "version": "2.4.1",
+  "version": "2.5.0",
   "description": "Homelab status: uptime monitors plus Proxmox hosts/containers reported by connector agents. Zero dependencies.",
   "main": "server.js",
   "scripts": {

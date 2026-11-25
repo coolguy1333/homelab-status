@@ -4,6 +4,70 @@
    Loaded before app.js; uses its helpers ($, $$, esc, api, toast, duration, ago, fmtDate, bytes, pct,
    recentBars, daysBars, state) only inside functions. */
 
+// Patch the DOM in place instead of replacing it, so refreshes don't reset scroll positions, text selection,
+// focus, open <details>, or what you're typing. Elements with data-key/data-id/data-ct/data-chat/id are matched
+// by that key; everything else by position.
+function morph(el, html) {
+  if (!el) return;
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  morphChildren(el, tpl.content);
+}
+function morphKey(n) {
+  if (n.nodeType !== 1) return null;
+  return n.getAttribute('data-key') || n.getAttribute('data-id') || n.getAttribute('data-ct') || n.getAttribute('data-chat') || n.id || null;
+}
+function morphSame(a, b) {
+  if (a.nodeType !== b.nodeType) return false;
+  if (a.nodeType !== 1) return true;
+  return a.nodeName === b.nodeName && morphKey(a) === morphKey(b);
+}
+function morphChildren(from, to) {
+  const keyed = new Map();
+  for (const n of from.childNodes) { const k = morphKey(n); if (k) keyed.set(k, n); }
+  const want = [...to.childNodes];
+  for (let i = 0; i < want.length; i++) {
+    const t = want[i];
+    const k = morphKey(t);
+    let cur = from.childNodes[i] || null;
+    if (k && keyed.has(k)) {
+      const m = keyed.get(k);
+      keyed.delete(k);
+      if (m !== cur) { from.insertBefore(m, cur); cur = m; }
+    }
+    if (cur && morphSame(cur, t)) morphNode(cur, t);
+    else from.insertBefore(document.importNode(t, true), cur);
+  }
+  while (from.childNodes.length > want.length) from.removeChild(from.lastChild);
+}
+function morphNode(a, b) {
+  if (a.nodeType !== 1) { if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue; return; }
+  const focused = a === document.activeElement;
+  for (const { name } of [...a.attributes]) {
+    if (!b.hasAttribute(name) && !(a.nodeName === 'DETAILS' && name === 'open')) a.removeAttribute(name);
+  }
+  for (const { name, value } of [...b.attributes]) {
+    if (a.nodeName === 'DETAILS' && name === 'open') continue; // the user's open/closed choice wins
+    if (a.getAttribute(name) !== value) a.setAttribute(name, value);
+  }
+  if (a.nodeName === 'INPUT') {
+    if (a.type === 'checkbox' || a.type === 'radio') a.checked = b.hasAttribute('checked');
+    else if (!focused && a.value !== (b.getAttribute('value') || '')) a.value = b.getAttribute('value') || '';
+    return;
+  }
+  if (a.nodeName === 'TEXTAREA') {
+    if (!focused && a.value !== b.value && !a.dataset.dirty) a.value = b.value;
+    return;
+  }
+  if (a.nodeName === 'SELECT' && focused) return;
+  morphChildren(a, b);
+}
+// Don't redraw text the user is selecting (e.g. to copy an answer).
+function selectingIn(el) {
+  const sel = window.getSelection && window.getSelection();
+  return Boolean(sel && !sel.isCollapsed && sel.anchorNode && el && el.contains(sel.anchorNode));
+}
+
 const Dash = (() => {
   const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity'];
   const st = {
@@ -224,7 +288,7 @@ const Dash = (() => {
     for (const a of agents()) for (const e of ((a.report || {}).events || [])) events.push({ ...e, host: hostOf(a) });
     events.sort((x, y) => y.t - x.t);
     const recent = events.slice(0, 8).map(e => `<li><time>${esc(ago(e.t))}</time>${levelTag(e.level)}<span><b>${esc(e.host)}</b> ${esc(e.msg)}</span></li>`).join('');
-    return `${pageHead('Overview', `Updated ${esc(new Date().toLocaleTimeString())}`)}
+    return `${pageHead('Overview', '')}
       ${attHtml}${kpis}
       <h3 class="sec-title">Proxmox hosts</h3>${hosts}
       <div class="card pad"><div class="att-head"><h3>Recent activity</h3><a href="#activity">All activity →</a></div>
@@ -254,7 +318,10 @@ const Dash = (() => {
         <div class="kv"><span>Memory</span>${meter(d.memory && d.memory.used, d.memory && d.memory.total)}</div>
         <div class="kv"><span>System disk</span>${meter(d.root && d.root.used, d.root && d.root.total)}</div>
       </div>
-      ${jobs.length ? `<table class="mini pbs-jobs"><tbody>${jobs.map(j => `<tr><td>${dot(okState(j.state) ? 'up' : 'down')}${esc(j.type)}</td><td class="muted">${esc(j.id || '')}</td><td class="${okState(j.state) ? 'pct-good' : 'pct-bad'}">${esc(j.state || 'not run yet')}</td><td class="muted">${j.last ? esc(ago(j.last)) : ''}</td><td class="muted">${j.next ? `next ${esc(fmtTime(j.next))}` : ''}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${jobs.length ? `<div class="pbs-jobs">${jobs.map(j => `<div class="pj">
+          <div class="pj-top">${dot(okState(j.state) ? 'up' : 'down')}<b>${esc(j.type)}</b><span class="pj-state ${okState(j.state) ? (j.state ? 'pct-good' : 'muted') : 'pct-bad'}">${esc(j.state || 'not run yet')}</span></div>
+          <div class="pj-sub muted">${esc(j.id || '')}${j.last ? ` · last ${esc(ago(j.last))}` : ''}${j.next ? ` · next ${esc(fmtTime(j.next))}` : ''}</div>
+        </div>`).join('')}</div>` : ''}
       ${recentFails.length ? details(`pbsfail`, `<span class="pct-bad">${recentFails.length} failed PBS task${recentFails.length > 1 ? 's' : ''} in the last 7 days</span>`, `<ul class="events">${recentFails.map(t => `<li><time>${esc(fmtDate(t.t))}</time>${tag('down', t.type || 'task')}<span>${esc(t.id || '')} — ${esc(t.status || '')}</span></li>`).join('')}</ul>`) : ''}
       <div class="meta"><span>PBS <b>${esc(d.version || '?')}</b></span>${d.uptime ? `<span>Up <b>${esc(duration(d.uptime).split(' ').slice(0, 2).join(' '))}</b></span>` : ''}</div>`;
   }
@@ -357,7 +424,7 @@ const Dash = (() => {
         <div class="seg" data-filter="status">${[['', 'All'], ['running', 'Running'], ['problem', 'Problems']].map(([v, l]) => `<button class="${f.status === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div>
         <input type="search" class="search" data-filter-input="q" placeholder="Search containers…" value="${esc(f.q)}">
       </div>
-      <div class="card table-card"><div class="table-wrap"><table class="ctable">
+      <div class="card table-card"><div class="table-wrap"><table class="ctable ct-containers">
         <thead><tr><th></th><th>ID</th><th>Name</th><th>Host</th><th>CPU</th><th>Memory</th><th>Disk</th><th>Services</th><th>Updates</th><th>Last backup</th><th>Last update</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="11" class="muted">No containers match.</td></tr>'}</tbody></table></div></div>`;
   }
@@ -471,7 +538,7 @@ const Dash = (() => {
       <h3 class="sec-title">Waiting for approval</h3><div class="stack">${pendHtml}</div>
       <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}</div>
       <h3 class="sec-title">Containers</h3>
-      <div class="card table-card"><div class="table-wrap"><table class="ctable">
+      <div class="card table-card"><div class="table-wrap"><table class="ctable ct-updates">
         <thead><tr><th>Container</th><th>Host</th><th>Pending</th><th>Security</th><th>Checked</th><th>Last update</th><th>Notes</th><th></th></tr></thead>
         <tbody>${rows || '<tr><td colspan="8" class="muted">No data yet.</td></tr>'}</tbody></table></div></div>`;
   }
@@ -527,11 +594,11 @@ const Dash = (() => {
       ${kpis}
       ${servers.length ? `<div class="hosts">${servers.map(pbsCard).join('')}</div>` : ''}
       <h3 class="sec-title">Containers</h3>
-      <div class="card table-card"><div class="table-wrap"><table class="ctable">
+      <div class="card table-card"><div class="table-wrap"><table class="ctable ct-backups">
         <thead><tr><th>Container</th><th>Host</th><th>In a job</th><th>Last backup</th><th>Size</th><th>Verified</th><th>Kept</th><th>Snapshots</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="8" class="muted">No data yet.</td></tr>'}</tbody></table></div></div>
       <h3 class="sec-title">Backup jobs</h3>
-      <div class="card table-card"><div class="table-wrap"><table class="ctable">
+      <div class="card table-card"><div class="table-wrap"><table class="ctable ct-jobs">
         <thead><tr><th>Job</th><th>Schedule</th><th>Storage</th><th>Guests</th><th>Mode</th><th>Retention</th><th>Next run</th></tr></thead>
         <tbody>${jobRows || '<tr><td colspan="7" class="muted">No backup jobs found.</td></tr>'}</tbody></table></div></div>
       <h3 class="sec-title">Recent runs</h3>
@@ -739,18 +806,15 @@ const Dash = (() => {
     $$('#sidenav a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
     if (!on) { $('#v-services').innerHTML = ''; return; }
     if (!st.data) {
-      if (st.error) { const el = $(`#v-${view}`); if (el) el.innerHTML = empty(st.error); }
+      if (st.error) { const el = $(`#v-${view}`); if (el) morph(el, empty(st.error)); }
       if (!st.loading) { st.loading = true; load(d).then(() => { st.loading = false; if (st.data) render(d); }); }
       return;
     }
     badges(d);
-    // Don't redraw under someone typing.
-    const act = document.activeElement;
-    const typing = act && act.matches && act.matches('textarea, input[type="search"]') && act.closest('.view');
-    if (view === 'uptime') { $('#v-services').innerHTML = viewServices(); return; }
-    if (typing && typing.dataset.view === view) return;
-    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity }[view];
-    $(`#v-${view}`).innerHTML = fn(d);
+    const target = view === 'uptime' ? $('#v-services') : $(`#v-${view}`);
+    if (selectingIn(target)) return;
+    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices }[view];
+    morph(target, fn(d));
   }
 
   const rerender = () => state.data && render(state.data);
@@ -776,9 +840,9 @@ const Dash = (() => {
 
   document.addEventListener('input', e => {
     const t = e.target;
-    if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; const pos = t.selectionStart; $('#v-containers').innerHTML = viewContainers(); const n = $('[data-filter-input="q"]'); n.focus(); n.setSelectionRange(pos, pos); return; }
+    if (t.matches && t.matches('[data-filter-input]')) { st.filters[t.dataset.filterInput] = t.value; morph($('#v-containers'), viewContainers()); return; }
     const form = t.closest && t.closest('.ask-form');
-    if (form) st.drafts[form.dataset.draft || form.dataset.agent] = t.value;
+    if (form) { st.drafts[form.dataset.draft || form.dataset.agent] = t.value; if (t.value) t.dataset.dirty = '1'; else delete t.dataset.dirty; }
   });
 
   document.addEventListener('click', async e => {
@@ -911,6 +975,7 @@ const Dash = (() => {
       st.drafts[form.dataset.draft] = '';
       st.drafts[agent] = '';
       form.text.value = '';
+      delete form.text.dataset.dirty;
       form.text.blur();
       toast(agent === '_all' ? 'Sent to every agent.' : `Sent to ${agent}.`);
       await load(state.data); rerender();

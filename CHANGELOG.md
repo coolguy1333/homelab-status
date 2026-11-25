@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.5.0
+
+- Smooth refreshes: the page is patched in place instead of being redrawn every 10 seconds. Scroll positions,
+  text you're selecting, open sections, focus, and half-typed messages all survive a refresh, and nothing flickers.
+- Container search filters as you type without losing focus.
+- Fixed page spacing: sections were pressed together because the page wrappers had no gaps.
+- Phones and small screens: tables drop less important columns instead of running off the screen, the header
+  stays on one line, filter buttons scroll, and lists wrap properly.
+- Backup-server jobs show as compact rows (state on the right, details underneath).
+- Agent 1.6.1: health checks after an update only count real services, so a timer that briefly shows "failed"
+  during an upgrade no longer causes a rollback. Host status reads ignore warning lines on stderr.
+
 ## 2.4.1
 
 - When a container is deleted, its internal-service history leaves the dashboard right away instead of

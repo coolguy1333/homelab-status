@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -147,21 +147,24 @@ def add_pending(s, item):
 
 # ------------------------------------------------------------------ remote execution
 
-def ssh(cmd, timeout=120):
-    """Run a shell command on the Proxmox host as root. Returns (rc, combined output)."""
+def ssh(cmd, timeout=120, stdout_only=False):
+    """Run a shell command on the Proxmox host as root. Returns (rc, combined output), or just stdout
+    with stdout_only (for machine-readable output, so warnings on stderr can't corrupt it)."""
     sock = os.path.join(HOME, ".ssh", "cm-%r@%h")
     args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
             "-o", "ControlMaster=auto", "-o", f"ControlPath={sock}", "-o", "ControlPersist=120",
             f"root@{CFG['host']}", cmd]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if stdout_only:
+            return p.returncode, p.stdout.strip() if p.returncode == 0 else (p.stdout + p.stderr).strip()
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, f"timed out after {timeout}s"
 
 
 def ssh_json(cmd, timeout=60):
-    rc, out = ssh(cmd, timeout)
+    rc, out = ssh(cmd, timeout, stdout_only=True)
     if rc != 0:
         raise RuntimeError(out[-300:])
     return json.loads(out)
@@ -972,7 +975,9 @@ def health(vmid):
     running = "running" in out
     if not running:
         return {"running": False, "failed": set(), "ports": set()}
-    rc, out = cx(vmid, "systemctl list-units --failed --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}';"
+    # Only real services count: a timer/socket/path unit can show "failed" for a moment while its package is
+    # upgraded (e.g. wtmpdb-rotate.timer) without anything actually being broken.
+    rc, out = cx(vmid, "systemctl list-units --failed --type=service --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}';"
                        " echo ---; ss -ltnH 2>/dev/null | awk '{print $4}'", 60)
     failed_part, _, ports_part = out.partition("---")
     ports = set()

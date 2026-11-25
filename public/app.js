@@ -157,7 +157,8 @@ function renderSelf(d) {
       ${s.host.loadavg ? `<span>Load <b>${s.host.loadavg.join(' / ')}</b></span>` : ''}
       <span>Memory <b>${bytes(s.host.memoryRss)}</b> (system ${bytes(s.host.systemMemory.total - s.host.systemMemory.free)} / ${bytes(s.host.systemMemory.total)})</span>
     </div>` : '';
-  el.innerHTML = `
+  if (selectingIn(el)) return;
+  morph(el, `
     <div class="self-top">
       <div>
         <div class="self-label">This server${(d.peers || []).length && d.serverName ? ` · ${esc(d.serverName)}` : ''}</div>
@@ -178,7 +179,7 @@ function renderSelf(d) {
       <span>Last outage <b>${s.lastDowntime ? `${esc(fmtDate(s.lastDowntime.start))} (${duration((s.lastDowntime.end - s.lastDowntime.start) / 1000)})` : 'none'}</b></span>
     </div>
     ${host}
-    ${events ? `<details><summary>Server events</summary><ul class="events">${events}</ul></details>` : ''}`;
+    ${events ? `<details data-key="self-events"><summary>Server events</summary><ul class="events">${events}</ul></details>` : ''}`);
   state.selfBase = { uptime: s.processUptime, at: Date.now() };
 }
 
@@ -187,7 +188,7 @@ function renderPeers(d) {
   const peers = d.peers || [];
   el.hidden = peers.length === 0;
   if (!peers.length) return;
-  $('#peerList').innerHTML = peers.map(peerCard).join('');
+  morph($('#peerList'), peers.map(peerCard).join(''));
 }
 
 function peerCard(p) {
@@ -340,7 +341,7 @@ function renderMonitors(d) {
   const list = d.monitors
     .filter(m => (!q || m.name.toLowerCase().includes(q) || (m.target || '').toLowerCase().includes(q)) && (!f || m.status === f))
     .sort((a, b) => (order[a.status] - order[b.status]) || a.name.localeCompare(b.name));
-  $('#monitors').innerHTML = list.map(monitorRow).join('');
+  morph($('#monitors'), list.map(monitorRow).join(''));
   $('#empty').hidden = d.monitors.length > 0;
   $$('.chart').forEach(attachChartHover);
 }
@@ -375,7 +376,7 @@ function renderUser(d) {
   const avatar = u.picture
     ? `<img src="${esc(u.picture)}" alt="" referrerpolicy="no-referrer">`
     : `<span class="avatar">${esc(label.charAt(0).toUpperCase())}</span>`;
-  chip.innerHTML = `${avatar}<span class="who">${esc(label)}</span>`;
+  morph(chip, `${avatar}<span class="who">${esc(label)}</span>`);
   chip.title = `Signed in as ${label}`;
   chip.hidden = false;
 }
