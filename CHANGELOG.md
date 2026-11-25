@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.4.1
+
+- When a container is deleted, its internal-service history leaves the dashboard right away instead of
+  lingering for 7 days.
+
 ## 2.4.0
 
 - Chats: each agent and the Datacenter box have their own list of conversations. "+ New chat" starts one,
