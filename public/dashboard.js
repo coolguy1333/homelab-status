@@ -220,6 +220,7 @@ const Dash = (() => {
   const usageTotal = u => (u ? (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) : 0);
   function usageLine(u) {
     if (!u) return '';
+    if (u.script) return '<span class="usage-line script" title="Answered by a script on the agent from live data. Start a message with /ai to ask Claude instead.">⚡ script · no Claude tokens</span>';
     return `<span class="usage-line" title="${esc(`input ${u.input || 0} · output ${u.output || 0} · cache read ${u.cacheRead || 0} · cache write ${u.cacheWrite || 0}${u.model ? ` · ${u.model}` : ''}`)}">${kTok(usageTotal(u))} tokens${u.cost ? ` · $${Number(u.cost).toFixed(2)}` : ''}${u.turns ? ` · ${u.turns} step${u.turns > 1 ? 's' : ''}` : ''}${u.ms ? ` · ${duration(u.ms / 1000)}` : ''}</span>`;
   }
   function answer(output, id) {
@@ -855,7 +856,7 @@ const Dash = (() => {
         ${toSeg}
         <div class="composer-box"><textarea name="text" rows="1" maxlength="4000" aria-label="Message" placeholder="${chat ? 'Reply — the agent remembers this conversation…' : 'Ask a question or describe what to fix…'}">${esc(st.drafts[draftKey] || '')}</textarea>
           <button class="btn primary send" type="submit">Send</button></div>
-        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'}${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
+        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'} · simple requests (ping, status, restart, disk, updates…) are answered by a script for free; start with <code>/ai</code> to always ask Claude${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
       </form>`;
     const main = `<section class="ask-main">${head}<div class="convo" data-convo="${esc(draftKey)}">${msgs || welcome}</div>${form}</section>`;
 
@@ -938,7 +939,7 @@ const Dash = (() => {
 
   // How much Claude the agents used (from each run's own token report).
   function usageSum(list, key) {
-    const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const o = { runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, scripted: 0 };
     for (const a of list) { const u = a.report && a.report.usage && a.report.usage[key]; if (u) for (const k in o) o[k] += u[k] || 0; }
     return o;
   }
@@ -957,7 +958,7 @@ const Dash = (() => {
     const recent = [];
     for (const a of list) for (const r of ((a.report && a.report.usage && a.report.usage.recent) || [])) recent.push({ ...r, agent: a.name });
     recent.sort((x, y) => y.t - x.t);
-    const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices</div></div>`;
+    const tile = (label, u) => `<div class="kpi"><div class="kpi-k">${label}</div><div class="kpi-v">${kTok(usageTotal(u))}</div><div class="kpi-s">${u.runs} Claude run${u.runs === 1 ? '' : 's'} · ≈ $${u.cost.toFixed(2)} at API prices${u.scripted ? ` · <span class="pct-good">⚡ ${u.scripted} answered by scripts</span>` : ''}</div></div>`;
     return `<div class="usage">
       <div class="kpis">${tile('Today', today)}${tile('Last 7 days', week)}${tile('Last 30 days', month)}</div>
       <div><div class="usage-bars">${bars}</div><div class="bars-legend"><span>30 days ago</span><span>Today</span></div></div>

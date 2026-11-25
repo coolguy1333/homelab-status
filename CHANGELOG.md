@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.10.0
+
+Less Claude usage: things a script can do no longer go to Claude.
+
+- **Quick answers in chat (agent 1.11.0).** Simple requests are answered by a script on the agent, straight from
+  live data, at no token cost. This covers: ping (a container, an IP or hostname, several at once, or "everything"),
+  "is X up" / "status of X", start / restart / reboot / stop / shut down a container (exact name or ID only; the agent
+  never shuts down its own container), disk / memory / CPU use per container, "are any services failing",
+  pending updates (all, or "check updates for X"), backups, host status, and last night's update run.
+  Anything else, or any message that starts with `/ai`, still goes to Claude. Script answers are marked
+  "⚡ script · no Claude tokens", and the usage panel counts them.
+- **Nightly update reviews ask Claude far less.** The built-in rules decide the clear cases: security fixes and point
+  releases are low risk, and removals or major jumps of databases/servers/runtimes are held. Claude reviews only
+  packages that move to a new minor/major version, and its verdict for the same package set is reused for 14 days.
+- **Auto-fix:** a container that won't start because of a stale lock (an interrupted backup or snapshot, with
+  nothing running) is unlocked and started by the script. Claude is asked at most once a day per container
+  (it was every 6 hours).
+- Settings in `~/agent/config.json` (all optional): `"quick_answers": false` turns quick answers off;
+  `"claude_review": "auto" | "always" | "never"` (default `auto`); `"autofix_claude_hours": 24`.
+
 ## 2.9.0
 
 - Merged the parallel dashboard work (2.5.1–2.8.1: logs, live update progress, security-only policy, Ask inbox)

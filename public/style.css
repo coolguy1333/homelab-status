@@ -733,3 +733,4 @@ a.head-status:hover { filter: brightness(.95); }
   .ct-runs th:nth-child(2), .ct-runs td:nth-child(2), .ct-runs th:nth-child(5), .ct-runs td:nth-child(5), .ct-runs th:nth-child(6), .ct-runs td:nth-child(6) { display: none; }
   .ct-runs td.wrap { min-width: 160px; }
 }
+.usage-line.script { color: var(--up); font-weight: 600; }
