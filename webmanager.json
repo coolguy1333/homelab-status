@@ -1,0 +1,84 @@
+{
+  "type": "app",
+  "health": "/api/health",
+  "memory_mb": 256,
+  "env": [
+    {
+      "name": "ADMIN_PASSWORD",
+      "description": "Password for the admin account. Also works as an API bearer token.",
+      "secret": true,
+      "required": true
+    },
+    {
+      "name": "AGENT_TOKENS",
+      "description": "Infrastructure agents allowed to report here, as name:token pairs separated by commas (e.g. connector1:abc...,connector2:def...). Tokens are in /home/agent/agent/config.json on each connector.",
+      "secret": true,
+      "required": true
+    },
+    {
+      "name": "SITE_TITLE",
+      "description": "Title shown on the status page.",
+      "default": "Homelab Status"
+    },
+    {
+      "name": "SERVER_NAME",
+      "description": "Name other servers show for this one when you run several (for example \"Raspberry Pi\"). Defaults to the site title. Can also be changed later in Settings."
+    },
+    {
+      "name": "PUBLIC_DASHBOARD",
+      "description": "Show the dashboard without signing in.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "PASSWORD_LOGIN",
+      "description": "Allow signing in with the admin password. Defaults to on, or off if Google sign-in is configured.",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "GOOGLE_CLIENT_ID",
+      "description": "Google OAuth client ID. With the secret below, enables Sign in with Google. In Google Cloud, add this app's address plus /api/auth/google/callback as an Authorized redirect URI (e.g. https://status.example.com/api/auth/google/callback).",
+      "required": true
+    },
+    {
+      "name": "GOOGLE_CLIENT_SECRET",
+      "description": "Google OAuth client secret.",
+      "secret": true,
+      "required": true
+    },
+    {
+      "name": "ADMIN_EMAILS",
+      "description": "Comma-separated Google accounts allowed to sign in (@domain.com for a whole Workspace domain).",
+      "required": true
+    },
+    {
+      "name": "NOTIFY_WEBHOOK_URL",
+      "description": "Comma-separated webhook URLs (Discord, Slack, ntfy, or any JSON endpoint) for down/up/certificate alerts.",
+      "secret": true
+    },
+    {
+      "name": "ALLOW_EMBED",
+      "description": "Allow the dashboard to be shown in an iframe (Homepage, Heimdall, Home Assistant, ...).",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "PEERS",
+      "description": "Comma-separated URLs of other Uptime Monitor deployments to federate with, shown as \"Other servers\" on the dashboard."
+    },
+    {
+      "name": "PEER_TOKEN",
+      "description": "Shared secret used between federated servers (same value on every server in the group). Required for monitor sync: with it, monitors added, edited or deleted on any server are synced to the others.",
+      "secret": true
+    }
+  ]
+}
