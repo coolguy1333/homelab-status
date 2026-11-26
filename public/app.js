@@ -81,9 +81,10 @@ async function api(path, opts = {}) {
     const err = new Error((data && data.error) || `Request failed (${res.status})`);
     err.status = res.status;
     // Session expired or revoked while the page was open: refresh the UI and offer to sign in again.
-    if (res.status === 401 && state.data && state.data.authed && !path.includes('login')) {
+    // The Cloudflare Access sign-in ran out while the page was open: reloading lets Access sign you in again.
+    if (res.status === 401 && state.data && state.data.authed) {
       state.data.authed = false;
-      setTimeout(() => { refresh(); openLogin(); }, 0);
+      setTimeout(() => location.reload(), 0);
     }
     throw err;
   }
@@ -353,7 +354,8 @@ function render() {
   const d = state.data;
   if (!d) return;
   $('#siteTitle').textContent = d.title;
-  $('#loginBtn').textContent = d.authed ? 'Log out' : 'Sign in';
+  $('#loginBtn').hidden = !(d.authed && d.user && d.user.method === 'cloudflare');
+  $('#lockedHint').textContent = d.auth && d.auth.cloudflare ? 'Open it through Cloudflare Access to sign in.' : 'Sign-in is not set up: the server needs CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD (Cloudflare Access).';
   renderUser(d);
   $('#addBtn').hidden = !d.authed;
   $('#settingsBtn').hidden = !d.authed;
@@ -382,41 +384,6 @@ function renderUser(d) {
   morph(chip, `${avatar}<span class="who">${esc(label)}</span>`);
   chip.title = `Signed in as ${label}`;
   chip.hidden = false;
-}
-
-function openLogin() {
-  const m = (state.data && state.data.auth) || { google: false, password: true };
-  $('#googleLogin').hidden = !m.google;
-  $('#loginGoogleHint').hidden = !m.google;
-  $('#loginNoPasswordHint').hidden = m.password;
-  $('#loginForm').hidden = !m.password;
-  $('#loginDivider').hidden = !(m.google && m.password);
-  $('#loginNone').hidden = m.google || m.password;
-  $('#loginGoogleOnlyActions').hidden = m.password;
-  openDialog('#loginDialog');
-  if (m.password) $('#loginForm').password.focus();
-}
-
-const LOGIN_ERRORS = {
-  not_allowed: 'That Google account is not allowed to sign in. Ask the admin to add it to ADMIN_EMAILS.',
-  cancelled: 'Sign-in was cancelled.',
-  invalid_state: 'Sign-in expired or was started in another tab. Please try again.',
-  token_exchange_failed: 'Google sign-in failed (could not verify with Google). Check GOOGLE_CLIENT_SECRET and the redirect URI.',
-  bad_id_token: 'Google sign-in failed (invalid response).',
-  email_not_verified: 'Your Google email address is not verified.',
-  google_disabled: 'Google sign-in is not configured on this server.',
-  rate_limited: 'Too many sign-in attempts. Wait a minute and try again.',
-  google_error: 'Google reported an error during sign-in.',
-};
-
-function showLoginErrorFromUrl() {
-  const params = new URLSearchParams(location.search);
-  const code = params.get('login_error');
-  if (!code) return;
-  toast(LOGIN_ERRORS[code] || `Sign-in failed (${code})`, true);
-  params.delete('login_error');
-  const q = params.toString();
-  history.replaceState(null, '', location.pathname + (q ? `?${q}` : '') + location.hash);
 }
 
 // ------------------------------------------------------------------ chart hover
@@ -564,26 +531,7 @@ $('#monitorForm').addEventListener('submit', async e => {
   }
 });
 
-$('#loginForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const form = e.target;
-  try {
-    await api('api/login', { method: 'POST', body: { password: form.password.value } });
-    $('#loginDialog').close();
-    form.reset();
-    toast('Logged in');
-    refresh();
-  } catch (err) {
-    $('.form-error', form).textContent = err.message;
-  }
-});
-
-async function logout() {
-  await api('api/logout', { method: 'POST', body: {} }).catch(() => {});
-  $('#settingsDialog').close();
-  toast('Logged out');
-  refresh();
-}
+function logout() { location.href = '/cdn-cgi/access/logout'; }
 
 async function openSettings() {
   try {
@@ -600,16 +548,41 @@ async function openSettings() {
     const peers = s.peers || {};
     const who = state.data && state.data.user;
     $('#authInfo').innerHTML = [
-      who ? `<div>Signed in as <b>${esc(who.email || who.name)}</b>${who.method === 'google' ? ' (Google)' : who.method === 'password' ? ' (password)' : ''}</div>` : '',
-      `<div>Google sign-in: <b>${a.google ? 'on' : 'off'}</b>${a.google ? ` — admins: ${esc((a.adminEmails || []).join(', ') || 'none (set ADMIN_EMAILS)')}` : ' — set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and ADMIN_EMAILS to enable'}</div>`,
-      `<div>Password login: <b>${a.password ? 'on' : 'off'}</b> · API token / password from ${esc(a.passwordSource || '')}</div>`,
+      who ? `<div>Signed in as <b>${esc(who.email || who.name)}</b>${who.method === 'cloudflare' ? ' (Cloudflare Access)' : who.method === 'token' ? ' (API token)' : ''}</div>` : '',
+      `<div>Sign-in: <b>${a.cloudflare ? `Cloudflare Access (${esc(a.team)})` : 'not set up'}</b>${a.cloudflare ? ` — ${(a.adminEmails || []).length ? `limited to ${esc(a.adminEmails.join(', '))}` : 'whoever your Access policy lets in'}` : ' — set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD'}</div>`,
+      `<div>API token (ADMIN_PASSWORD) from ${esc(a.tokenSource || '')}</div>`,
       peers.count
         ? `<div>Other servers: <b>${peers.count}</b> · monitor sync: <b>${peers.sync ? 'on' : 'off'}</b>${peers.sync ? '' : ' — set the same PEER_TOKEN on every server to turn it on'}</div>`
         : '<div>Other servers: <b>none</b> — set PEERS (and PEER_TOKEN) to show and sync other servers</div>',
     ].join('');
     openDialog('#settingsDialog');
+    loadMcpClients();
   } catch (err) { toast(err.message, true); }
 }
+
+// Settings → Connected clients: Claude connectors that were approved (lib/oauth.js), with a Revoke button each.
+async function loadMcpClients() {
+  const box = $('#mcpClients');
+  try {
+    const r = await api('api/oauth/clients');
+    if (!r.enabled) { box.innerHTML = `<b>Connected clients</b><span>Claude connector off: ${esc(r.reason || '')}.</span>`; return; }
+    box.innerHTML = `<b>Connected clients</b>
+      <span>Add <code>${esc(r.url)}</code> in Claude → Settings → Connectors (read-only access).</span>
+      ${r.clients.length ? r.clients.map(c => `<div class="mcp-client"><span><b>${esc(c.name)}</b> · ${esc(c.redirectHost || '')} · ${esc(c.accounts.join(', '))} · connected ${esc(ago(c.connectedAt))}${c.lastUsedAt ? ` · used ${esc(ago(c.lastUsedAt))}` : ''}</span>
+        <button type="button" class="btn ghost small" data-revoke-client="${esc(c.id)}" data-name="${esc(c.name)}">Revoke</button></div>`).join('') : '<span>None yet.</span>'}`;
+  } catch (err) { box.innerHTML = `<b>Connected clients</b><span>${esc(err.message)}</span>`; }
+}
+
+$('#mcpClients').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-revoke-client]');
+  if (!btn) return;
+  if (!(await uiConfirm(`Revoke ${btn.dataset.name}?`, 'Its access stops at once. Claude has to be connected again to use it.', { ok: 'Revoke', danger: true }))) return;
+  try {
+    await api(`api/oauth/clients/${encodeURIComponent(btn.dataset.revokeClient)}`, { method: 'DELETE' });
+    toast('Client revoked');
+    loadMcpClients();
+  } catch (err) { toast(err.message, true); }
+});
 
 $('#settingsForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -660,7 +633,7 @@ document.addEventListener('click', async e => {
   const m = id && state.data.monitors.find(x => x.id === id);
   const action = btn.dataset.action;
 
-  if (action === 'login') return openLogin();
+  if (action === 'login') return location.reload();
   if (action === 'add') return openMonitorDialog(null);
   if (!m) return;
 
@@ -701,7 +674,6 @@ document.addEventListener('keydown', e => {
 });
 $('#addBtn').addEventListener('click', () => openMonitorDialog(null));
 $('#settingsBtn').addEventListener('click', openSettings);
-$('#loginBtn').addEventListener('click', () => (state.data && state.data.authed ? logout() : openLogin()));
 $('#search').addEventListener('input', () => state.data && renderMonitors(state.data));
 $('#statusFilter').addEventListener('change', () => state.data && renderMonitors(state.data));
 
@@ -726,7 +698,6 @@ $('#themeBtn').addEventListener('click', () => {
 function setTopbarHeight() { document.documentElement.style.setProperty('--topbar-h', `${$('.topbar').offsetHeight}px`); }
 setTopbarHeight();
 if (window.ResizeObserver) new ResizeObserver(setTopbarHeight).observe($('.topbar'));
-showLoginErrorFromUrl();
 refresh();
 setInterval(() => { if (!document.hidden && !$('dialog[open]')) refresh(); }, REFRESH_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });

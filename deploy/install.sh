@@ -24,6 +24,7 @@ fi
 echo "==> Installing packages"
 apt-get update -qq || echo "    (apt-get update reported errors, continuing)"
 apt-get install -y -qq iputils-ping ca-certificates curl >/dev/null
+command -v npm >/dev/null 2>&1 || apt-get install -y -qq npm >/dev/null || true
 if [ "$need_node" -eq 1 ]; then
   apt-get install -y -qq nodejs >/dev/null || true
   if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then
@@ -41,7 +42,9 @@ chown uptime:uptime "$DATA_DIR"
 chmod 750 "$DATA_DIR"
 
 echo "==> Copying app to $APP_DIR"
-cp -r "$SRC_DIR/server.js" "$SRC_DIR/package.json" "$SRC_DIR/lib" "$SRC_DIR/public" "$APP_DIR/"
+cp -r "$SRC_DIR/server.js" "$SRC_DIR/package.json" "$SRC_DIR/package-lock.json" "$SRC_DIR/lib" "$SRC_DIR/public" "$APP_DIR/"
+echo "==> Installing dependencies (npm ci)"
+(cd "$APP_DIR" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null) || echo "    npm ci failed: the app runs, but the Claude connector (/mcp) is off until it works"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "==> Writing $ENV_FILE"
@@ -49,11 +52,11 @@ if [ ! -f "$ENV_FILE" ]; then
 # Uptime Monitor settings. Restart after editing: systemctl restart uptime-monitor
 PORT=3000
 HOST=0.0.0.0
-#ADMIN_PASSWORD=change-me
+#ADMIN_PASSWORD=change-me   # API token for scripts
 #SITE_TITLE=Homelab Status
-# Google sign-in (see docs/GOOGLE_SIGNIN.md)
-#GOOGLE_CLIENT_ID=
-#GOOGLE_CLIENT_SECRET=
+# Sign-in is Cloudflare Access (see docs/CLOUDFLARE_ACCESS.md)
+#CF_ACCESS_TEAM_DOMAIN=yourteam.cloudflareaccess.com
+#CF_ACCESS_AUD=
 #ADMIN_EMAILS=you@gmail.com
 #PUBLIC_URL=https://status.example.com
 #NOTIFY_WEBHOOK_URL=
@@ -75,8 +78,8 @@ IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
 echo "Uptime Monitor is running:  http://${IP:-localhost}:${PORT:-3000}"
 if [ -f "$DATA_DIR/admin-password.txt" ] && ! grep -qE '^ADMIN_PASSWORD=.+' "$ENV_FILE"; then
-  echo "Admin password / API token: $(cat "$DATA_DIR/admin-password.txt")"
+  echo "API token (ADMIN_PASSWORD):  $(cat "$DATA_DIR/admin-password.txt")"
 fi
-echo "Google sign-in:             edit $ENV_FILE (see docs/GOOGLE_SIGNIN.md)"
+echo "Sign-in (Cloudflare Access): edit $ENV_FILE (see docs/CLOUDFLARE_ACCESS.md)"
 echo "Logs:                       journalctl -u uptime-monitor -f"
 echo "Settings:                   $ENV_FILE"

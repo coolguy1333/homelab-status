@@ -1,8 +1,12 @@
 # Troubleshooting
 
-## Google sign-in problems
+## Sign-in problems
 
-See the troubleshooting table in [GOOGLE_SIGNIN.md](GOOGLE_SIGNIN.md#troubleshooting). The common ones are `redirect_uri_mismatch` (register the exact URI printed in the startup log) and the app being in *Testing* without your account added as a test user.
+See the troubleshooting table in [CLOUDFLARE_ACCESS.md](CLOUDFLARE_ACCESS.md#troubleshooting). The common ones are a wrong `CF_ACCESS_AUD`, and opening the app on its LAN address (which never counts as signed in).
+
+## Claude connector problems
+
+See [Claude connector](CONFIGURATION.md#claude-connector-mcp). Most often Cloudflare blocks Claude (Bot Fight Mode, Block AI Bots) or an Access bypass is missing for `/mcp`, `/oauth/token`, `/oauth/register` or `/.well-known/`. `journalctl -u uptime-monitor | grep -E '\[mcp\]|\[oauth\]'` shows registrations, approvals and every tool call.
 
 ## I don't know the admin password
 
@@ -65,11 +69,7 @@ Set another port: `PORT=8080 node server.js`, or change the left side of the Com
 
 ## Signed out unexpectedly
 
-Sessions last 30 days and survive restarts. You are signed out if your email was removed from `ADMIN_EMAILS`, password login was turned off while you were signed in with the password, or `sessions.json` was deleted.
-
-## Login doesn't stick behind a reverse proxy
-
-If the site is served over HTTPS by a proxy, set `TRUST_PROXY=true`. Also make sure the proxy passes cookies and the `Host` header through unchanged.
+The sign-in is Cloudflare Access's: its session length is set on the Access application (*Session duration*). When it runs out, the dashboard reloads and Access asks you to sign in again.
 
 ## Docker: "permission denied" writing to /data
 

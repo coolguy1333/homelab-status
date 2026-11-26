@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.15.0
+
+**Claude connector** (read-only MCP server at `$PUBLIC_URL/mcp`) and **Cloudflare Access** replaces the site's own
+sign-in.
+
+- **Sign-in is Cloudflare Access.** Google sign-in and the password form are gone. The app verifies the JWT Access
+  adds to each request (RS256 against the team's keys, issuer, AUD, expiry). A request that didn't come through
+  Access, e.g. straight to `:3000` on the LAN, is not signed in. New: `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`.
+  `ADMIN_EMAILS` is now an optional second check. `ADMIN_PASSWORD` stays as the API token for scripts. Removed:
+  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PASSWORD_LOGIN`, `/api/login`, `/api/logout`, `/api/auth/google*`,
+  `sessions.json`. Setup and the Access bypasses agents and Claude need: [docs/CLOUDFLARE_ACCESS.md](docs/CLOUDFLARE_ACCESS.md).
+- **Claude connector:** add `https://<domain>/mcp` in Claude → Settings → Connectors. 14 read-only tools
+  (`get_overview` with the Overview's needs-attention list, monitors, agents, containers, approvals, update runs,
+  backups, events, agent logs, Claude usage, internal services, HA status). Compact JSON, ISO 8601 times, 50 items
+  per page by default (max 200). It never returns tokens, passwords, webhooks, OAuth data or chat contents.
+- **OAuth 2.1 built in:** discovery (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`),
+  dynamic registration, authorization code with PKCE S256 only, refresh tokens that rotate (the old one works for
+  2 more minutes, so a failover right after a refresh doesn't disconnect Claude). Redirect URIs are limited to
+  `MCP_REDIRECT_ALLOWLIST` (Claude's callbacks by default). Only SHA-256 hashes are stored, in `oauth.json`, which
+  um-ha replicates. Access cookies and `ADMIN_PASSWORD` are not accepted on `/mcp`. 60 calls per minute per client;
+  every tool call is logged without arguments or results. `MCP_ENABLED=false` turns it all off.
+- **Settings → Connected clients:** see who is connected and revoke a client.
+- **One npm dependency** (`@modelcontextprotocol/sdk`). um-update now runs `npm ci --omit=dev` and installs
+  `node_modules` with the app, and fills it in for an app installed without it (needs `npm` on the container;
+  without it the app runs and only the connector is off). `deploy/install.sh` and the Dockerfile do the same.
+- Tests: `npm test` (node:test): tool output shapes and limits, no secrets in any output, the OAuth flow, and the
+  full connection the way Claude does it.
+
 ## 2.14.0
 
 Everything on the Uptime page is checked every 20 seconds, and the backup server gets updates like a Proxmox host

@@ -157,7 +157,7 @@ pm2 save && pm2 startup
 
 ## Reverse proxy and HTTPS
 
-Put the monitor behind a reverse proxy to serve it on a domain with HTTPS. This is also what you need for [Google sign-in](GOOGLE_SIGNIN.md) from other devices, because Google only allows HTTPS domains or `localhost`, not LAN IPs. Set **`TRUST_PROXY=true`** so the app knows the original client IP and that the connection is HTTPS (login cookies are then marked `Secure`). Optionally set `HOST=127.0.0.1` so the app is only reachable through the proxy.
+Put the monitor behind a reverse proxy to serve it on a domain with HTTPS. Signing in needs [Cloudflare Access](CLOUDFLARE_ACCESS.md) in front of the domain (a Cloudflare Tunnel is the usual way to get there). Set **`TRUST_PROXY=true`** so the app knows the original client IP and that the connection is HTTPS. Optionally set `HOST=127.0.0.1` so the app is only reachable through the proxy.
 
 **Caddy** (automatic HTTPS) — see `deploy/Caddyfile`:
 
@@ -184,7 +184,7 @@ Everything is in the data folder (`./data`, `/var/lib/uptime-monitor`, or the Do
 | `history.json` | check results (24 h raw, 90 days hourly) |
 | `self.json` | the monitor's own uptime record |
 | `admin-password.txt` | generated admin password (if `ADMIN_PASSWORD` isn't set) |
-| `sessions.json` | signed-in sessions |
+| `oauth.json` | Claude connector clients and token hashes |
 
 Copy the folder to back up; copy it back to restore. For just the monitor list, use **Settings → Export monitors** and **Import monitors**.
 
