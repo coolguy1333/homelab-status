@@ -31,7 +31,10 @@ function ago(t) {
   if (!t) return '—';
   const s = (Date.now() - t) / 1000;
   if (s < 5) return 'just now';
-  return `${duration(s).split(' ').slice(0, 2).join(' ')} ago`;
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;          // "2m ago", not "2m 0s ago"
+  const [a, b] = duration(s).split(' ');
+  return `${a}${b && !/^0/.test(b) ? ` ${b}` : ''} ago`;            // "1h 5m ago", "3d 4h ago", "1h ago"
 }
 
 const fmtDate = t => new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });

@@ -384,46 +384,81 @@ const Dash = (() => {
     return [...m.values()];
   }
 
-  function pbsDetails(d) {
-    if (!d) return '<p class="hint">Add a read-only PBS API token to see garbage collection, verify jobs and the server\'s own health.</p>';
-    const okState = v => !v || /^ok$/i.test(v);
+  // ---- backup server (PBS) card: full width under the hosts, two columns inside
+  const TASK_NAMES = {
+    garbage_collection: 'Garbage collection', verificationjob: 'Verify job', verify: 'Verify', syncjob: 'Sync job', sync: 'Sync',
+    prune: 'Prune', prunejob: 'Prune job', backup: 'Backup', reader: 'Restore', 'tape-backup-job': 'Tape backup',
+  };
+  const taskName = t => TASK_NAMES[String(t || '').toLowerCase()] || String(t || 'Task').replace(/[_-]+/g, ' ').replace(/^\w/, c => c.toUpperCase());
+  const stateCls = v => (!v ? 'muted' : /^ok$/i.test(v) ? 'pct-good' : /^warn/i.test(v) ? 'pct-warn' : 'pct-bad');
+  const stateDot = v => (!v ? '' : /^ok$/i.test(v) ? 'up' : /^warn/i.test(v) ? 'pending' : 'down');
+
+  function pbsJobs(d) {
     // PBS leaves last-run-state empty for some job types: fall back to the newest failed task for that job.
     const failedFor = id => (d.failedTasks || []).find(t => t.id && id && String(t.id).includes(id) && Date.now() - t.t < 48 * 3600e3);
-    const jobs = [...(d.gc || []).map(g => ({ type: 'garbage collection', id: g.store, state: g.state, last: g.last, next: g.next })), ...(d.jobs || [])]
+    const jobs = [...(d.gc || []).map(g => ({ type: 'garbage_collection', id: g.store, state: g.state, last: g.last, next: g.next })), ...(d.jobs || [])]
       .map(j => { if (j.state) return j; const f = failedFor(j.id); return f ? { ...j, state: `failed: ${f.status || 'error'}`, last: f.t } : j; });
-    const recentFails = (d.failedTasks || []).filter(t => Date.now() - t.t < 7 * 86400e3);
-    return `<div class="host-meters">
-        <div class="kv"><span>CPU</span>${cpuMeter(d.cpu)}</div>
-        <div class="kv"><span>Memory</span>${meter(d.memory && d.memory.used, d.memory && d.memory.total)}</div>
-        <div class="kv"><span>System disk</span>${meter(d.root && d.root.used, d.root && d.root.total)}</div>
-      </div>
-      ${jobs.length ? `<div class="pbs-jobs">${jobs.map(j => `<div class="pj">
-          <div class="pj-top">${dot(okState(j.state) ? 'up' : 'down')}<b>${esc(j.type)}</b><span class="pj-state ${okState(j.state) ? (j.state ? 'pct-good' : 'muted') : 'pct-bad'}">${esc(j.state || 'not run yet')}</span></div>
-          <div class="pj-sub muted">${esc(j.id || '')}${j.last ? ` · last ${esc(ago(j.last))}` : ''}${j.next ? ` · next ${esc(fmtTime(j.next))}` : ''}</div>
-        </div>`).join('')}</div>` : ''}
-      ${recentFails.length ? details(`pbsfail`, `<span class="pct-bad">${recentFails.length} failed PBS task${recentFails.length > 1 ? 's' : ''} in the last 7 days</span>`, `<ul class="events">${recentFails.map(t => `<li><time>${esc(fmtDate(t.t))}</time>${tag('down', t.type || 'task')}<span>${esc(t.id || '')} — ${esc(t.status || '')}</span></li>`).join('')}</ul>`) : ''}
-      <div class="meta"><span>PBS <b>${esc(d.version || '?')}</b></span>${d.uptime ? `<span>Up <b>${esc(duration(d.uptime).split(' ').slice(0, 2).join(' '))}</b></span>` : ''}</div>`;
+    if (!jobs.length) return '';
+    return `<div class="pbs-sub">Jobs</div><div class="pbs-jobs">${jobs.map(j => `<div class="pj">
+        <div class="pj-top">${dot(stateDot(j.state))}<b>${esc(taskName(j.type))}</b><span class="pj-state ${stateCls(j.state)}" title="${esc(j.state || '')}">${esc(j.state || 'not run yet')}</span></div>
+        <div class="pj-sub muted" title="${esc(j.id || '')}">${esc(j.id || '')}${j.last ? ` · last ${esc(ago(j.last))}` : ''}${j.next ? ` · next ${esc(fmtTime(j.next))}` : ''}</div>
+      </div>`).join('')}</div>`;
+  }
+
+  // Failed tasks of the last 7 days, grouped: the same job failing every hour is one line, not twelve.
+  function pbsProblems(d, key) {
+    const fails = (d.failedTasks || []).filter(t => Date.now() - t.t < 7 * 86400e3).sort((x, y) => y.t - x.t);
+    if (!fails.length) return '<div class="pbs-sub">Problems</div><p class="pbs-ok">✓ No failed tasks in the last 7 days</p>';
+    const groups = new Map();
+    for (const t of fails) {
+      const k = `${t.type}|${t.id}`;
+      if (!groups.has(k)) groups.set(k, { type: t.type, id: t.id, n: 0, last: t.t, status: t.status });
+      groups.get(k).n++;
+    }
+    const rows = [...groups.values()].sort((x, y) => y.last - x.last);
+    return `<div class="pbs-sub">Problems in the last 7 days</div>
+      <div class="pbs-fails">${rows.slice(0, 6).map(g => `<div class="pf">
+          <div class="pf-top">${dot(stateDot(g.status))}<b>${esc(taskName(g.type))}</b><span class="pf-id muted" title="${esc(g.id || '')}">${esc(g.id || '')}</span><span class="pf-n">${g.n}×</span></div>
+          <div class="pf-sub"><span class="${stateCls(g.status)}">${esc(g.status || 'failed')}</span><span class="muted"> · last ${esc(ago(g.last))}</span></div>
+        </div>`).join('')}</div>
+      ${rows.length > 6 ? `<p class="muted small">…and ${rows.length - 6} more kinds of failure</p>` : ''}
+      ${details(`pbsall:${key}`, `All ${fails.length} failed task${fails.length > 1 ? 's' : ''}`, `<div class="table-wrap"><table class="mini pbs-table"><tbody>${fails.map(t => `<tr><td class="muted">${esc(fmtDate(t.t))}</td><td>${esc(taskName(t.type))}</td><td class="muted">${esc(t.id || '')}</td><td class="${stateCls(t.status)}">${esc(t.status || '')}</td></tr>`).join('')}</tbody></table></div>`)}`;
   }
 
   function pbsCard(p) {
+    const d = p.details;
     const verPct = p.count ? Math.round((p.verifiedOk / p.count) * 100) : null;
-    return `<div class="card host">
+    const sub = [`Proxmox Backup Server · datastore ${p.datastore || '?'}`, p.reachable ? `answering (${p.ms} ms)` : 'NOT REACHABLE'];
+    if (d && d.version) sub.push(`PBS ${d.version}`);
+    if (d && d.uptime) sub.push(`up ${duration(d.uptime).split(' ').slice(0, 2).join(' ')}`);
+    return `<div class="card host pbs">
       <div class="host-head">${dot(p.reachable ? 'up' : 'down')}<div><h3>${esc(p.storage)} <span class="muted">${esc(p.server || '')}</span></h3>
-        <div class="muted ${p.reachable ? '' : 'pct-bad'}">Proxmox Backup Server · datastore ${esc(p.datastore || '?')} · ${p.reachable ? `answering (${p.ms} ms)` : 'NOT REACHABLE'}</div></div>
+        <div class="muted ${p.reachable ? '' : 'pct-bad'}">${esc(sub.join(' · '))}</div></div>
         <span class="pill">backup server</span></div>
-      <div class="host-meters"><div class="kv"><span>${esc(p.datastore || 'Datastore')}</span>${meter(p.used, p.total)}</div></div>
-      <div class="pbs-stats">
-        <div><b>${p.count}</b><span>backups</span></div>
-        <div><b>${p.guests}</b><span>guests (${p.containers} CT · ${p.vms} VM)</span></div>
-        <div><b>${p.last24h}</b><span>in last 24 h</span></div>
-        <div><b class="${p.verifyFailed ? 'pct-bad' : verPct === 100 ? 'pct-good' : ''}">${verPct == null ? '—' : `${verPct}%`}</b><span>verified${p.verifyFailed ? ` · ${p.verifyFailed} failed` : ''}</span></div>
-      </div>
-      ${pbsDetails(p.details)}
-      <div class="meta">
-        <span>Newest <b>${p.last ? esc(ago(p.last)) : '—'}</b></span>
-        <span>Oldest <b>${p.oldest ? esc(new Date(p.oldest).toLocaleDateString()) : '—'}</b></span>
-        <span>Free <b>${p.avail ? bytes(p.avail) : '—'}</b></span>
-        ${p.staleGuests ? `<span class="pct-warn">${p.staleGuests} guest(s) with no backup in 3 days</span>` : ''}
+      <div class="pbs-body">
+        <div class="pbs-col">
+          <div class="host-meters"><div class="kv"><span>${esc(p.datastore || 'Datastore')}</span>${meter(p.used, p.total)}</div></div>
+          <div class="pbs-stats">
+            <div><b>${p.count ?? '—'}</b><span>backups</span></div>
+            <div><b>${p.guests ?? '—'}</b><span>guests</span><span class="muted">${p.containers || 0} CT · ${p.vms || 0} VM</span></div>
+            <div><b>${p.last24h ?? '—'}</b><span>in last 24 h</span></div>
+            <div><b class="${p.verifyFailed ? 'pct-bad' : verPct === 100 ? 'pct-good' : ''}">${verPct == null ? '—' : `${verPct}%`}</b><span>verified</span>${p.verifyFailed ? `<span class="pct-bad">${p.verifyFailed} failed</span>` : ''}</div>
+          </div>
+          <div class="meta">
+            <span>Newest <b>${p.last ? esc(ago(p.last)) : '—'}</b></span>
+            <span>Oldest <b>${p.oldest ? esc(new Date(p.oldest).toLocaleDateString()) : '—'}</b></span>
+            <span>Free <b>${p.avail ? bytes(p.avail) : '—'}</b></span>
+            ${p.staleGuests ? `<span class="pct-warn">${p.staleGuests} guest(s) with no backup in 3 days</span>` : ''}
+          </div>
+          ${d ? `<div class="pbs-sub">Server</div><div class="host-meters">
+            <div class="kv"><span>CPU</span>${cpuMeter(d.cpu)}</div>
+            <div class="kv"><span>Memory</span>${meter(d.memory && d.memory.used, d.memory && d.memory.total)}</div>
+            <div class="kv"><span>System disk</span>${meter(d.root && d.root.used, d.root && d.root.total)}</div>
+          </div>` : ''}
+        </div>
+        <div class="pbs-col">
+          ${d ? `${pbsJobs(d)}${pbsProblems(d, `${p.server}/${p.datastore}`)}` : '<p class="hint">Add a read-only PBS API token to see garbage collection, verify jobs and the server\'s own health.</p>'}
+        </div>
       </div>
     </div>`;
   }
