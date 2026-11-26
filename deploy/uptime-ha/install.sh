@@ -37,7 +37,8 @@ echo "    node $(node --version), python $(python3 --version | cut -d' ' -f2)"
 echo "==> Source checkout in $SRC (the updater pulls it every 5 minutes)"
 if [ ! -d "$SRC/.git" ]; then
   if [ "$HERE" != "$SRC" ] && [ -d "$HERE/.git" ]; then
-    git clone -q "$HERE" "$SRC" && git -C "$SRC" remote set-url origin "$REPO"
+    git -c safe.directory='*' clone -q "$HERE" "$SRC"
+    git -C "$SRC" remote set-url origin "$REPO"
   else
     git clone -q "$REPO" "$SRC"
   fi
