@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Pulls github.com/coolguy1333/homelab-status (main) and installs it when it changed: the same
+# "deploy on push" WebManager did. A running app (primary) restarts for a few seconds, well under
+# um-ha's FAIL_AFTER, so updates don't fail over. Run by um-update.timer every 5 minutes.
+set -euo pipefail
+SRC=/opt/homelab-status-src
+cd "$SRC"
+git fetch -q origin main
+new=$(git rev-parse origin/main)
+old=$(cat /var/lib/um-ha/installed-rev 2>/dev/null || true)
+[ "$new" = "$old" ] && exit 0
+if ! git cat-file -e "$new:deploy/uptime-ha/um-ha" 2>/dev/null; then
+  echo "origin/main has no deploy/uptime-ha yet (not merged?): staying on ${old:0:7}"
+  exit 0
+fi
+
+git reset -q --hard "$new"
+changed=$(git diff --name-only "${old:-$(git hash-object -t tree /dev/null)}" "$new" 2>/dev/null || echo all)
+echo "updating ${old:0:7} -> ${new:0:7}"
+
+if [ "$changed" = all ] || echo "$changed" | grep -qE '^(server\.js|package\.json|lib/|public/)'; then
+  rm -rf /opt/uptime-monitor/lib /opt/uptime-monitor/public
+  cp -r server.js package.json lib public /opt/uptime-monitor/
+  systemctl try-restart uptime-monitor
+  echo "app updated to $(node -p "require('/opt/uptime-monitor/package.json').version")"
+fi
+if [ "$changed" = all ] || echo "$changed" | grep -qE '^deploy/(uptime-ha/|uptime-monitor\.service)'; then
+  cp deploy/uptime-monitor.service /etc/systemd/system/uptime-monitor.service
+  install -m 755 deploy/uptime-ha/um-update /usr/local/sbin/um-update
+  for u in um-ha.service um-update.service um-update.timer; do cp "deploy/uptime-ha/$u" "/etc/systemd/system/$u"; done
+  systemctl daemon-reload
+  if ! cmp -s deploy/uptime-ha/um-ha /usr/local/sbin/um-ha; then
+    if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" deploy/uptime-ha/um-ha; then
+      install -m 755 deploy/uptime-ha/um-ha /usr/local/sbin/um-ha
+      systemctl restart um-ha
+      echo "um-ha updated and restarted"
+    else
+      echo "new um-ha does not parse: keeping the old one" >&2
+    fi
+  fi
+fi
+echo "$new" > /var/lib/um-ha/installed-rev

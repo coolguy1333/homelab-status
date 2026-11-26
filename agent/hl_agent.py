@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -497,6 +497,19 @@ def collect_slow(s, node, host, containers, force=False):
 
 IGNORE_PORTS = {25, 111, 631, 5355}  # mail relay, rpcbind, cups, llmnr: noise, not services
 
+# Status-site containers (UptimeMonitor / UptimeMonitor2) run um-ha: the app listens only on whichever one is
+# primary, so its port moves on every failover. It is left out of discovery and update health checks (the
+# public monitor for the site and um-ha's own :8099 cover it); otherwise a failover would look like a dead
+# service, and a failover during a nightly update would look like a broken update and trigger a rollback.
+UMHA_PROBE = "if test -f /etc/um-ha.conf; then echo UMHA-APP-PORT $(sed -n 's/^APP_PORT=//p' /etc/um-ha.conf); fi"
+
+
+def umha_app_port(out):
+    m = re.search(r"^UMHA-APP-PORT ?(\d*)\s*$", out, re.M)
+    if not m:
+        return None
+    return int(m.group(1) or 3000)
+
 
 def pbs_api(path, timeout=10):
     """GET from the Proxmox Backup Server API with the read-only token in config.json ("pbs").
@@ -617,11 +630,13 @@ def discover_services(containers):
         if c["status"] != "running":
             continue
         rc, out = cx(c["vmid"], "hostname -I 2>/dev/null; echo ---; ss -ltnpH 2>/dev/null; "
-                                "if test -f /var/lib/webmanager/webmanager.sqlite3; then echo WEBMANAGER-FOUND; fi", 30)
+                                "if test -f /var/lib/webmanager/webmanager.sqlite3; then echo WEBMANAGER-FOUND; fi; "
+                                + UMHA_PROBE, 30)
         if rc != 0 or "---" not in out:
             continue
         if "WEBMANAGER-FOUND" in out:
             c["_webmanager"] = True
+        standby_port = umha_app_port(out)
         ips_part, _, ss_part = out.partition("---")
         ip = next((x for x in ips_part.split() if re.match(r"^\d+\.\d+\.\d+\.\d+$", x) and not x.startswith("127.")), None)
         if not ip:
@@ -638,7 +653,7 @@ def discover_services(containers):
             if not port.isdigit() or addr.startswith("127.") or addr in ("[::1]", "::1") or "%lo" in addr:
                 continue
             port = int(port)
-            if port in IGNORE_PORTS or port in seen:
+            if port in IGNORE_PORTS or port in seen or port == standby_port:
                 continue
             seen.add(port)
             m = re.search(r'users:\(\("([^"]+)"', line)
@@ -1529,8 +1544,10 @@ def health(vmid):
     # Only real services count: a timer/socket/path unit can show "failed" for a moment while its package is
     # upgraded (e.g. wtmpdb-rotate.timer) without anything actually being broken.
     rc, out = cx(vmid, "systemctl list-units --failed --type=service --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}';"
-                       " echo ---; ss -ltnH 2>/dev/null | awk '{print $4}'", 60)
-    failed_part, _, ports_part = out.partition("---")
+                       " echo ---; ss -ltnH 2>/dev/null | awk '{print $4}'; echo ---; " + UMHA_PROBE, 60)
+    failed_part, _, rest = out.partition("---")
+    ports_part, _, umha_part = rest.partition("---")
+    standby_port = umha_app_port(umha_part)
     ports = set()
     for a in ports_part.split():
         addr, _, port = a.rpartition(":")
@@ -1540,7 +1557,7 @@ def health(vmid):
         # in the ephemeral range get a new random number every restart (e.g. containerd's): neither counts as lost.
         if addr.startswith("127.") or addr in ("[::1]", "::1") or "%lo" in addr:
             continue
-        if 32768 <= int(port) <= 60999:
+        if 32768 <= int(port) <= 60999 or int(port) == standby_port:
             continue
         ports.add(port)
     return {"running": True, "failed": set(failed_part.split()), "ports": ports}

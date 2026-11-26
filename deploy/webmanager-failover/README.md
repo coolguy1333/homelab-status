@@ -1,7 +1,7 @@
 # WebManager automatic failover
 
-Keeps the WebManager sites (and this status site, app 51) up when the
-WebManager primary goes down, and keeps the Proxmox web UI reachable when one
+Keeps the WebManager sites up when the WebManager primary goes down
+(the status site moved to its own pair of containers: see `../uptime-ha/`), and keeps the Proxmox web UI reachable when one
 of the two hosts is down.
 
 | Piece | Where | What it does |

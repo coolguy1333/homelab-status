@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.12.0
+
+The status site moved off WebManager onto its own pair of containers with automatic failover (agent 1.13.0).
+
+- CT 214 **UptimeMonitor** (GOD, preferred primary) and CT 215 **UptimeMonitor2** (HELP), Debian 13, run the app
+  under systemd. `um-ha` (`deploy/uptime-ha/`) runs the app only on the primary, copies its data folder to the replica
+  every 5 seconds, promotes the replica after 60 seconds of primary failure (only if the gateway still answers), and
+  hands the role back to GOD 2 minutes after GOD is healthy again (a few seconds of downtime). A returning stale
+  primary saves a backup of its data and rejoins as the replica. `um-update.timer` deploys `main` from GitHub every
+  5 minutes, replacing WebManager's deploy on push.
+- Connector HAProxy: new `uptime` backend on `127.0.0.1:8082`, which follows `:8099/active`. `upt.webmgr.dev` arriving
+  on `:8081` (through the `*.webmgr.dev` tunnel wildcard) is forwarded there too.
+- Agent 1.13.0 knows about um-ha containers. The app port, which moves with every failover, is left out of service
+  discovery and the nightly update health check, so a failover is not reported as a dead service and doesn't roll
+  back an update. The agent's CLAUDE.md explains the HA pairs (status site and WebManager), so it doesn't start the
+  replica's app.
+
 ## 2.11.0
 
 Internal services and core servers are checked every minute, like the public sites (agent 1.12.0).

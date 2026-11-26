@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""um-ha: active/passive high availability for the Homelab Status site (Uptime Monitor).
+
+Runs on both status containers (UptimeMonitor on GOD, UptimeMonitor2 on HELP). Exactly one of them is
+the primary and runs the app (uptime-monitor.service). The other is a replica: its app is stopped and it
+copies the primary's data folder every few seconds.
+
+  failover  The replica promotes itself when the primary has not been a healthy primary for FAIL_AFTER
+            seconds (time-based, at least MIN_FAILS failed checks in a row) while the gateway still
+            answers a ping (so a replica that lost its own network doesn't promote itself).
+  rejoin    A primary that sees the peer is primary with a newer epoch (a stale primary coming back after
+            an outage) stops its app, saves a backup of its data, and becomes the replica.
+  failback  The PREFERRED server, after FAILBACK_AFTER seconds as a healthy, synced replica, asks the peer
+            for a handover: the peer stops its app (which flushes everything to disk), answers with a final
+            copy of its data and shows "draining". The preferred server loads that copy, starts its app
+            and promotes itself; the peer sees the newer epoch and becomes the replica. If the handover
+            doesn't finish within HANDOVER_TIMEOUT, the peer starts its app again and keeps serving.
+
+HTTP on HA_PORT (default 8099):
+  GET  /role      JSON with role, epoch, app health, last sync (public: no secrets)
+  GET  /active    200 only on the primary whose app is healthy (HAProxy on the connectors tracks this)
+  GET  /snapshot  tar.gz of the data folder (peer IP + token only; primary or draining only)
+  POST /handover  stop the app and answer with the final data (peer IP + token only; primary only)
+
+Config: /etc/um-ha.conf. State: /var/lib/um-ha/state.json. Logs: journalctl -u um-ha.
+"""
+import hmac
+import http.server
+import io
+import json
+import os
+import shutil
+import socketserver
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+CONF_FILE = os.environ.get("UM_HA_CONF", "/etc/um-ha.conf")
+STATE_DIR = "/var/lib/um-ha"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
+
+DEFAULTS = {
+    "SELF_IP": "", "PEER_IP": "", "TOKEN": "", "PREFERRED": "0",
+    "HA_PORT": "8099", "APP_PORT": "3000", "APP_SERVICE": "uptime-monitor",
+    "DATA_DIR": "/var/lib/uptime-monitor", "APP_USER": "uptime",
+    "GATEWAY": "192.168.10.1",
+    "FAIL_AFTER": "60", "MIN_FAILS": "5", "FAILBACK_AFTER": "120", "HANDOVER_TIMEOUT": "60",
+    "FAILBACK_BACKOFF": "1800", "SYNC_EVERY": "5", "CHECK_EVERY": "2", "KEEP_BACKUPS": "5",
+}
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    with open(CONF_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            c[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("SELF_IP", "PEER_IP", "TOKEN"):
+        if not c[k]:
+            sys.exit(f"um-ha: {k} is not set in {CONF_FILE}")
+    return c
+
+
+C = load_conf()
+PREFERRED = C["PREFERRED"] in ("1", "true", "yes")
+HA_PORT, APP_PORT = int(C["HA_PORT"]), int(C["APP_PORT"])
+FAIL_AFTER, MIN_FAILS = float(C["FAIL_AFTER"]), int(C["MIN_FAILS"])
+FAILBACK_AFTER, HANDOVER_TIMEOUT = float(C["FAILBACK_AFTER"]), float(C["HANDOVER_TIMEOUT"])
+FAILBACK_BACKOFF, SYNC_EVERY, CHECK_EVERY = float(C["FAILBACK_BACKOFF"]), float(C["SYNC_EVERY"]), float(C["CHECK_EVERY"])
+DATA_DIR = C["DATA_DIR"]
+PEER = f"http://{C['PEER_IP']}:{HA_PORT}"
+
+lock = threading.RLock()       # guards S and role changes (the HTTP thread and the main loop both change roles)
+S = {"role": "replica", "epoch": 0}
+RT = {"app_ok": False, "synced_at": 0, "replica_ok_since": 0, "peer_bad_since": 0, "peer_fails": 0,
+      "failback_after": 0, "failback_promoted_at": 0, "draining_since": 0, "peer": None}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+# ------------------------------------------------------------------ state
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        if d.get("role") in ("primary", "replica", "draining"):
+            S["role"] = d["role"]
+        S["epoch"] = int(d.get("epoch") or 0)
+    except (OSError, ValueError):
+        pass
+    if S["role"] == "draining":   # died mid-handover: decide again from scratch, as a primary
+        S["role"] = "primary"
+
+
+def save_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(S, f)
+    os.replace(tmp, STATE_FILE)
+
+
+def set_role(role, epoch=None, why=""):
+    with lock:
+        old = (S["role"], S["epoch"])
+        S["role"] = role
+        if epoch is not None:
+            S["epoch"] = epoch
+        save_state()
+    log(f"role {old[0]}({old[1]}) -> {role}({S['epoch']}){': ' + why if why else ''}")
+
+
+# ------------------------------------------------------------------ app
+
+def systemctl(*args, timeout=60):
+    return subprocess.run(["systemctl", *args, C["APP_SERVICE"]], capture_output=True, text=True, timeout=timeout)
+
+
+def app_active():
+    return systemctl("is-active", "--quiet").returncode == 0
+
+
+def app_healthy():
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{APP_PORT}/api/health", timeout=3) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def start_app():
+    r = systemctl("start")
+    if r.returncode:
+        log(f"starting the app failed: {r.stderr.strip()}")
+
+
+def stop_app():
+    r = systemctl("stop", timeout=90)   # the app saves its data on SIGTERM
+    if r.returncode:
+        log(f"stopping the app failed: {r.stderr.strip()}")
+    RT["app_ok"] = False
+
+
+def wait_healthy(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if app_healthy():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ------------------------------------------------------------------ data
+
+def data_files():
+    try:
+        names = sorted(os.listdir(DATA_DIR))
+    except OSError:
+        return []
+    return [n for n in names if os.path.isfile(os.path.join(DATA_DIR, n))
+            and not n.endswith(".tmp") and ".corrupt-" not in n and not n.startswith(".")]
+
+
+def make_snapshot():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
+        for n in data_files():
+            try:
+                with open(os.path.join(DATA_DIR, n), "rb") as f:   # the app replaces files atomically
+                    data = f.read()
+            except OSError:
+                continue
+            info = tarfile.TarInfo(n)
+            info.size, info.mtime, info.mode = len(data), int(time.time()), 0o640
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def apply_snapshot(blob):
+    """Replace the data folder's files with the snapshot's (the app must be stopped)."""
+    import pwd
+    pw = pwd.getpwnam(C["APP_USER"])
+    names = set()
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            n = m.name
+            if not m.isfile() or "/" in n or n.startswith(".") or n in ("", "..") or len(n) > 100:
+                continue
+            data = tar.extractfile(m).read()
+            dst = os.path.join(DATA_DIR, n)
+            tmp = dst + ".ha-tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chown(tmp, pw.pw_uid, pw.pw_gid)
+            os.chmod(tmp, 0o600 if n == "sessions.json" else 0o640)
+            os.replace(tmp, dst)
+            names.add(n)
+    if not names:
+        raise ValueError("empty snapshot")
+    for n in data_files():
+        if n not in names:
+            os.unlink(os.path.join(DATA_DIR, n))
+    return len(names)
+
+
+def backup_data(tag):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    path = os.path.join(BACKUP_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.tar.gz")
+    with open(path, "wb") as f:
+        f.write(make_snapshot())
+    keep = int(C["KEEP_BACKUPS"])
+    old = sorted(os.listdir(BACKUP_DIR))[:-keep] if keep > 0 else []
+    for n in old:
+        os.unlink(os.path.join(BACKUP_DIR, n))
+    log(f"saved a copy of this server's data to {path}")
+
+
+# ------------------------------------------------------------------ peer
+
+def peer_request(path, method="GET", timeout=3, auth=False):
+    req = urllib.request.Request(PEER + path, method=method, data=b"" if method == "POST" else None)
+    if auth:
+        req.add_header("Authorization", "Bearer " + C["TOKEN"])
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), r.headers
+
+
+def peer_role():
+    """The peer's /role as a dict, or None if it doesn't answer."""
+    try:
+        body, _ = peer_request("/role")
+        d = json.loads(body)
+        return d if isinstance(d, dict) else None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def gateway_up():
+    return subprocess.run(["ping", "-c", "1", "-W", "1", C["GATEWAY"]], capture_output=True).returncode == 0
+
+
+def outranks(p):
+    """Does primary peer `p` win over this server as primary? Newer epoch wins; a tie goes to the preferred one."""
+    pe = int(p.get("epoch") or 0)
+    if pe != S["epoch"]:
+        return pe > S["epoch"]
+    return bool(p.get("preferred")) and not PREFERRED
+
+
+def sync_from_peer():
+    blob, _ = peer_request("/snapshot", timeout=20, auth=True)
+    n = apply_snapshot(blob)
+    RT["synced_at"] = time.time()
+    return n
+
+
+# ------------------------------------------------------------------ HTTP
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "um-ha"
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body=b"", ctype="text/plain"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def peer_authorized(self):
+        if self.client_address[0] != C["PEER_IP"]:
+            return False
+        got = self.headers.get("Authorization", "")
+        return hmac.compare_digest(got.encode(), ("Bearer " + C["TOKEN"]).encode())
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/role":
+            # No lock: /role must answer even while the main loop is busy (a failback takes seconds).
+            d = {"role": S["role"], "epoch": S["epoch"], "preferred": PREFERRED, "app": RT["app_ok"],
+                 "syncedAt": int(RT["synced_at"] * 1000) or None, "self": C["SELF_IP"], "time": now_ms()}
+            return self.reply(200, json.dumps(d), "application/json")
+        if p == "/active":
+            ok = S["role"] == "primary" and RT["app_ok"]
+            return self.reply(200 if ok else 503, "active\n" if ok else f"{S['role']}\n")
+        if p == "/snapshot":
+            if not self.peer_authorized():
+                return self.reply(403, "forbidden\n")
+            if S["role"] not in ("primary", "draining"):
+                return self.reply(409, f"not primary ({S['role']})\n")
+            return self.reply(200, make_snapshot(), "application/gzip")
+        self.reply(404, "not found\n")
+
+    def do_POST(self):
+        p = self.path.split("?")[0]
+        if p != "/handover":
+            return self.reply(404, "not found\n")
+        if not self.peer_authorized():
+            return self.reply(403, "forbidden\n")
+        with lock:   # waits for the main loop's current step, so it can't restart the app behind our back
+            if S["role"] != "primary":
+                return self.reply(409, f"not primary ({S['role']})\n")
+            S["role"] = "draining"
+            save_state()
+            RT["draining_since"] = time.time()
+            log("handover requested by the preferred peer: stopping the app and sending it the final data")
+            stop_app()
+        self.reply(200, make_snapshot(), "application/gzip")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # Health checkers (HAProxy) often hang up before the reply is sent: not worth a traceback.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+# ------------------------------------------------------------------ main loop
+
+def promote(why, failback=False):
+    RT["failback_promoted_at"] = time.time() if failback else 0
+    set_role("primary", now_ms(), why)
+    RT["synced_at"] = 0   # only meaningful on a replica
+    start_app()
+    RT["app_ok"] = wait_healthy(30)
+    log("app is up" if RT["app_ok"] else "app did not answer /api/health within 30 s (still starting?)")
+
+
+def demote(why):
+    if RT.get("failback_promoted_at") and time.time() - RT["failback_promoted_at"] < 600:
+        # We failed back and lost the primary role again soon after: don't keep bouncing.
+        RT["failback_after"] = time.time() + FAILBACK_BACKOFF
+        log(f"lost the primary role soon after a failback: next failback in {FAILBACK_BACKOFF / 60:.0f} min at the earliest")
+    RT["failback_promoted_at"] = 0
+    stop_app()
+    try:
+        backup_data("before-rejoin")
+    except OSError as e:
+        log(f"backup before rejoining failed: {e}")
+    set_role("replica", why=why)
+    RT["synced_at"] = 0
+    RT["replica_ok_since"] = 0
+    RT["peer_bad_since"] = 0
+    RT["peer_fails"] = 0
+
+
+def try_failback(p):
+    log(f"failback: healthy replica for {FAILBACK_AFTER:.0f} s, asking the peer to hand over")
+    try:
+        blob, _ = peer_request("/handover", method="POST", timeout=60, auth=True)
+        n = apply_snapshot(blob)
+    except (urllib.error.URLError, OSError, ValueError, tarfile.TarError) as e:
+        RT["failback_after"] = time.time() + FAILBACK_BACKOFF
+        log(f"failback failed ({e}); the peer resumes on its own; next try in {FAILBACK_BACKOFF / 60:.0f} min")
+        return
+    log(f"failback: loaded the peer's final data ({n} files)")
+    promote("failback to the preferred server", failback=True)
+
+
+def step_primary():
+    if not app_active():
+        log("app not running on the primary: starting it")
+        start_app()
+    RT["app_ok"] = app_healthy()
+    p = peer_role()
+    RT["peer"] = p
+    if p and p.get("role") == "primary" and outranks(p):
+        demote(f"the peer is primary with a newer epoch ({p.get('epoch')} > {S['epoch']})")
+
+
+def step_draining():
+    p = peer_role()
+    RT["peer"] = p
+    if p and p.get("role") == "primary" and outranks(p):
+        set_role("replica", why="handover finished: the peer is primary")
+        RT["synced_at"] = time.time()   # it promoted from our final data
+        RT["replica_ok_since"] = time.time()
+        RT["peer_bad_since"], RT["peer_fails"] = 0, 0
+        return
+    if time.time() - RT["draining_since"] > HANDOVER_TIMEOUT:
+        log(f"handover not finished within {HANDOVER_TIMEOUT:.0f} s: serving again")
+        set_role("primary", why="handover timed out")
+        start_app()
+
+
+def step_replica():
+    t = time.time()
+    if app_active():
+        log("app running on a replica: stopping it")
+        stop_app()
+    p = peer_role()
+    RT["peer"] = p
+    role = p and p.get("role")
+    if role == "primary" and p.get("app"):
+        healthy = True
+    elif role == "replica" and not PREFERRED:
+        healthy = True   # nobody is primary: the preferred server promotes itself
+    else:
+        # unreachable, primary with a broken app, stuck draining (it resumes by itself after
+        # HANDOVER_TIMEOUT < FAIL_AFTER), or both replicas and this is the preferred server
+        healthy = False
+
+    if healthy:
+        if RT["peer_bad_since"]:
+            log(f"the peer is a healthy primary again (after {RT['peer_fails']} failed checks)")
+        RT["peer_bad_since"], RT["peer_fails"] = 0, 0
+    else:
+        if not RT["peer_bad_since"]:
+            RT["peer_bad_since"] = t
+            log(f"peer check failed: {'no answer' if p is None else json.dumps(p)}")
+        RT["peer_fails"] += 1
+
+    # Keep copying while the peer is primary even if its app is unhealthy: whatever it saved before
+    # crashing or hanging is the freshest data there is.
+    if role == "primary" and t - RT["synced_at"] >= SYNC_EVERY:
+        try:
+            sync_from_peer()
+            if not p.get("app"):
+                RT["replica_ok_since"] = 0
+            elif not RT["replica_ok_since"]:
+                RT["replica_ok_since"] = t
+        except (urllib.error.URLError, OSError, ValueError, tarfile.TarError) as e:
+            log(f"sync from the peer failed: {e}")
+            RT["replica_ok_since"] = 0
+    elif role != "primary":
+        RT["replica_ok_since"] = 0
+
+    if RT["peer_bad_since"] and t - RT["peer_bad_since"] >= FAIL_AFTER and RT["peer_fails"] >= MIN_FAILS:
+        if not gateway_up():
+            if t - RT.get("gw_logged", 0) >= 60:
+                RT["gw_logged"] = t
+                log(f"the peer is down, but so is the gateway {C['GATEWAY']}: not promoting (this server may be cut off)")
+            return
+        age = f"{t - RT['synced_at']:.0f} s old" if RT["synced_at"] else "never synced since start"
+        promote(f"the peer has not been a healthy primary for {t - RT['peer_bad_since']:.0f} s "
+                f"({RT['peer_fails']} checks); data is {age}")
+        return
+
+    if (PREFERRED and role == "primary" and p.get("app") and RT["replica_ok_since"]
+            and t - RT["replica_ok_since"] >= FAILBACK_AFTER and t - RT["synced_at"] < 15
+            and t >= RT["failback_after"]):
+        try_failback(p)
+
+
+def startup():
+    """A server that was primary doesn't start its app until it knows the peer hasn't taken over meanwhile."""
+    load_state()
+    log(f"um-ha starting: {S['role']} epoch {S['epoch']}, preferred={PREFERRED}, peer {C['PEER_IP']}")
+    if S["role"] != "primary":
+        if app_active():
+            stop_app()
+        return
+    p = None
+    for _ in range(8):
+        p = peer_role()
+        if p:
+            break
+        time.sleep(2)
+    if p and p.get("role") in ("primary", "draining") and outranks(p):
+        demote(f"the peer took over while this server was away (epoch {p.get('epoch')} > {S['epoch']})")
+    elif p and p.get("role") == "primary" and p.get("app") and not outranks(p):
+        log("the peer is also primary but older: it will step down")
+        start_app()
+    else:
+        start_app()
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    srv = Server(("0.0.0.0", HA_PORT), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    startup()
+    while True:
+        t0 = time.time()
+        try:
+            with lock:
+                role = S["role"]
+                if role == "primary":
+                    step_primary()
+                elif role == "draining":
+                    step_draining()
+                else:
+                    step_replica()
+        except Exception as e:   # never die
+            log(f"check failed: {e!r}")
+        time.sleep(max(0.2, CHECK_EVERY - (time.time() - t0)))
+
+
+if __name__ == "__main__":
+    main()

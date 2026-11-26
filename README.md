@@ -21,6 +21,12 @@ scripts; Claude is only used for chat questions and unclear update reviews. Each
 something broke. Security updates always go in. Risky updates and anything touching the host wait for **Approve**.
 Infrastructure pages require Google sign-in.
 
+## Where it runs
+
+Production runs on two dedicated containers with automatic failover: CT 214 UptimeMonitor (GOD) and
+CT 215 UptimeMonitor2 (HELP). See [deploy/uptime-ha/README.md](deploy/uptime-ha/README.md). They deploy
+`main` from GitHub automatically within 5 minutes.
+
 ## Deploy on WebManager (app)
 
 Add this repository as a source, choose **Deploy as an app**, then set the variables:
