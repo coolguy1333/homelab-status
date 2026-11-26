@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.13.1
+
+Fixes from a full bug and UI check.
+
+- Backups: a run that finished with `WARNINGS: n` (everything was backed up, e.g. a VM without an efidisk) now
+  shows as an amber **warning**, not a red **failed** run. It no longer counts toward "failed runs" or the
+  red Overview alert.
+- um-update: an install that was cut off (reboot, killed process) no longer leaves the Servers page showing
+  "updating" forever. The next check marks it as interrupted and offers Install again. If copying the new files
+  fails partway (e.g. disk full), the previous version is put back instead of leaving half-new code.
+- um-ha: temporary files while copying data end in `.tmp`, so a leftover is never copied or backed up. um-ha and
+  um-update share the backup folder, so both keep 8 copies (rejoins used to prune update backups down to 5).
+- Servers page: it keeps showing the last good data for a minute while the app or um-ha restarts (during an
+  update), instead of flashing "not running on the um-ha pair". On phones "60 s" no longer wraps.
+
 ## 2.13.0
 
 **Servers** page: see and update both status servers from the one serving the dashboard, as in WebManager.

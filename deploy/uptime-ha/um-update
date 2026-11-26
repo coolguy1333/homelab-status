@@ -150,6 +150,12 @@ def check():
     latest = git("rev-parse", "origin/main")
     cur = installed()
     st = read_status()
+    if st.get("state") == "installing":
+        # check() runs under the update lock, so no install is running: the last one was cut off (reboot, killed).
+        tgt = st.get("target_commit") or ""
+        st = write_status(state="error", failed_commit=tgt or None,
+                          message=f"The update to {tgt[:12] or 'a new version'} was interrupted before it finished.",
+                          detail="Click Install to try it again. The version shown is the one that runs now.")
     if latest == cur:
         return write_status(state="current", available_commit=latest, checked_at=now_ms(),
                             message="Up to date.", detail=None)
@@ -262,19 +268,30 @@ def install(commit, manual):
     shutil.rmtree(PREV, ignore_errors=True)
     if os.path.isdir(APP):
         shutil.copytree(APP, PREV)
-    copy_app(SRC, APP)
     was_running = app_active()
+
+    def put_back(why):
+        if os.path.isdir(PREV):
+            shutil.rmtree(APP, ignore_errors=True)
+            shutil.copytree(PREV, APP)
+        if was_running:
+            run(["systemctl", "restart", "uptime-monitor"], timeout=90)
+        if old:
+            git("reset", "-q", "--hard", old)
+        raise RuntimeError(f"{why}, so the previous version was put back.")
+
+    try:
+        copy_app(SRC, APP)
+    except OSError as e:   # e.g. disk full halfway: never leave half-new code behind
+        put_back(f"Copying the new version failed ({e})")
     if was_running:
         run(["systemctl", "restart", "uptime-monitor"], timeout=90)
         if not healthy(app_port(), 40):
             journal = run(["journalctl", "-u", "uptime-monitor", "-n", "30", "--no-pager", "-o", "cat"]).stdout
-            if os.path.isdir(PREV):
-                shutil.rmtree(APP)
-                shutil.copytree(PREV, APP)
-            run(["systemctl", "restart", "uptime-monitor"], timeout=90)
-            if old:
-                git("reset", "-q", "--hard", old)
-            raise RuntimeError(f"The app did not come back after the update, so the previous version was put back.\n{journal[-1500:]}")
+            try:
+                put_back("The app did not come back after the update")
+            except RuntimeError as e:
+                raise RuntimeError(f"{e}\n{journal[-1500:]}")
 
     with open(REV, "w") as f:
         f.write(commit + "\n")
