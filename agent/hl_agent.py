@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -185,13 +185,13 @@ def add_pending(s, item):
 
 # ------------------------------------------------------------------ remote execution
 
-def ssh(cmd, timeout=120, stdout_only=False):
-    """Run a shell command on the Proxmox host as root. Returns (rc, combined output), or just stdout
-    with stdout_only (for machine-readable output, so warnings on stderr can't corrupt it)."""
+def ssh(cmd, timeout=120, stdout_only=False, host=None):
+    """Run a shell command on the Proxmox host (or `host`, e.g. the backup server) as root. Returns (rc, combined
+    output), or just stdout with stdout_only (for machine-readable output, so warnings on stderr can't corrupt it)."""
     sock = os.path.join(HOME, ".ssh", "cm-%r@%h")
     args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
             "-o", "ControlMaster=auto", "-o", f"ControlPath={sock}", "-o", "ControlPersist=120",
-            f"root@{CFG['host']}", cmd]
+            f"root@{host or CFG['host']}", cmd]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         if stdout_only:
@@ -842,6 +842,7 @@ def build_report(s, host, containers):
         "core": s.get("coreChecks") if checks_fresh(s) else check_core(),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
+        "pbsHost": s.get("pbsHost") if pbs_owner() else None,
         "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300,
                      "securityOnly": bool((s.get("policy") or {}).get("securityOnly"))},
         "policy": s.get("policy"),
@@ -884,7 +885,7 @@ def sync_now():
             log(f"sync to {url} failed: {e}")
 
 
-CHECK_EVERY = 60  # seconds between service/core checks (like the dashboard's site monitors); config: check_every
+CHECK_EVERY = 20  # seconds between service/core checks (like the dashboard's site monitors); config: check_every
 
 
 def fast_checks():
@@ -1002,6 +1003,11 @@ def cmd_report(send=True):
             host = dict(host, unreachable=True)
         else:
             autofix(s, host, containers)
+        if pbs_owner() and now_ms() - (s.get("pbsHost") or {}).get("t", 0) > 30 * 60e3:
+            try:
+                pbs_host_status(s)
+            except Exception as e:  # the backup server being down is reported elsewhere (core servers)
+                log(f"backup server status: {e}")
         report = build_report(s, host, containers)
 
     if not send:
@@ -1956,6 +1962,70 @@ def check_host_updates():
     return len(pkgs)
 
 
+# ------------------------------------------------------------------ backup server (PBS) host updates
+# One agent owns the backup server's own updates (config "pbs_updates": true, on connector1), so it gets the same
+# treatment as a Proxmox host: checked nightly and on demand, updates and reboots wait for approval, and the
+# result shows on the dashboard's Updates page. The other agent leaves it alone, so nothing happens twice.
+
+def pbs_owner():
+    return bool(CFG.get("pbs_updates")) and bool((CFG.get("pbs") or {}).get("server"))
+
+
+def pbs_ssh(cmd, timeout=120):
+    return ssh(cmd, timeout, host=(CFG.get("pbs") or {})["server"])
+
+
+def pbs_host_status(s):
+    """Kernel, PBS version, uptime and "reboot needed" of the backup server (kept in state as pbsHost)."""
+    rc, out = pbs_ssh("hostname; uname -r; ls /lib/modules | sort -V | tail -1; cut -d' ' -f1 /proc/uptime; "
+                      "proxmox-backup-manager versions 2>/dev/null | head -1; "
+                      "test -f /var/run/reboot-required && echo REBOOT; true", 60)
+    if rc != 0:
+        raise RuntimeError(f"cannot reach the backup server: {out[-200:]}")
+    lines = out.splitlines()
+    name, running, newest = (lines + ["", "", ""])[:3]
+    try:
+        uptime = int(float(lines[3]))
+    except (IndexError, ValueError):
+        uptime = None
+    # "proxmox-backup-server 4.2.14-1 running version: 4.2.14" -> "4.2.14-1"
+    version = next((l.split()[1] if len(l.split()) > 1 else l for l in lines[4:5] if l and l != "REBOOT"), None)
+    reboot = "REBOOT" in lines or (running and newest and running != newest)
+    ph = s.setdefault("pbsHost", {})
+    ph.update({"name": name.strip() or "PBS", "ip": CFG["pbs"]["server"], "kernel": running.strip(),
+               "version": version, "uptime": uptime, "rebootRequired": bool(reboot), "t": now_ms()})
+    return ph
+
+
+def check_pbs_updates():
+    rc, out = pbs_ssh("apt-get update -q >/dev/null 2>&1; apt list --upgradable 2>/dev/null", 900)
+    if rc != 0 and "Listing" not in out:
+        raise RuntimeError(f"apt on the backup server failed: {out[-200:]}")
+    pkgs = parse_upgradable(out)
+    with state() as s:
+        ph = pbs_host_status(s)
+        name = ph.get("name") or "the backup server"
+        ph["updates"] = {"count": len(pkgs), "security": sum(p["security"] for p in pkgs), "checkedAt": now_ms()}
+        for k in [k for k, v in s["pending"].items() if v.get("kind") == "pbs-update" and v.get("status") != "approved"]:
+            s["pending"].pop(k)
+        if pkgs:
+            pid = "pbs-update-" + hashlib.sha1(json.dumps([(p['name'], p['new']) for p in pkgs]).encode()).hexdigest()[:8]
+            add_pending(s, {"id": pid, "kind": "pbs-update",
+                            "packages": [{k: p[k] for k in ("name", "old", "new", "security")} for p in pkgs[:600]],
+                            "summary": f"Update backup server {name} ({len(pkgs)} package(s), {sum(p['security'] for p in pkgs)} security)",
+                            "details": "\n".join(f"{p['name']} {p['old']} -> {p['new']}" for p in pkgs[:300]) +
+                                       "\n\nApproving runs `apt full-upgrade` on the backup server (keeping config files). "
+                                       "Backups keep their data; a job running at that moment may fail and run again on "
+                                       "schedule. If a new kernel arrives, a separate reboot approval appears."})
+        if ph.get("rebootRequired") and not any(v.get("kind") == "pbs-reboot" for v in s["pending"].values()):
+            add_pending(s, {"id": "pbs-reboot-" + time.strftime("%Y%m%d"), "kind": "pbs-reboot",
+                            "summary": f"Reboot backup server {name} (new kernel/updates need it)",
+                            "details": "The backup server is unavailable for a few minutes. A backup or verify job "
+                                       "running at that moment fails and runs again on its next schedule. "
+                                       "The Proxmox hosts and containers are not affected."})
+    return len(pkgs)
+
+
 def cmd_update(mode=None):
     """Nightly run. mode: None = follow the dashboard's policy, "security" = security updates only."""
     if mode is None:
@@ -2001,6 +2071,14 @@ def cmd_update(mode=None):
             except Exception as e:
                 results.append(f"host: update check failed: {e}")
             plog(results[-1])
+            if pbs_owner():
+                progress("host", "Checking the backup server for updates")
+                try:
+                    n = check_pbs_updates()
+                    results.append(f"backup server: {n} update(s) waiting for approval" if n else "backup server: up to date")
+                except Exception as e:
+                    results.append(f"backup server: update check failed: {e}")
+                plog(results[-1])
         finally:
             progress_end(summary="; ".join(r for r in results if re.search(r"ROLLED BACK|BROKEN|error|failed|held", r))[:400]
                          or f"{len(targets)} container(s) checked")
@@ -2046,6 +2124,27 @@ def cmd_action(pid):
             cmd_report()
             ssh("systemd-run --on-active=60 --unit=hl-host-reboot /bin/systemctl reboot")
             return
+        elif kind == "pbs-update":
+            sel = item.get("selected")
+            if sel:
+                event("info", f"Updating {len(sel)} selected package(s) on the backup server (approved)")
+                names = " ".join(shlex.quote(n) for n in sel)
+                rc, out = pbs_ssh(f"apt-get update -q >/dev/null 2>&1; {APT_ENV} apt-get {APT_OPTS} install --only-upgrade {names} 2>&1 | tail -40", 3600)
+            else:
+                event("info", "Updating the backup server (approved)")
+                rc, out = pbs_ssh(f"apt-get update -q >/dev/null 2>&1; {APT_ENV} apt-get {APT_OPTS} dist-upgrade 2>&1 | tail -40", 3600)
+            event("info" if "E: " not in out and rc == 0 else "error",
+                  f"Backup server update finished: {out.strip().splitlines()[-1][:300] if out.strip() else 'no output'}")
+            with state() as s:
+                s["pending"].pop(pid, None)
+            check_pbs_updates()   # refreshes the count and the "reboot needed" flag
+        elif kind == "pbs-reboot":
+            event("warn", "Rebooting the backup server in 60 s (approved)")
+            with state() as s:
+                s["pending"].pop(pid, None)
+            pbs_ssh("systemd-run --on-active=60 --unit=hl-pbs-reboot /bin/systemctl reboot")
+            with state() as s:
+                (s.get("pbsHost") or {}).update(rebootRequired=False, rebootingAt=now_ms())
         elif kind == "risky-update":
             vmid = int(item["vmid"])
             rc, out = ssh(f"pct config {vmid} | sed -n 's/^hostname: //p'")
@@ -2148,6 +2247,11 @@ def cmd_ctaction(tid):
         elif typ == "check-updates":
             n = check_host_updates()
             out = f"{n} host package update(s) available." if n else "The host is up to date."
+        elif typ == "check-pbs-updates":
+            if not pbs_owner():
+                raise RuntimeError('this agent does not manage the backup server\'s updates ("pbs_updates" is off)')
+            n = check_pbs_updates()
+            out = f"{n} package update(s) available on the backup server." if n else "The backup server is up to date."
         else:
             raise RuntimeError(f"unknown action {typ}")
     except Exception as e:

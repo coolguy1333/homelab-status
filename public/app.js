@@ -525,7 +525,7 @@ function openMonitorDialog(m) {
   form.reset();
   state.editingId = m ? m.id : null;
   $('#monitorDialogTitle').textContent = m ? `Edit ${m.name}` : 'Add monitor';
-  const c = m ? m.config : { interval: 60, timeout: 10, retries: 1, method: 'GET', acceptedStatus: '200-399', followRedirects: true, type: 'http' };
+  const c = m ? m.config : { interval: 20, timeout: 10, retries: 1, method: 'GET', acceptedStatus: '200-399', followRedirects: true, type: 'http' };
   for (const el of form.elements) {
     if (!el.name || !(el.name in c)) continue;
     if (el.type === 'checkbox') el.checked = Boolean(c[el.name]);

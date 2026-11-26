@@ -138,6 +138,7 @@ const Dash = (() => {
       if (waiting.length) push('warn', `${waiting.length} item${waiting.length > 1 ? 's' : ''} waiting for your approval on ${hostOf(a)}`, 'updates');
       if (a.progress) push(progStale(a.progress) ? 'warn' : 'info', progStale(a.progress) ? `Update run on ${hostOf(a)} has not reported progress for a while` : `Updating on ${hostOf(a)}: ${a.progress.kind === 'run' ? `${a.progress.done}/${a.progress.total} containers · ` : ''}${progNow(a.progress)}`, 'updates');
       if (r.host && r.host.rebootRequired) push('info', `${hostOf(a)} needs a reboot to finish updates`, 'updates');
+      if (r.pbsHost && r.pbsHost.rebootRequired) push('info', `Backup server ${r.pbsHost.name} needs a reboot to finish updates`, 'updates');
       for (const s of (r.host && r.host.storage) || []) if (s.total && s.used / s.total >= 0.9) push('warn', `${hostOf(a)} storage ${s.name} is ${Math.round(s.used / s.total * 100)}% full`, 'overview');
       const recent = ((r.backups && r.backups.tasks) || []).filter(t => Date.now() - t.t < 24 * HOUR);
       const failed = recent.filter(t => runState(t) === 'failed');
@@ -702,9 +703,12 @@ const Dash = (() => {
   }
 
   // Recent one-click actions for a container (or the host when vmid is null).
-  function actionLog(agent, vmid) {
+  const PBS_ACTS = ['check-pbs-updates'];
+  function actionLog(agent, vmid, { pbs = false } = {}) {
     const a = agents().find(x => x.name === agent);
-    const acts = ((a && a.tasks) || []).filter(t => t.action && (t.action.vmid ?? null) === vmid).slice(0, 4);
+    // Host cards and the backup server card share vmid null: split them by action type.
+    const acts = ((a && a.tasks) || []).filter(t => t.action && (t.action.vmid ?? null) === vmid
+      && (vmid !== null || PBS_ACTS.includes(t.action.type) === pbs)).slice(0, 4);
     if (!acts.length) return '';
     return `<ul class="events act-log">${acts.map(t => {
       const out = String(t.output || '');
@@ -739,8 +743,8 @@ const Dash = (() => {
           ${details(`pk:${selKey}`, 'Choose packages', `<div class="pkg-list">${pk.map(x => `<label class="pkg"><input type="checkbox" data-pkg="${esc(x.name)}" ${sel.has(x.name) ? 'checked' : ''}><span class="pkg-name">${esc(x.name)}</span>${x.security ? '<span class="tag down">security</span>' : ''}<span class="muted">${esc(x.old)} → ${esc(x.new)}</span></label>`).join('')}</div>`)}
         </div>` : '';
       return `<div class="card approval">
-        <div class="ap-head"><span class="pill ${p.kind === 'host-reboot' ? 'bad' : p.kind === 'host-update' ? 'warn' : ''}">${esc({ 'host-update': 'host update', 'host-reboot': 'host reboot', 'risky-update': 'held update' }[p.kind] || p.kind)}</span>
-          <b class="ap-title">${esc(p.summary)}</b><span class="muted">${esc(hostOf(a))} · ${esc(ago(p.t))}</span></div>
+        <div class="ap-head"><span class="pill ${p.kind === 'host-reboot' || p.kind === 'pbs-reboot' ? 'bad' : p.kind === 'host-update' || p.kind === 'pbs-update' ? 'warn' : ''}">${esc({ 'host-update': 'host update', 'host-reboot': 'host reboot', 'pbs-update': 'backup server update', 'pbs-reboot': 'backup server reboot', 'risky-update': 'held update' }[p.kind] || p.kind)}</span>
+          <b class="ap-title">${esc(p.summary)}</b><span class="muted">${esc(/^pbs-/.test(p.kind) && a.report.pbsHost ? a.report.pbsHost.name : hostOf(a))} · ${esc(ago(p.t))}</span></div>
         ${picker}
         ${p.details ? details(`pd:${a.name}:${p.id}`, pk.length ? 'Why / full details' : 'Details', `<pre>${esc(p.details)}</pre>`) : ''}
         <div class="ap-actions">${act}</div></div>`;
@@ -772,6 +776,26 @@ const Dash = (() => {
       </div>`;
     }).join('');
 
+    // The backup server's own packages (one agent manages them, "pbs_updates" in its config): same card as a host.
+    const pbsCards = ag.filter(a => a.report.pbsHost && a.report.pbsHost.name).map(a => {
+      const ph = a.report.pbsHost;
+      const pu = ph.updates || {};
+      const waiting = (a.report.pending || []).filter(p => (p.kind === 'pbs-update' || p.kind === 'pbs-reboot') && !a.decisions[p.id]).length;
+      return `<div class="card pad sched"><div class="host-head">${dot(a.online ? 'up' : 'down')}<div><h3>${esc(ph.name)} <span class="muted">${esc(ph.ip || '')}</span></h3>
+        <div class="muted">Backup server · checked nightly by ${esc(a.name)} at <b>${esc((a.report.schedule || {}).updates || '?')}</b> · packages: ${pu.count ?? '—'} waiting${pu.security ? ` (<span class="pct-bad">${pu.security} security</span>)` : ''}
+          · <button class="linkbtn" data-act="check-pbs-updates" data-agent="${esc(a.name)}" data-name="${esc(ph.name)}">check now</button></div></div>
+          ${ph.rebootRequired ? '<span class="pill warn">reboot needed</span>' : ''}</div>
+        <p class="muted">Updates and reboots of the backup server always wait for your approval${waiting ? ` — <b>${waiting}</b> waiting above` : ''}.</p>
+        <div class="meta">
+          ${ph.version ? `<span>PBS <b>${esc(String(ph.version).split(' ')[0])}</b></span>` : ''}
+          ${ph.kernel ? `<span>Kernel <b>${esc(ph.kernel)}</b></span>` : ''}
+          ${ph.uptime ? `<span>Up <b>${esc(duration(ph.uptime).split(' ').slice(0, 2).join(' '))}</b></span>` : ''}
+          <span>Checked <b>${pu.checkedAt ? esc(ago(pu.checkedAt)) : 'tonight'}</b></span>
+        </div>
+        ${actionLog(a.name, null, { pbs: true })}
+      </div>`;
+    }).join('');
+
     const uf = st.filters.upd;
     const all = containers();
     const cs = all.filter(c => !uf || (uf === 'pending' ? c.updates && c.updates.count : c.updates && c.updates.security))
@@ -793,7 +817,7 @@ const Dash = (() => {
     return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the agent rates them low-risk, unless you switch a host to <b>security only</b>; the rest wait here. Every update is snapshotted first and rolled back if services break.')}
       ${running.length ? `<h3 class="sec-title">In progress</h3><div class="stack">${running.map(progressCard).join('')}</div>` : ''}
       <h3 class="sec-title">Waiting for approval</h3><div class="stack">${pendHtml}</div>
-      <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}</div>
+      <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}${pbsCards}</div>
       <h3 class="sec-title">Containers</h3>
       <div class="toolbar"><div class="seg" data-filter="upd">${[['', `All (${all.length})`], ['pending', `With updates (${nPend})`], ['security', `Security (${nSec})`]].map(([v, l]) => `<button class="${uf === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div></div>
       <div class="card table-card"><div class="table-wrap"><table class="ctable ct-updates">
@@ -890,8 +914,8 @@ const Dash = (() => {
       </div>`;
     }).join('');
     const down = sv.filter(s => s.status === 'down' && !s.stale).length;
-    return `${core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent, every minute</span></h3></div>${core}` : ''}
-      <div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every minute</span></h3>
+    return `${core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent, every 20 seconds</span></h3></div>${core}` : ''}
+      <div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every 20 seconds</span></h3>
       <span class="${down ? 'pct-bad' : 'pct-good'}">${down ? `${down} down` : `all ${sv.length} answering`}</span></div>
       <div class="svc-grid">${cards}</div>`;
   }
@@ -1398,6 +1422,7 @@ const Dash = (() => {
     'update-all': n => [`Run the nightly update on ${n} now?`, 'Every container is snapshotted, updated and checked one by one, following this host\'s nightly setting.'],
     'update-all-security': n => [`Install security updates on every container on ${n}?`, 'Each container is snapshotted, gets only its security updates, and is checked one by one.'],
     'check-updates': n => [`Check ${n} for host package updates?`, ''],
+    'check-pbs-updates': n => [`Check backup server ${n} for package updates?`, 'Nothing is installed: updates wait for your approval.'],
   };
   const ACT_OK = { update: 'Update', 'update-security': 'Install', 'update-all': 'Run now', 'update-all-security': 'Install', shutdown: 'Shut down', reboot: 'Reboot' };
 

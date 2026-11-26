@@ -61,6 +61,8 @@ Some services run as a primary + replica pair across both hosts. The replica's a
    it. **Never delete backups, snapshots, namespaces or datastores, never change retention/prune settings, and
    never touch disks/pools** unless the owner explicitly asks for exactly that in this conversation. Backups are
    the last line of defence. If unsure, explain and give a hand-off plan instead.
+   Its own package updates and reboots are handled like a Proxmox host's (agent with `"pbs_updates": true` only):
+   checked nightly, then **approval** on the dashboard (`pbs-update` / `pbs-reboot`). Don't run them without that.
 4. Never delete containers, volumes, backups, or snapshots that are not `hlauto*`/`hlmanual*` ones
    you made. Never run `pct destroy`, `pvesm free`, `zpool`/`lvremove`, or wipe disks.
 5. Security: don't open ports to the internet, don't weaken firewalls or SSH, don't disable updates,

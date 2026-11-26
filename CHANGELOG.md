@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.14.0
+
+Everything on the Uptime page is checked every 20 seconds, and the backup server gets updates like a Proxmox host
+(agent 1.14.0).
+
+- **Checks every 20 s:** public monitors (new and auto-added ones default to 20 s; existing monitors were switched),
+  internal services and core servers (agent `check_every` default 20, was 60). A service is marked down after 2
+  failed checks, which now takes about 40 s instead of 2 min.
+- **Backup server updates:** connector1 (`"pbs_updates": true` in its config) checks HOLY's packages nightly and on
+  demand. Updates and reboots wait for approval, exactly like GOD and HELP. The Updates page has a HOLY card
+  (packages waiting, security count, "check now", PBS version, kernel, uptime, "reboot needed"), and the Overview
+  says when HOLY needs a reboot.
+- **um-ha replication is incremental:** the replica asks only for files changed since its last copy, plus a
+  manifest so deleted files go too. There is a full copy every 5 minutes and after any role change. With 20 s
+  checks the history files are megabytes, so a 5-second full copy would be wasteful.
+
 ## 2.13.1
 
 Fixes from a full bug and UI check.

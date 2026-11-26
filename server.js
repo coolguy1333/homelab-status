@@ -112,7 +112,7 @@ infra.onPublic = (list, agent) => {
     }
     if (store.monitors.length >= 1000) break;
     const name = item.name ? `${String(item.name).slice(0, 80)} (${host})` : host;
-    const m = newMonitor({ name, type: 'http', target, acceptedStatus: '200-499', interval: 120, timeout: 15, retries: 2, autoHost: host, autoBy: agent });
+    const m = newMonitor({ name, type: 'http', target, acceptedStatus: '200-499', interval: 20, timeout: 15, retries: 2, autoHost: host, autoBy: agent });
     store.monitors.push(m);
     scheduler.schedule(m, 1000 + added * 400);
     added++;
@@ -155,7 +155,7 @@ function newMonitor(fields) {
   return {
     id: crypto.randomBytes(6).toString('hex'),
     name: '', type: 'http', target: '', port: null,
-    interval: 60, timeout: 10, retries: 1,
+    interval: 20, timeout: 10, retries: 1,
     method: 'GET', acceptedStatus: '200-399', keyword: '', invertKeyword: false,
     ignoreTls: false, followRedirects: true, paused: false,
     createdAt: Date.now(),
