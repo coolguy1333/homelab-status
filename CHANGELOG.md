@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.10.2
+
+Fixed: logs and activity disappearing.
+
+- **Agent logs are saved** (`agentlogs.json`, up to 5000 lines per agent). They were kept in memory only, so every
+  restart or redeploy of the dashboard wiped them, and only the newest 300 lines came back with the next report.
+- **Activity keeps its own history** (`events.json`, 30 days, up to 3000 events per agent). Activity used to show only
+  the newest 100 events in the agent's latest report, so older entries vanished as new ones arrived. The page shows
+  300 at a time with **Show older**.
+- **Update-run logs can't be lost any more.** An agent used to send a run's full log only for 30 minutes after the
+  run; if the dashboard was restarting or unreachable then, it was gone ("not kept"). Now the dashboard says which
+  run logs it has, and the agent keeps resending a log until every dashboard has it.
+- No events lost in bursts: each report now carries every event since the last report all dashboards received
+  (it was the newest 100, then 200). Warning/error alerts are checked against the saved history, so a restart
+  doesn't repeat old alerts.
+- The Logs page shows up to 1500 lines (was 800).
+- Agent 1.11.1.
+
 ## 2.10.1
 
 - Fixed: the sidebar scrolled away. On pages shorter than the window the footer made the page scroll and the sidebar
