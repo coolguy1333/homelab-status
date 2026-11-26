@@ -1,32 +1,59 @@
 #!/usr/bin/env bash
-# wm-ha: automatic failover between two WebManager servers (one primary, one
-# replica). Runs every 10 s from wm-ha.timer on BOTH servers.
+# wm-ha: automatic failover (and failback) between two WebManager servers
+# (one primary, one replica). Runs every 5 s from wm-ha.timer on BOTH servers.
 #
-# - Replica: if the primary's /healthz has failed for FAIL_LIMIT checks in a
-#   row (and this server can still reach the gateway, so it isn't the one
-#   that is cut off), run webmanager-promote --yes.
+# - Replica: if the primary's /healthz has been failing for FAIL_AFTER seconds
+#   (and at least MIN_FAILS checks in a row), and this server can still reach
+#   the gateway (so it isn't the one that is cut off), run
+#   webmanager-promote --yes. The delay is measured in time, not in check
+#   count, because a check against a dead primary spends seconds on timeouts.
 # - Primary: if the peer is also primary and was promoted more recently, this
 #   server is the stale old primary: stop its apps and rejoin the peer as a
 #   replica.
+# - Failback: one server has PREFERRED=1 (the normal primary). When the other
+#   one is primary and the preferred one has been a healthy replica for
+#   FAILBACK_AFTER seconds, the current primary pauses its apps (so their data
+#   stops changing) and advertises "draining". The preferred replica then
+#   restarts its WebManager, which drops any data sync in flight and starts a
+#   fresh full one at once (so it surely began after the pause), and
+#   advertises "resync". Once the primary's nginx access log shows a data
+#   snapshot finished after it saw "resync", it advertises "handover"; the
+#   preferred replica promotes itself, and the old primary sees a newer epoch
+#   and rejoins it as a replica (the normal path above). This has to be quick:
+#   WebManager's watchdog restarts "down" (paused) apps after 1-2 minutes. If
+#   the handover doesn't finish within HANDOVER_TIMEOUT, the apps are unpaused
+#   and it is retried after FAILBACK_BACKOFF.
 # - Publishes its role for HAProxy on the connectors through nginx
-#   (Host: wm-ha.internal on :8080): /role = "<role> <epoch>", /active = 200
-#   only when this server is the primary that should get traffic.
+#   (Host: wm-ha.internal on :8080): /role = "<role> <epoch> [flags]" (flags:
+#   preferred, draining, handover, resync), /active = 200 only when this server is the primary
+#   that should get traffic.
 #
-# Config: /etc/wm-ha.conf (SELF_IP, PEER_IP, GATEWAY, FAIL_LIMIT)
+# Config: /etc/wm-ha.conf (SELF_IP, PEER_IP, GATEWAY, FAIL_AFTER, MIN_FAILS,
+#         PREFERRED, FAILBACK_AFTER)
 # Log:    journalctl -u wm-ha
 set -u
 exec 9>/run/wm-ha.lock
 flock -n 9 || exit 0
 
 . /etc/wm-ha.conf
-FAIL_LIMIT=${FAIL_LIMIT:-18}
+FAIL_AFTER=${FAIL_AFTER:-60}
+MIN_FAILS=${MIN_FAILS:-5}
 REJOIN_BACKOFF=${REJOIN_BACKOFF:-600}
+PREFERRED=${PREFERRED:-0}
+FAILBACK_AFTER=${FAILBACK_AFTER:-120}
+HANDOVER_TIMEOUT=${HANDOVER_TIMEOUT:-150}
+FAILBACK_BACKOFF=${FAILBACK_BACKOFF:-1800}
 ENV_FILE=/etc/webmanager/webmanager.env
 DATA_DIR=/var/lib/webmanager
 STATE=/var/lib/wm-ha
 WEB=/srv/wm-ha
+# The "active" flag lives in /run (tmpfs) so it never survives a reboot: a
+# stale primary that boots after a failover must not advertise itself as
+# active before its first check has looked at the peer.
+RUN=/run/wm-ha
 SRC=/root/webmanager
-mkdir -p "$STATE" "$WEB"
+ACCESS_LOG=/var/log/nginx/access.log
+mkdir -p "$STATE" "$WEB" "$RUN"
 
 replica_of=$(sed -n 's/^WEBMANAGER_REPLICA_OF=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 if [[ -z $replica_of || -e $DATA_DIR/promoted ]]; then
@@ -37,52 +64,105 @@ fi
 # Epoch: when this server became primary. 0 = original primary (never promoted).
 epoch=0
 [[ -e $DATA_DIR/promoted ]] && epoch=$(stat -c %Y "$DATA_DIR/promoted")
+now=$(date +%s)
 
-peer=$(curl -s -m 4 -H 'Host: wm-ha.internal' "http://$PEER_IP:8080/role" 2>/dev/null)
-peer_role=${peer%% *}
-peer_epoch=${peer##* }
-[[ $peer_epoch =~ ^[0-9]+$ ]] || peer_epoch=0
+peer_role="" peer_epoch=0 peer_flags=""
+read_peer() {
+    local peer
+    peer=$(curl -s -m 3 -H 'Host: wm-ha.internal' "http://$PEER_IP:8080/role" 2>/dev/null)
+    read -r peer_role peer_epoch peer_flags <<<"$peer"
+    [[ $peer_role == primary || $peer_role == replica ]] || peer_role=""
+    [[ $peer_epoch =~ ^[0-9]+$ ]] || peer_epoch=0
+}
 
 publish() {
-    printf '%s %s\n' "$role" "$epoch" >"$WEB/role.tmp" && mv "$WEB/role.tmp" "$WEB/role"
-    if [[ $1 == yes ]]; then
-        echo yes >"$WEB/active"
-    else
-        rm -f "$WEB/active"
+    local flags=""
+    [[ $PREFERRED == 1 ]] && flags+=" preferred"
+    if [[ $role == primary && -e $STATE/handover-ready ]]; then
+        flags+=" handover"
+    elif [[ $role == primary && -e $STATE/handover-start ]]; then
+        flags+=" draining"
     fi
+    [[ $role == replica && -s $STATE/resynced ]] && flags+=" resync@$(cat "$STATE/resynced")"
+    printf '%s %s%s\n' "$role" "$epoch" "$flags" >"$WEB/role.tmp" && mv "$WEB/role.tmp" "$WEB/role"
+    if [[ $1 == yes ]]; then
+        echo yes >"$RUN/active"
+    else
+        rm -f "$RUN/active"
+    fi
+}
+
+promote() {
+    rm -f "$STATE/fails" "$STATE/fail-since" "$STATE/resynced"
+    webmanager-promote --yes
+    role=primary
+    epoch=$(stat -c %Y "$DATA_DIR/promoted" 2>/dev/null || date +%s)
+    publish yes
+}
+
+# Undo a failback handover that was started on this server (unpause apps).
+abort_handover() {
+    [[ -e $STATE/handover-start ]] || return 0
+    echo "failback handover aborted: $1; unpausing apps (retry in ${FAILBACK_BACKOFF}s)"
+    xargs -r docker unpause <"$STATE/handover-paused" >/dev/null 2>&1
+    rm -f "$STATE/handover-start" "$STATE/handover-ready" "$STATE/handover-paused" "$STATE/peer-ok-since" \
+        "$STATE/resync-seen"
+    echo "$now" >"$STATE/failback-backoff"
 }
 
 if [[ $role == replica ]]; then
     publish no
-    if curl -fs -m 5 -o /dev/null -H 'Host: 127.0.0.1' "$replica_of/healthz"; then
-        echo 0 >"$STATE/fails"
+    if curl -fs -m 3 -o /dev/null -H 'Host: 127.0.0.1' "$replica_of/healthz"; then
+        rm -f "$STATE/fails" "$STATE/fail-since"
+        if [[ $PREFERRED == 1 ]]; then
+            read_peer
+            if [[ $peer_role == primary && " $peer_flags " == *" handover "* ]]; then
+                echo "primary $replica_of is handing over (planned failback): PROMOTING this server"
+                promote
+                # Planned and lossless, so skip WebManager's "Failed over: check
+                # everything" banner (it is for real failovers).
+                printf '{"by": "wm-ha planned failback", "at": %s}\n' "$(date +%s)" \
+                    >"$DATA_DIR/promoted-acknowledged"
+                chown webmanager:webmanager "$DATA_DIR/promoted-acknowledged" 2>/dev/null
+            elif [[ $peer_role == primary && " $peer_flags " == *" draining "* ]]; then
+                if [[ ! -e $STATE/resynced ]]; then
+                    echo "primary $replica_of paused its apps for a failback: restarting WebManager to pull a fresh data snapshot now"
+                    systemctl restart webmanager
+                    # When the restart finished: the old process (and any sync
+                    # it had in flight) is gone, and the new one syncs at once.
+                    date +%s >"$STATE/resynced"
+                    publish no
+                fi
+            else
+                rm -f "$STATE/resynced"
+            fi
+        fi
         exit 0
     fi
     if ! ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1; then
         echo "primary unreachable but so is the gateway $GATEWAY: not promoting (this server is probably the one cut off)"
-        echo 0 >"$STATE/fails"
+        rm -f "$STATE/fails" "$STATE/fail-since"
         exit 0
     fi
+    [[ -s $STATE/fail-since ]] || echo "$now" >"$STATE/fail-since"
+    since=$(cat "$STATE/fail-since")
     fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
     echo "$fails" >"$STATE/fails"
-    echo "primary $replica_of failed health check ($fails/$FAIL_LIMIT)"
-    if (( fails >= FAIL_LIMIT )); then
+    down=$(( now - since ))
+    echo "primary $replica_of failed health check ($fails in a row, down ${down}s of ${FAIL_AFTER}s)"
+    if (( down >= FAIL_AFTER && fails >= MIN_FAILS )); then
         echo "PROMOTING this server to primary"
-        echo 0 >"$STATE/fails"
-        webmanager-promote --yes
-        role=primary
-        epoch=$(stat -c %Y "$DATA_DIR/promoted" 2>/dev/null || date +%s)
-        publish yes
+        promote
     fi
     exit 0
 fi
 
 # Primary.
-echo 0 >"$STATE/fails"
+rm -f "$STATE/fails" "$STATE/fail-since"
+read_peer
 if [[ $peer_role == primary ]] && (( peer_epoch > epoch )); then
     publish no
     last=$(cat "$STATE/last-rejoin" 2>/dev/null || echo 0)
-    now=$(date +%s)
     if (( now - last < REJOIN_BACKOFF )); then
         exit 0
     fi
@@ -94,15 +174,68 @@ if [[ $peer_role == primary ]] && (( peer_epoch > epoch )); then
         echo "no peer token found; cannot rejoin"
         exit 1
     fi
-    # A replica never runs apps; stop the ones this old primary still has up.
+    # A replica never runs apps; stop the ones this old primary still has up
+    # (unpausing first, in case a failback handover paused them).
+    [[ -e $STATE/handover-paused ]] && xargs -r docker unpause <"$STATE/handover-paused" >/dev/null 2>&1
+    rm -f "$STATE/handover-start" "$STATE/handover-ready" "$STATE/handover-paused" "$STATE/peer-ok-since" \
+        "$STATE/resync-seen"
     docker ps -q --filter name=webmanager-app- 2>/dev/null | xargs -r docker stop >/dev/null
     (cd "$SRC" && git pull -q --ff-only) || true
     if (cd "$SRC" && bash setup.sh --replica-of "http://$PEER_IP:8080" --peer-token "$token" \
             --announce-url "http://$SELF_IP:8080" </dev/null >>"$STATE/rejoin.log" 2>&1); then
         echo "rejoined $PEER_IP as a replica"
+        # The backoff only spaces out failed attempts; a later failover and
+        # failback (possibly minutes from now) must be able to rejoin at once.
+        rm -f "$STATE/last-rejoin"
     else
         echo "rejoin failed; see $STATE/rejoin.log (retrying in ${REJOIN_BACKOFF}s)"
     fi
     exit 0
+fi
+
+# Failback: this server is primary but not the preferred one.
+if [[ $PREFERRED != 1 ]]; then
+    if [[ $peer_role == replica && " $peer_flags " == *" preferred "* ]] \
+            && curl -fs -m 3 -o /dev/null -H 'Host: 127.0.0.1' "http://$PEER_IP:8080/healthz"; then
+        [[ -s $STATE/peer-ok-since ]] || { echo "$now" >"$STATE/peer-ok-since"; echo "preferred primary $PEER_IP is back as a replica; failing back after ${FAILBACK_AFTER}s"; }
+        ok_for=$(( now - $(cat "$STATE/peer-ok-since") ))
+        backoff=$(cat "$STATE/failback-backoff" 2>/dev/null || echo 0)
+        if [[ ! -e $STATE/handover-start ]] && (( ok_for >= FAILBACK_AFTER && now - backoff >= FAILBACK_BACKOFF )); then
+            echo "$now" >"$STATE/handover-start"
+            docker ps -q --filter name=webmanager-app- --filter status=running 2>/dev/null >"$STATE/handover-paused"
+            xargs -r docker pause <"$STATE/handover-paused" >/dev/null 2>&1
+            echo "failback: paused $(wc -l <"$STATE/handover-paused") app(s); waiting for $PEER_IP to copy their data"
+        fi
+    elif [[ ! -e $STATE/handover-start ]]; then
+        # Not (or no longer) a healthy preferred replica. (During a handover the
+        # peer restarts its WebManager, so a failed check then is expected; only
+        # the timeout below aborts a handover.)
+        rm -f "$STATE/peer-ok-since"
+    fi
+    if [[ -e $STATE/handover-start && ! -e $STATE/handover-ready ]]; then
+        # Wait for the peer to restart its WebManager (flag "resync@<time the
+        # restart finished>"), then for a data snapshot it finished pulling
+        # after that (nginx logs a request when it completes). That snapshot
+        # began after the restart, so after the pause.
+        resync_at=$(grep -o 'resync@[0-9]*' <<<"$peer_flags" | cut -d@ -f2)
+        if [[ ! -s $STATE/resync-seen && -n $resync_at ]] && (( resync_at >= $(cat "$STATE/handover-start") )); then
+            echo "$resync_at" >"$STATE/resync-seen"
+        fi
+        if [[ -s $STATE/resync-seen ]]; then
+            seen=$(cat "$STATE/resync-seen")
+            while read -r stamp; do
+                t=$(date -d "$(sed 's#/# #g; s#:# #' <<<"$stamp")" +%s 2>/dev/null) || continue
+                if (( t > seen )); then
+                    touch "$STATE/handover-ready"
+                    echo "failback: $PEER_IP has all app data ($(( now - $(cat "$STATE/handover-start") ))s after the pause); handing over"
+                    break
+                fi
+            done < <(grep -F "$PEER_IP - " "$ACCESS_LOG" 2>/dev/null | grep -F 'GET /replication/data-snapshot ' \
+                     | grep -F '" 200 ' | tail -n 5 | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+        fi
+    fi
+    if [[ -e $STATE/handover-start ]] && (( now - $(cat "$STATE/handover-start") > HANDOVER_TIMEOUT )); then
+        abort_handover "the peer did not take over within ${HANDOVER_TIMEOUT}s"
+    fi
 fi
 publish yes
