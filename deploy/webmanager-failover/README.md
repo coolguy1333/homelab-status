@@ -23,10 +23,11 @@ Cloudflare ──tunnel──▶ cloudflared (connector1 / connector2)
 
 ## wm-ha (`wm-ha`, `install.sh`)
 
-Runs every 10 s from `wm-ha.timer` on both servers.
+Runs every 5 s from `wm-ha.timer` on both servers.
 
-- **Replica:** if the primary's `/healthz` has failed 18 times in a row
-  (3 minutes) and the gateway `192.168.10.1` still answers a ping, it runs
+- **Replica:** if the primary's `/healthz` has been failing for 60 seconds
+  (`FAIL_AFTER`, measured in time, with at least `MIN_FAILS` = 5 checks in a
+  row) and the gateway `192.168.10.1` still answers a ping, it runs
   `webmanager-promote --yes`. Apps then start from the last synced data.
 - **Primary:** if the peer is also primary with a newer epoch (the mtime of
   `/var/lib/webmanager/promoted`; 0 = never promoted), this server is the
@@ -34,11 +35,24 @@ Runs every 10 s from `wm-ha.timer` on both servers.
   `setup.sh --replica-of`. Retries are spaced 10 minutes apart, and the log
   is `/var/lib/wm-ha/rejoin.log`.
 - **Publishes its role** via `/etc/nginx/conf.d/wm-ha.conf` on `:8080` with
-  `Host: wm-ha.internal`: `/role` returns `"<role> <epoch>"`, and `/active`
-  returns 200 only on the primary that should get traffic.
+  `Host: wm-ha.internal`: `/role` returns `"<role> <epoch> [preferred] [handover]"`, and `/active`
+  returns 200 only on the primary that should get traffic. The flag lives in
+  `/run/wm-ha`, so a rebooted server never advertises it before its first check.
 
-There is no automatic failback. After a failover the roles stay swapped,
-which is fine because the servers are symmetric.
+- **Failback:** CT 212 is the preferred primary (`PREFERRED=1`). When CT 213
+  is primary and CT 212 has been a healthy replica for 2 minutes
+  (`FAILBACK_AFTER`), CT 213 pauses its app containers (`docker pause`, so
+  their data stops changing) and advertises `draining`. CT 212 restarts its
+  WebManager, which drops any data sync in flight and pulls a fresh full
+  snapshot right away, and advertises `resync@<when the restart finished>`. When CT 213's nginx access
+  log shows that snapshot finished, it advertises `handover`. CT 212 promotes
+  itself (and acknowledges WebManager's "Failed over" banner, since nothing
+  was lost), and CT 213 sees the newer epoch and rejoins it as a replica.
+  Apps are unavailable for roughly 30–60 seconds, and static sites stay up.
+  It has to be quick because WebManager's watchdog on CT 213 restarts "down"
+  (paused) apps after 1–2 minutes. If the handover isn't done within
+  `HANDOVER_TIMEOUT` (150 s), CT 213 unpauses its apps and retries 30 minutes
+  later.
 
 `install.sh` also adds a systemd drop-in that sets
 `TMPDIR=/var/lib/webmanager/tmp` for `webmanager.service`. WebManager
@@ -49,11 +63,11 @@ Install or update (as root inside each WebManager CT):
 
 ```bash
 bash install.sh <this server's IP> <the other server's IP>
-# CT 212: bash install.sh 192.168.10.20 192.168.10.116
+# CT 212: bash install.sh 192.168.10.20 192.168.10.116 preferred
 # CT 213: bash install.sh 192.168.10.116 192.168.10.20
 ```
 
-Logs: `journalctl -u wm-ha`. Config: `/etc/wm-ha.conf` (`FAIL_LIMIT`, `GATEWAY`).
+Logs: `journalctl -u wm-ha`. Config: `/etc/wm-ha.conf` (`FAIL_AFTER`, `MIN_FAILS`, `PREFERRED`, `FAILBACK_AFTER`, `GATEWAY`).
 
 ## HAProxy (`haproxy-connector.cfg`)
 
@@ -93,7 +107,7 @@ point at `http://localhost:8081`:
 
 - If CT 212 is only cut off from CT 213 and not actually down, both can run
   apps until it reconnects and rejoins. Bots and similar apps may then act twice.
-- An update or reboot of the primary that lasts more than 3 minutes swaps
+- An update or reboot of the primary that lasts more than 60 seconds swaps
   the roles.
 - Once both servers run WebManager with PR #16, HAProxy could check
   `/healthz?role=primary` directly instead of the `wm-ha.internal` endpoint.

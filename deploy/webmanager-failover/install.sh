@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# install.sh SELF_IP PEER_IP  (run as root inside the WebManager CT)
+# install.sh SELF_IP PEER_IP [preferred]  (run as root inside the WebManager CT)
+# Pass "preferred" on the server that should normally be the primary: after a
+# failover, the roles switch back to it once it has been healthy for 2 minutes.
 set -Eeuo pipefail
 SELF_IP=$1 PEER_IP=$2
+PREFERRED=0
+[[ ${3:-} == preferred ]] && PREFERRED=1
 cd "$(dirname "$0")"
 
 command -v ping >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iputils-ping >/dev/null
@@ -12,8 +16,14 @@ cat >/etc/wm-ha.conf <<EOF
 SELF_IP=$SELF_IP
 PEER_IP=$PEER_IP
 GATEWAY=192.168.10.1
-# 18 checks x 10 s = 3 minutes of primary downtime before promoting.
-FAIL_LIMIT=18
+# Promote after the primary has failed health checks for 60 seconds
+# (and at least 5 checks in a row).
+FAIL_AFTER=60
+MIN_FAILS=5
+# 1 on the server that should normally be the primary (automatic failback).
+PREFERRED=$PREFERRED
+# Fail back once the preferred server has been a healthy replica this long.
+FAILBACK_AFTER=120
 EOF
 
 cat >/etc/systemd/system/wm-ha.service <<'EOF'
@@ -28,11 +38,11 @@ TimeoutStartSec=15min
 EOF
 cat >/etc/systemd/system/wm-ha.timer <<'EOF'
 [Unit]
-Description=WebManager automatic failover check every 10 s
+Description=WebManager automatic failover check every 5 s
 
 [Timer]
 OnBootSec=30s
-OnUnitInactiveSec=10s
+OnUnitInactiveSec=5s
 AccuracySec=1s
 
 [Install]
@@ -46,6 +56,7 @@ printf '# Docker bind-mounts app restore temp dirs; PrivateTmp hides /tmp from d
     >/etc/systemd/system/webmanager.service.d/tmpdir.conf
 
 install -d -m 755 /srv/wm-ha
+rm -f /srv/wm-ha/active
 cat >/etc/nginx/conf.d/wm-ha.conf <<'EOF'
 # Role endpoint for the HAProxy failover on the Cloudflare connectors (wm-ha).
 server {
@@ -55,7 +66,7 @@ server {
     default_type text/plain;
     access_log off;
     location = /role   { try_files /role =503; }
-    location = /active { try_files /active =503; }
+    location = /active { root /run/wm-ha; try_files /active =503; }
     location / { return 404; }
 }
 EOF
@@ -66,4 +77,4 @@ NEEDS_RESTART=$(systemctl show webmanager -p Environment --value | grep -c TMPDI
 [[ $NEEDS_RESTART -gt 0 ]] || systemctl restart webmanager
 systemctl enable -q --now wm-ha.timer
 /usr/local/sbin/wm-ha
-echo "role: $(cat /srv/wm-ha/role)  active: $([[ -e /srv/wm-ha/active ]] && echo yes || echo no)"
+echo "role: $(cat /srv/wm-ha/role)  active: $([[ -e /run/wm-ha/active ]] && echo yes || echo no)"
