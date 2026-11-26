@@ -397,11 +397,6 @@ function send(res, status, body, headers = {}) {
   res.end(payload);
 }
 
-function redirect(res, location, headers = {}) {
-  res.writeHead(302, { ...SECURITY_HEADERS, Location: location, 'Cache-Control': 'no-store', ...headers });
-  res.end();
-}
-
 function readBody(req, limit = 100 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
