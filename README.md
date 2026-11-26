@@ -15,7 +15,7 @@ and keeps all of its features (monitors, Google sign-in, webhook alerts, peers).
 | **Logs** | Each update run step by step (apt output included) with a live view while it runs, and the agents' own log (search, filter, copy, download) |
 
 How it works: an agent on each Proxmox host (connector1 on GOD, connector2 on HELP) reports to this app every
-5 minutes. It pings and port-checks the internal services and core servers every minute (as often as the public
+5 minutes. It pings and port-checks the internal services and core servers every 20 seconds (as often as the public
 sites are checked), and looks for new services, tunnel hostnames and WebManager sites every 1–2 hours. These are plain
 scripts; Claude is only used for chat questions and unclear update reviews. Each night it snapshots, risk-reviews, updates, and health-checks every container, and rolls back if
 something broke. Security updates always go in. Risky updates and anything touching the host wait for **Approve**.

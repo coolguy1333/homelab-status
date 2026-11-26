@@ -126,6 +126,7 @@ def save_state():
 
 
 def set_role(role, epoch=None, why=""):
+    RT["snap_time"] = 0   # the next copy (if any) is a full one
     with lock:
         old = (S["role"], S["epoch"])
         S["role"] = role
@@ -186,10 +187,25 @@ def data_files():
             and not n.endswith(".tmp") and ".corrupt-" not in n and not n.startswith(".")]
 
 
-def make_snapshot():
+def make_snapshot(since=0.0):
+    """tar.gz of the data folder. With `since` (the X-Snapshot-Time of the copy the replica already has), only files
+    changed after it are included, plus a ".manifest" listing every file so the replica can drop deleted ones.
+    With checks every 20 s the history files are megabytes, so this keeps a 5-second sync cheap."""
     buf = io.BytesIO()
+    names = data_files()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
-        for n in data_files():
+        if since:
+            man = json.dumps(names).encode()
+            info = tarfile.TarInfo(".manifest")
+            info.size, info.mtime = len(man), int(time.time())
+            tar.addfile(info, io.BytesIO(man))
+        for n in names:
+            if since:
+                try:
+                    if os.stat(os.path.join(DATA_DIR, n)).st_mtime < since - 2:   # 2 s margin for coarse mtimes
+                        continue
+                except OSError:
+                    continue
             try:
                 with open(os.path.join(DATA_DIR, n), "rb") as f:   # the app replaces files atomically
                     data = f.read()
@@ -206,9 +222,13 @@ def apply_snapshot(blob):
     import pwd
     pw = pwd.getpwnam(C["APP_USER"])
     names = set()
+    manifest = None
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
         for m in tar.getmembers():
             n = m.name
+            if n == ".manifest" and m.isfile():
+                manifest = set(x for x in json.loads(tar.extractfile(m).read()) if isinstance(x, str))
+                continue
             if not m.isfile() or "/" in n or n.startswith(".") or n in ("", "..") or len(n) > 100:
                 continue
             data = tar.extractfile(m).read()
@@ -220,10 +240,11 @@ def apply_snapshot(blob):
             os.chmod(tmp, 0o600 if n == "sessions.json" else 0o640)
             os.replace(tmp, dst)
             names.add(n)
-    if not names:
+    keep = manifest if manifest is not None else names
+    if not keep:
         raise ValueError("empty snapshot")
     for n in data_files():
-        if n not in names:
+        if n not in keep:
             os.unlink(os.path.join(DATA_DIR, n))
     return len(names)
 
@@ -273,9 +294,19 @@ def outranks(p):
 
 
 def sync_from_peer():
-    blob, _ = peer_request("/snapshot", timeout=20, auth=True)
+    # Incremental after the first full copy (snap_time = the peer's clock when it built our last copy).
+    since = RT.get("snap_time") or 0
+    if time.time() - RT.get("full_at", 0) >= 300:   # a full copy every 5 min catches anything mtimes can't
+        since = 0                                   # (e.g. files restored to older versions on the primary)
+    blob, headers = peer_request(f"/snapshot?since={since:.3f}" if since else "/snapshot", timeout=20, auth=True)
     n = apply_snapshot(blob)
+    try:
+        RT["snap_time"] = float(headers.get("X-Snapshot-Time") or 0)
+    except ValueError:
+        RT["snap_time"] = 0
     RT["synced_at"] = time.time()
+    if not since:
+        RT["full_at"] = RT["synced_at"]
     return n
 
 
@@ -407,6 +438,7 @@ def control_local(action, commit=None):
         if S["role"] != "replica":
             raise ValueError("only the replica copies data")
         RT["synced_at"] = 0   # the main loop syncs on its next check (within 2 s)
+        RT["snap_time"] = 0   # a full copy, not just the changes
         return "Copying the primary's data now."
     raise ValueError(f"unknown action {action!r}")
 
@@ -437,10 +469,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, code, body=b"", ctype="text/plain"):
+    def reply(self, code, body=b"", ctype="text/plain", headers=None):
         if isinstance(body, str):
             body = body.encode()
         self.send_response(code)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -486,7 +520,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(403, "forbidden\n")
             if S["role"] not in ("primary", "draining"):
                 return self.reply(409, f"not primary ({S['role']})\n")
-            return self.reply(200, make_snapshot(), "application/gzip")
+            try:
+                since = float(self.path.partition("since=")[2].split("&")[0] or 0)
+            except ValueError:
+                since = 0.0
+            t = time.time()   # taken before reading: anything written meanwhile goes out next time too
+            return self.reply(200, make_snapshot(since), "application/gzip", {"X-Snapshot-Time": f"{t:.3f}"})
         self.reply(404, "not found\n")
 
     def do_POST(self):

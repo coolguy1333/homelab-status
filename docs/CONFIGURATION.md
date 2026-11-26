@@ -181,6 +181,6 @@ In **Settings** (admin only):
 | `sessions.json` | signed-in sessions (hashed tokens) | on sign-in/out |
 | `admin-password.txt` | generated password | first start |
 
-Retention: individual check results are kept for **24 hours**; hourly summaries for **90 days**; the last 100 status events per monitor. A monitor checked every 60 s uses roughly 200 KB of history. Files are written atomically (temp file + rename), so a crash mid-write won't corrupt them. If a file is unreadable on startup it is renamed to `*.corrupt-<timestamp>` and a fresh one is started.
+Retention: individual check results are kept for **24 hours**; hourly summaries for **90 days**; the last 100 status events per monitor. A monitor checked every 60 s uses roughly 200 KB of history (every 20 s, the default since 2.14: about 600 KB). Files are written atomically (temp file + rename), so a crash mid-write won't corrupt them. If a file is unreadable on startup it is renamed to `*.corrupt-<timestamp>` and a fresh one is started.
 
 You can edit `monitors.json` by hand while the app is stopped.
