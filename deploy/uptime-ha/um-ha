@@ -342,6 +342,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def promote(why, failback=False):
     RT["failback_promoted_at"] = time.time() if failback else 0
     set_role("primary", now_ms(), why)
+    RT["synced_at"] = 0   # only meaningful on a replica
     start_app()
     RT["app_ok"] = wait_healthy(30)
     log("app is up" if RT["app_ok"] else "app did not answer /api/health within 30 s (still starting?)")
@@ -444,7 +445,9 @@ def step_replica():
 
     if RT["peer_bad_since"] and t - RT["peer_bad_since"] >= FAIL_AFTER and RT["peer_fails"] >= MIN_FAILS:
         if not gateway_up():
-            log(f"the peer is down, but so is the gateway {C['GATEWAY']}: not promoting (this server may be cut off)")
+            if t - RT.get("gw_logged", 0) >= 60:
+                RT["gw_logged"] = t
+                log(f"the peer is down, but so is the gateway {C['GATEWAY']}: not promoting (this server may be cut off)")
             return
         age = f"{t - RT['synced_at']:.0f} s old" if RT["synced_at"] else "never synced since start"
         promote(f"the peer has not been a healthy primary for {t - RT['peer_bad_since']:.0f} s "
