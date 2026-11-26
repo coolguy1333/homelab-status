@@ -438,10 +438,14 @@ def step_replica():
             log(f"peer check failed: {'no answer' if p is None else json.dumps(p)}")
         RT["peer_fails"] += 1
 
-    if role == "primary" and p.get("app") and t - RT["synced_at"] >= SYNC_EVERY:
+    # Keep copying while the peer is primary even if its app is unhealthy: whatever it saved before
+    # crashing or hanging is the freshest data there is.
+    if role == "primary" and t - RT["synced_at"] >= SYNC_EVERY:
         try:
             sync_from_peer()
-            if not RT["replica_ok_since"]:
+            if not p.get("app"):
+                RT["replica_ok_since"] = 0
+            elif not RT["replica_ok_since"]:
                 RT["replica_ok_since"] = t
         except (urllib.error.URLError, OSError, ValueError, tarfile.TarError) as e:
             log(f"sync from the peer failed: {e}")
