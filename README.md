@@ -1,7 +1,8 @@
 # Homelab Status
 
 Status and control panel for the homelab. It replaces [Uptime-Monitor](https://github.com/coolguy1333/Uptime-Monitor)
-and keeps all of its features (monitors, Google sign-in, webhook alerts, peers).
+and keeps its features (monitors, webhook alerts, peers). Sign-in is Cloudflare Access in front of the domain, and
+Claude can read everything the dashboard shows through a read-only connector at `$PUBLIC_URL/mcp`.
 
 | Page | What it shows |
 |---|---|
@@ -19,7 +20,7 @@ How it works: an agent on each Proxmox host (connector1 on GOD, connector2 on HE
 sites are checked), and looks for new services, tunnel hostnames and WebManager sites every 1–2 hours. These are plain
 scripts; Claude is only used for chat questions and unclear update reviews. Each night it snapshots, risk-reviews, updates, and health-checks every container, and rolls back if
 something broke. Security updates always go in. Risky updates and anything touching the host wait for **Approve**.
-Infrastructure pages require Google sign-in.
+Infrastructure pages require a Cloudflare Access sign-in ([docs/CLOUDFLARE_ACCESS.md](docs/CLOUDFLARE_ACCESS.md)).
 
 ## Where it runs
 
@@ -33,11 +34,12 @@ Add this repository as a source, choose **Deploy as an app**, then set the varia
 
 | Variable | Value |
 |---|---|
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth client. Redirect URI: `https://<your-domain>/api/auth/google/callback` |
-| `ADMIN_EMAILS` | Google accounts allowed in |
-| `ADMIN_PASSWORD` | Long random string (API token; password login is off when Google is set) |
+| `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` | Your Cloudflare Access team domain and the Access application's AUD tag ([docs/CLOUDFLARE_ACCESS.md](docs/CLOUDFLARE_ACCESS.md)) |
+| `PUBLIC_URL` | `https://<your-domain>`: also the address of the Claude connector (`/mcp`) |
+| `ADMIN_EMAILS` | optional: only these Access users count as admins |
+| `ADMIN_PASSWORD` | Long random string (API token for scripts) |
 | `AGENT_TOKENS` | `connector1:<token>,connector2:<token>`. Each token is in `/home/agent/agent/config.json` on its connector |
-| `PUBLIC_DASHBOARD` | `false` (default): everything requires Google sign-in |
+| `PUBLIC_DASHBOARD` | `false` (default): everything requires signing in |
 | `NOTIFY_WEBHOOK_URL` | optional Discord/Slack/ntfy for alerts (agent offline, rollbacks, approvals) |
 
 Then point each agent at the site (on each connector, as root):

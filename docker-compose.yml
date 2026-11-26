@@ -7,13 +7,13 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Leave empty to auto-generate one (see: docker compose logs uptime-monitor)
+      # API token for scripts. Leave empty to auto-generate one (see: docker compose logs uptime-monitor)
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       SITE_TITLE: ${SITE_TITLE:-Uptime Monitor}
       TZ: ${TZ:-UTC}
-      # Google sign-in (docs/GOOGLE_SIGNIN.md)
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # Sign-in: Cloudflare Access in front of the domain (docs/CLOUDFLARE_ACCESS.md)
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
       ADMIN_EMAILS: ${ADMIN_EMAILS:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
       # NOTIFY_WEBHOOK_URL: https://discord.com/api/webhooks/...

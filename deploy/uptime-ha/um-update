@@ -15,6 +15,7 @@ under um-ha's FAIL_AFTER, so an update never causes a failover. um-ha shows the 
 dashboard's Servers page, and it starts this with --check/--install when someone clicks there.
 """
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -35,7 +36,7 @@ REV = os.path.join(STATE_DIR, "installed-rev")
 AUTO = os.path.join(STATE_DIR, "auto-install")       # "0" = off; missing or anything else = on
 LOCK = os.path.join(STATE_DIR, "update.lock")
 BACKUPS = os.path.join(STATE_DIR, "backups")
-APP_FILES = ("server.js", "package.json", "lib", "public")
+APP_FILES = ("server.js", "package.json", "package-lock.json", "lib", "public", "node_modules")   # missing ones are skipped
 UNITS = ("um-ha.service", "um-update.service", "um-update.timer")
 ATTEMPT = {"commit": None}   # set once an install starts: a failure after that marks this commit as failed
 
@@ -165,6 +166,63 @@ def check():
                         message=f"Version {latest[:12]} is available.", detail=None)
 
 
+# ------------------------------------------------------------------ dependencies
+
+def lock_hash(tree):
+    try:
+        with open(os.path.join(tree, "package-lock.json"), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def install_deps(tree):
+    """npm ci --omit=dev in the source tree, skipped when node_modules already matches package-lock.json.
+    Without npm the app still runs, only the Claude connector (/mcp) is off: say so instead of failing the update."""
+    want = lock_hash(tree)
+    if not want:
+        return
+    stamp = os.path.join(tree, "node_modules", ".um-lock-sha256")
+    try:
+        if open(stamp).read().strip() == want:
+            return
+    except OSError:
+        pass
+    if not shutil.which("npm"):
+        log("npm is not installed (apt install npm): the app runs, but the Claude connector stays off until it is")
+        return
+    r = run(["npm", "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], timeout=600, cwd=tree)
+    if r.returncode:
+        raise RuntimeError(f"npm ci failed:\n{(r.stderr or r.stdout).strip()[-800:]}")
+    with open(stamp, "w") as f:
+        f.write(want + "\n")
+
+
+def repair_deps():
+    """The installed app lacks the node_modules its package-lock.json needs (the first install of 2.15 is done by
+    the old um-update, which didn't copy them): install them now and restart the app."""
+    want = lock_hash(SRC)   # the old um-update didn't copy package-lock.json either
+    if not want or not os.path.isdir(APP) or installed() != git("rev-parse", "HEAD"):
+        return
+    try:
+        if open(os.path.join(APP, "node_modules", ".um-lock-sha256")).read().strip() == want:
+            return
+    except OSError:
+        pass
+    install_deps(SRC)
+    if not os.path.exists(os.path.join(SRC, "node_modules", ".um-lock-sha256")):
+        return   # no npm: install_deps said so
+    shutil.copy2(os.path.join(SRC, "package-lock.json"), os.path.join(APP, "package-lock.json"))
+    d = os.path.join(APP, "node_modules")
+    shutil.rmtree(d + ".new", ignore_errors=True)
+    shutil.copytree(os.path.join(SRC, "node_modules"), d + ".new")
+    shutil.rmtree(d, ignore_errors=True)
+    os.rename(d + ".new", d)
+    log("installed the app's node_modules")
+    if app_active():
+        run(["systemctl", "restart", "uptime-monitor"], timeout=90)
+
+
 # ------------------------------------------------------------------ test
 
 def test_version(tree):
@@ -225,6 +283,8 @@ def copy_app(tree, dst):
     os.makedirs(dst, exist_ok=True)
     for n in APP_FILES:
         s, d = os.path.join(tree, n), os.path.join(dst, n)
+        if not os.path.exists(s):
+            continue
         if os.path.isdir(d):
             shutil.rmtree(d)
         (shutil.copytree if os.path.isdir(s) else shutil.copy2)(s, d)
@@ -256,6 +316,7 @@ def install(commit, manual):
                  message=f"Testing {commit[:12]}…", detail=None)
     git("reset", "-q", "--hard", commit)
     try:
+        install_deps(SRC)
         test_version(SRC)
     except Exception as e:
         if old:
@@ -338,6 +399,7 @@ def main():
             install(st["available_commit"], manual=False)
         else:
             log(st.get("message", ""))
+            repair_deps()
         return 0
     except Exception as e:
         msg = str(e)

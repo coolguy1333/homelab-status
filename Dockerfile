@@ -1,4 +1,4 @@
-# Uptime Monitor - tiny image, no npm install needed (zero dependencies).
+# Homelab Status - small image; one npm dependency (@modelcontextprotocol/sdk, for the Claude connector).
 FROM node:22-alpine
 
 # iputils gives a `ping` that works without root (ICMP datagram sockets).
@@ -6,7 +6,9 @@ RUN apk add --no-cache iputils tzdata \
  && mkdir -p /data && chown node:node /data
 
 WORKDIR /app
-COPY --chown=node:node package.json server.js ./
+COPY --chown=node:node package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
+COPY --chown=node:node server.js ./
 COPY --chown=node:node lib ./lib
 COPY --chown=node:node public ./public
 

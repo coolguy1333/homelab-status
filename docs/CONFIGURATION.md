@@ -8,6 +8,7 @@
 - [Self-monitoring](#self-monitoring)
 - [Peer servers (multi-server / federation)](#peer-servers-multi-server--federation)
 - [Dashboard settings](#dashboard-settings)
+- [Claude connector (MCP)](#claude-connector-mcp)
 - [Data files and retention](#data-files-and-retention)
 
 ## Environment variables
@@ -18,11 +19,13 @@ Set them in your shell, in Docker/Compose, in `/etc/uptime-monitor.env` (systemd
 |---|---|---|
 | `PORT` | `3000` | Port to listen on. |
 | `HOST` | `0.0.0.0` | Address to bind to. `127.0.0.1` = only reachable from the same machine (e.g. via a reverse proxy). |
-| `ADMIN_PASSWORD` | *(generated)* | Admin password and API token. When unset, the password in `DATA_DIR/admin-password.txt` is used; that file is created with a random password on first start. |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | | Turn on "Sign in with Google". See [GOOGLE_SIGNIN.md](GOOGLE_SIGNIN.md). |
-| `ADMIN_EMAILS` | | Comma-separated Google accounts allowed to sign in. `@example.com` allows a whole Google Workspace domain. |
-| `PUBLIC_URL` | | Public base URL (e.g. `https://status.example.com`). Used to build the Google redirect URI; also marks cookies `Secure` when it starts with `https://`. |
-| `PASSWORD_LOGIN` | auto | Password sign-in. Default: on without Google, off with Google. |
+| `CF_ACCESS_TEAM_DOMAIN` | | Your Cloudflare Zero Trust team domain, e.g. `yourteam.cloudflareaccess.com`. Sign-in is Cloudflare Access: see [CLOUDFLARE_ACCESS.md](CLOUDFLARE_ACCESS.md). |
+| `CF_ACCESS_AUD` | | The Access application's *Application Audience (AUD) Tag* (several, comma-separated). Without both variables nobody is signed in. |
+| `ADMIN_EMAILS` | | Optional. Comma-separated emails (`@example.com` = a whole domain) that count as admins, checked on top of the Access policy. Empty = whoever Access lets in. |
+| `ADMIN_PASSWORD` | *(generated)* | API token for scripts (`Authorization: Bearer ...`). When unset, the one in `DATA_DIR/admin-password.txt` is used; that file is created with a random token on first start. |
+| `PUBLIC_URL` | | Public base URL (e.g. `https://status.example.com`). Required for the [Claude connector](#claude-connector-mcp) (OAuth issuer, `/mcp` address). |
+| `MCP_ENABLED` | `true` | The Claude connector (`/mcp`, `/oauth/*`, `/.well-known/oauth-*`). `false` turns all of it off. |
+| `MCP_REDIRECT_ALLOWLIST` | Claude's callbacks | Comma-separated OAuth redirect URIs clients may register. Default: `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback`. |
 | `DATA_DIR` | `./data` | Storage folder. Relative paths are relative to the app folder. Docker image default: `/data`. systemd install: `/var/lib/uptime-monitor`. |
 | `SITE_TITLE` | `Uptime Monitor` | Site title used on first start. After that, change it in Settings. |
 | `SERVER_NAME` | site title | Name other servers show for this one when you run several ([peer servers](#peer-servers-multi-server--federation)). After the first start, change it in Settings. |
@@ -33,7 +36,7 @@ Set them in your shell, in Docker/Compose, in `/etc/uptime-monitor.env` (systemd
 | `PEERS` | | Comma-separated base URLs of other Uptime Monitor instances to federate with. See [Peer servers](#peer-servers-multi-server--federation). |
 | `PEER_TOKEN` | | Shared secret sent as `Authorization: Bearer <PEER_TOKEN>` between peers. Recommended whenever `PEERS` is set; use the same value on every server in the group. |
 
-**Changing the admin password:** set `ADMIN_PASSWORD` and restart, or edit `admin-password.txt` and restart. Existing sessions stay signed in; delete `sessions.json` and restart to sign everyone out.
+**Changing the API token:** set `ADMIN_PASSWORD` and restart, or edit `admin-password.txt` and restart.
 
 ## Monitor types
 
@@ -170,6 +173,42 @@ In **Settings** (admin only):
 - **Show URLs / IP addresses to public visitors** — off by default, so a public status page doesn't reveal your internal IPs. Logged-in admins always see them.
 - **Export / Import monitors** — JSON file with your monitor definitions (not history). Import adds to the existing list.
 
+## Claude connector (MCP)
+
+Claude can read everything the dashboard shows through a **read-only** MCP server at `$PUBLIC_URL/mcp`
+(Streamable HTTP, stateless, JSON responses). In Claude: **Settings → Connectors → Add custom connector**, URL
+`https://<your-domain>/mcp`. Claude registers itself, sends you to the **Approve / Deny** page (behind Cloudflare
+Access, naming the client and the host it returns to), and connects.
+
+**Needs:** `PUBLIC_URL`, Cloudflare Access with the bypasses in [CLOUDFLARE_ACCESS.md](CLOUDFLARE_ACCESS.md#2-let-the-machines-through-bypass)
+(`/mcp`, `/oauth/token`, `/oauth/register`, `/.well-known/`; **not** `/oauth/authorize`), and the npm dependency
+installed (`npm ci --omit=dev`; um-update does it, it needs `npm` on the container). Cloudflare's **Block AI Bots**
+and **Bot Fight Mode** block Claude's connector: turn them off for the zone, or add IP Access rules allowing
+Anthropic's outbound ranges **160.79.104.0/21** and **153.61.208.0/20**.
+
+**What it can see** (14 tools, all `readOnlyHint`): `get_overview` (the Overview's needs-attention list and counts,
+version, HA role), `list_monitors`, `get_monitor`, `list_agents`, `list_containers`, `list_approvals`,
+`list_update_runs`, `get_update_run`, `get_backups`, `list_events`, `get_agent_logs`, `get_claude_usage`,
+`list_services`, `get_ha_status`. Details in [API.md](API.md#claude-connector-mcp). There are no write tools: it
+can't approve, update, restart or ask the agents anything.
+
+**What it never sees:** agent tokens, `ADMIN_PASSWORD`, `PEER_TOKEN`, webhook URLs, sign-in or OAuth data, and the
+content of your chats and tasks with the agents (usage rows of chat questions are labelled "chat message", and the
+agent log line that quotes a chat question is cut).
+
+**Auth:** OAuth 2.1 run by this app: dynamic client registration, authorization code with PKCE (S256 only),
+redirect URIs limited to `MCP_REDIRECT_ALLOWLIST`. Access tokens last 1 hour, refresh tokens 30 days and rotate on
+every use; the previous refresh token keeps working for 2 minutes, so a failover right after a refresh doesn't
+disconnect Claude. Only SHA-256 hashes are stored, in `oauth.json`, which um-ha copies to the replica like the other
+files. Cloudflare Access cookies and `ADMIN_PASSWORD` are **not** accepted on `/mcp`.
+
+**Limits and logs:** 60 calls per minute per client; lists return 50 items by default (at most 200) with `offset`
+paging. Every tool call is logged as `[mcp] <tool> by <client> (<email>) <ms> ms`, never with arguments or results.
+
+**Disconnect:** Settings → **Connected clients** → Revoke. That kills its tokens at once; Claude has to be
+connected again. Removing an email from `ADMIN_EMAILS` also cuts its connector off. Removing someone from the
+Access policy does **not** (the connector doesn't go through Access): revoke it here too.
+
 ## Data files and retention
 
 | File | Contents | Written |
@@ -178,8 +217,8 @@ In **Settings** (admin only):
 | `settings.json` | dashboard settings, webhooks | on change |
 | `history.json` | check results and events | every 30 s and on shutdown |
 | `self.json` | heartbeat, outages, server events | every 15 s |
-| `sessions.json` | signed-in sessions (hashed tokens) | on sign-in/out |
-| `admin-password.txt` | generated password | first start |
+| `oauth.json` | Claude connector: registered clients, grants, SHA-256 hashes of codes and tokens | on connect, refresh, revoke |
+| `admin-password.txt` | generated API token | first start |
 
 Retention: individual check results are kept for **24 hours**; hourly summaries for **90 days**; the last 100 status events per monitor. A monitor checked every 60 s uses roughly 200 KB of history (every 20 s, the default since 2.14: about 600 KB). Files are written atomically (temp file + rename), so a crash mid-write won't corrupt them. If a file is unreadable on startup it is renamed to `*.corrupt-<timestamp>` and a fresh one is started.
 

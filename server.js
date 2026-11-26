@@ -2,8 +2,8 @@
 'use strict';
 /*
  * Homelab Status - hosts, containers, updates, backups and uptime (based on Uptime Monitor).
- * Zero dependencies: needs only Node.js 18+.
- *   node server.js
+ * Needs Node.js 18+ and one dependency (@modelcontextprotocol/sdk, for the Claude connector at /mcp):
+ *   npm ci --omit=dev && node server.js
  * See README.md for configuration.
  */
 const http = require('http');
@@ -19,11 +19,14 @@ const { Store, DAY } = require('./lib/store');
 const { Notifier } = require('./lib/notify');
 const { Scheduler } = require('./lib/scheduler');
 const { SelfTracker } = require('./lib/self');
-const { Auth, AuthError } = require('./lib/auth');
+const { Auth } = require('./lib/auth');
 const { HOST_RE } = require('./lib/checks');
 const { PeerHub } = require('./lib/peers');
 const { mergeMonitors } = require('./lib/sync');
 const { Infra } = require('./lib/infra');
+const { OAuthStore, DEFAULT_REDIRECTS } = require('./lib/oauth');
+const { Connector } = require('./lib/connector');
+const { createTools } = require('./lib/mcp');
 
 const truthy = v => /^(1|true|yes|on)$/i.test(String(v || '').trim());
 
@@ -51,6 +54,11 @@ const PEER_TOKEN = (process.env.PEER_TOKEN || '').trim();
 // um-ha (deploy/uptime-ha) on this machine: the Servers page shows both status servers through it and asks it to
 // update either one. Not set up (e.g. running on WebManager or Docker): the page says so.
 const UM_HA_URL = (process.env.UM_HA_URL || 'http://127.0.0.1:8099').replace(/\/+$/, '');
+// Claude connector (read-only MCP server at /mcp with its own OAuth). Needs PUBLIC_URL and Cloudflare Access.
+const MCP_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.MCP_ENABLED ?? 'true').trim());
+const MCP_REDIRECT_ALLOWLIST = process.env.MCP_REDIRECT_ALLOWLIST
+  ? process.env.MCP_REDIRECT_ALLOWLIST.split(',').map(s => s.trim()).filter(Boolean)
+  : DEFAULT_REDIRECTS;
 
 const settingsDefaults = {};
 if (process.env.SITE_TITLE) settingsDefaults.title = process.env.SITE_TITLE;
@@ -63,7 +71,16 @@ const scheduler = new Scheduler(store, notifier);
 const selfTracker = new SelfTracker(store, notifier);
 const auth = new Auth(DATA_DIR);
 const infra = new Infra(DATA_DIR, notifier);
-auth.revokeDisallowed();
+let oauth = null, connector = null;
+if (MCP_ENABLED && !PUBLIC_URL) console.warn('[mcp] The Claude connector needs PUBLIC_URL (its OAuth issuer and /mcp address): it is off until PUBLIC_URL is set.');
+if (MCP_ENABLED && PUBLIC_URL) {
+  oauth = new OAuthStore(DATA_DIR, { redirectAllowlist: MCP_REDIRECT_ALLOWLIST, isAllowed: email => auth.isAllowedEmail(email) });
+  connector = new Connector({
+    publicUrl: PUBLIC_URL, auth, oauth, version: VERSION,
+    tools: createTools({ store, infra, version: VERSION, umHaUrl: UM_HA_URL }),
+    clientIp: req => clientIp(req), isSecure: req => isSecure(req),
+  });
+}
 const peerHub = new PeerHub(store, {
   urls: PEER_URLS,
   token: PEER_TOKEN,
@@ -363,7 +380,7 @@ const MIME = {
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
-  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.googleusercontent.com; connect-src 'self'; form-action 'self'; base-uri 'none'" +
+  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'" +
     (ALLOW_EMBED ? '' : "; frame-ancestors 'none'"),
   ...(ALLOW_EMBED ? {} : { 'X-Frame-Options': 'DENY' }),
 };
@@ -378,11 +395,6 @@ function send(res, status, body, headers = {}) {
     ...headers,
   });
   res.end(payload);
-}
-
-function redirect(res, location, headers = {}) {
-  res.writeHead(302, { ...SECURITY_HEADERS, Location: location, 'Cache-Control': 'no-store', ...headers });
-  res.end();
 }
 
 function readBody(req, limit = 100 * 1024) {
@@ -423,13 +435,6 @@ function isSecure(req) {
   if (req.socket.encrypted) return true;
   if (PUBLIC_URL.startsWith('https://')) return true;
   return TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
-}
-
-// Base URL of this site as seen by the browser (used for the Google redirect URI).
-function baseUrl(req) {
-  if (PUBLIC_URL) return PUBLIC_URL;
-  const host = (TRUST_PROXY && req.headers['x-forwarded-host']) || req.headers.host || `localhost:${PORT}`;
-  return `${isSecure(req) ? 'https' : 'http'}://${String(host).split(',')[0].trim()}`;
 }
 
 // CDNs/proxies in front of the app (e.g. WebManager's Cloudflare) can cache app.js and style.css for
@@ -514,50 +519,7 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ...base, ...statusParts(authed) });
   }
 
-  // ---- password login
-  if (p === '/api/login' && method === 'POST') {
-    if (needJson()) return;
-    if (!auth.passwordLogin) return send(res, 403, { error: 'Password login is disabled. Sign in with Google.' });
-    const ip = clientIp(req);
-    if (auth.loginBlocked(ip)) return send(res, 429, { error: 'Too many wrong passwords - wait a minute and try again' });
-    const body = await readBody(req);
-    if (!auth.check(body.password)) { auth.loginFailed(ip); return send(res, 401, { error: 'Wrong password' }); }
-    auth.loginSucceeded(ip);
-    const token = auth.createSession({ method: 'password', name: 'Admin' });
-    return send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookie(token, isSecure(req)) });
-  }
-
-  // ---- Google sign-in
-  if (p === '/api/auth/google' && method === 'GET') {
-    const home = PUBLIC_URL ? `${PUBLIC_URL}/` : '../../';
-    if (!auth.google) return redirect(res, `${home}?login_error=google_disabled`);
-    const ip = clientIp(req);
-    if (auth.starts.blocked(ip)) return redirect(res, `${home}?login_error=rate_limited`);
-    auth.starts.hit(ip);
-    const { url: googleUrl, cookie } = auth.googleStart(`${baseUrl(req)}/api/auth/google/callback`, isSecure(req));
-    return redirect(res, googleUrl, { 'Set-Cookie': cookie });
-  }
-
-  if (p === '/api/auth/google/callback' && method === 'GET') {
-    const home = PUBLIC_URL ? `${PUBLIC_URL}/` : '../../../';
-    const clear = auth.clearStateCookie(isSecure(req));
-    try {
-      const u = await auth.googleCallback(req, url.searchParams);
-      const token = auth.createSession(u);
-      return redirect(res, home, { 'Set-Cookie': [clear, auth.cookie(token, isSecure(req))] });
-    } catch (err) {
-      const code = err instanceof AuthError ? err.code : 'google_error';
-      if (!(err instanceof AuthError)) console.error('[auth]', err);
-      return redirect(res, `${home}?login_error=${encodeURIComponent(code)}`, { 'Set-Cookie': clear });
-    }
-  }
-
-  if (p === '/api/logout' && method === 'POST') {
-    if (needJson()) return;
-    const token = auth.tokenFrom(req);
-    if (token) auth.destroySession(token);
-    return send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookie(null, isSecure(req)) });
-  }
+  // Signing in and out happens at Cloudflare Access (the dashboard links to /cdn-cgi/access/logout).
 
   // ---- settings
   if (p === '/api/settings') {
@@ -567,7 +529,7 @@ async function handleApi(req, res, url) {
         ...store.settings,
         envWebhooks: Boolean(process.env.NOTIFY_WEBHOOK_URL),
         peers: { count: PEER_URLS.length, sync: SYNC_MONITORS },
-        auth: { ...auth.methods(), adminEmails: auth.google ? auth.google.admins : [], passwordSource: auth.source },
+        auth: { ...auth.methods(), adminEmails: auth.admins, tokenSource: auth.source },
       });
     }
     if (method === 'PUT') {
@@ -591,6 +553,19 @@ async function handleApi(req, res, url) {
       return send(res, 200, s);
     }
     return send(res, 405, { error: 'Method not allowed' });
+  }
+
+  // ---- Claude connector: the clients connected through OAuth (Settings → Connected clients)
+  if (p === '/api/oauth/clients' && method === 'GET') {
+    if (needAuth()) return;
+    return send(res, 200, { enabled: Boolean(connector), url: connector ? `${PUBLIC_URL}/mcp` : null, reason: connector ? null : !MCP_ENABLED ? 'MCP_ENABLED is off' : 'PUBLIC_URL is not set', clients: oauth ? oauth.connected() : [] });
+  }
+  const oc = p.match(/^\/api\/oauth\/clients\/(hsc_[a-f0-9]{32})$/);
+  if (oc && method === 'DELETE') {
+    if (needAuth()) return;
+    if (!oauth || !oauth.revokeClient(oc[1])) return send(res, 404, { error: 'Client not found' });
+    console.log(`[oauth] ${user.email || user.name || 'admin'} revoked client ${oc[1].slice(0, 12)}…`);
+    return send(res, 200, { ok: true });
   }
 
   if (p === '/api/settings/test-notification' && method === 'POST') {
@@ -820,6 +795,7 @@ const server = http.createServer(async (req, res) => {
   try { url = new URL(req.url, 'http://localhost'); } catch { return send(res, 400, 'Bad request'); }
   try {
     if (url.pathname === '/api' || url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (connector && await connector.handle(req, res, url)) return;
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
     return serveStatic(req, res, url.pathname);
   } catch (err) {
@@ -858,19 +834,16 @@ server.listen(PORT, HOST, () => {
   console.log(infra.enabled ? `Infrastructure agents: ${[...infra.tokens.keys()].join(', ')}` : 'Infrastructure agents: none (set AGENT_TOKENS)');
   if (PEER_URLS.length) console.log(`Federated with ${PEER_URLS.length} peer server(s): ${PEER_URLS.join(', ')} (monitor sync ${SYNC_MONITORS ? 'on' : 'off - set PEER_TOKEN'})`);
   const m = auth.methods();
-  if (m.google) {
-    console.log(`Google sign-in: enabled for ${auth.google.admins.join(', ') || '(nobody - set ADMIN_EMAILS)'}`);
-    console.log(`  Authorized redirect URI to register in Google Cloud: ${PUBLIC_URL || `http://localhost:${PORT}`}/api/auth/google/callback`);
-  }
-  console.log(`Password login: ${m.password ? 'enabled' : 'disabled'} (API bearer token still works)`);
+  console.log(m.cloudflare ? `Sign-in: Cloudflare Access (${m.team})${auth.admins.length ? `, limited to ${auth.admins.join(', ')}` : ''}` : 'Sign-in: none - set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD');
+  if (connector) console.log(`Claude connector: ${PUBLIC_URL}/mcp${m.cloudflare ? '' : ' (needs Cloudflare Access to connect)'}`);
   if (auth.generated) {
     console.log('');
-    console.log('  An admin password / API token was generated for you:');
+    console.log('  An API token (ADMIN_PASSWORD) was generated for you:');
     console.log(`    ${auth.password}`);
     console.log(`  It is saved in ${auth.source}. Set ADMIN_PASSWORD to use your own.`);
     console.log('');
   } else {
-    console.log(`Admin password source: ${auth.source}`);
+    console.log(`API token (ADMIN_PASSWORD) source: ${auth.source}`);
   }
 });
 
@@ -882,6 +855,7 @@ function shutdown(signal) {
   scheduler.stop();
   peerHub.stop();
   infra.stop();
+  if (oauth) { oauth.stop(); oauth.save(); }
   store.saveHistory(true);
   selfTracker.shutdown();
   server.close(() => process.exit(0));
