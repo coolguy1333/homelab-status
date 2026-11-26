@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.10.3
+
+Backup server card redesigned (Overview and Backups).
+
+- It gets its own full-width row under the Proxmox hosts, with two columns: storage, stats and server health on the
+  left; jobs and problems on the right. Host cards no longer stretch to its height with empty space.
+- Failed PBS tasks are grouped: the same job failing every hour is one line ("Verify job · WD-8tb:v-… · 7×,
+  last 2h ago") instead of a long list. The full list is under "All N failed tasks" as a compact table.
+- Warnings (e.g. garbage collection "WARNINGS: 2") show amber instead of red; jobs that haven't run yet show grey.
+- Stat tiles no longer cut their labels off ("guests (23…"); they show 4 in a row, or 2×2 when narrow.
+- Times read "2m ago" / "1h ago" instead of "2m 0s ago" / "1h 0m ago" everywhere.
+
 ## 2.10.2
 
 Fixed: logs and activity disappearing.
