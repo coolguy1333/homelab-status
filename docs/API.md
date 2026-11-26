@@ -40,6 +40,7 @@ Read endpoints (`/api/status`, `GET /api/monitors/:id`) are public when *Public 
 | GET | `/api/infra` | admin | Agents (reports, tasks, decisions, nightly `policy`, live update `progress`), internal services and chats. |
 | POST | `/api/infra/:agent/actions` | admin | `{"type", "vmid"}`. Container types: `start`, `shutdown`, `reboot`, `snapshot`, `backup`, `check`, `update`, `update-security`. Host types (no `vmid`): `update-all`, `update-all-security`, `check-updates`. |
 | GET | `/api/infra/:agent/logs` | admin | The newest lines (up to 1000) of that agent's `~/agent/logs/agent.log`: `{ "lines": [{ "t", "p" (process), "l" (info/warn/error), "m" }] }` (agent 1.9+). |
+| GET | `/api/infra/:agent/events` | admin | The agent's event history kept by the dashboard (what Activity shows): up to 3000 events, 30 days. |
 | GET | `/api/infra/:agent/runs/:id` | admin | One update run's full log (`/api/infra` lists the runs under each agent's `runs`). |
 | POST | `/api/infra/:agent/policy` | admin | `{"securityOnly": true}` makes that host's nightly run install security updates only (agent 1.9+). |
 | POST | `/api/infra/:agent/decision` | admin | `{"id", "decision": "approve" \| "deny", "packages"?: [...]}` for an item waiting for approval. |

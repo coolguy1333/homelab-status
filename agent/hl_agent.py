@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -145,7 +145,7 @@ def state():
         s = read_state()
         yield s
         # bound everything
-        s["events"] = s["events"][-300:]
+        s["events"] = s["events"][-500:]
         s["updateRuns"] = s["updateRuns"][-30:]
         cutoff = now_ms() - 14 * 86400e3
         s["tasks"] = {k: v for k, v in s["tasks"].items() if v.get("t", 0) > cutoff or v.get("status") == "running"}
@@ -789,7 +789,9 @@ def build_report(s, host, containers):
              for t in s["tasks"].values() if not t.get("internal")]
     pending = sorted(s["pending"].values(), key=lambda p: p["t"])
     internal = [t for t in s["tasks"].values() if t.get("internal")]
-    events = list(s["events"][-100:])
+    # Every event since the last report all dashboards received (the dashboard keeps the history; this covers the gap).
+    since = (s.get("reportedUpTo") or 0) - 60e3
+    events = [e for e in s["events"] if e["t"] > since][-500:] or list(s["events"][-50:])
     return {
         "agent": CFG["name"], "agentVersion": VERSION, "generatedAt": now_ms(),
         "host": host, "containers": containers, "pending": pending,
@@ -803,8 +805,9 @@ def build_report(s, host, containers):
                      "securityOnly": bool((s.get("policy") or {}).get("securityOnly"))},
         "policy": s.get("policy"),
         "progress": s.get("progress"),
-        # Full logs only for recent runs (the dashboard stores them); older ones as a summary line.
-        "runLogs": [r if (r.get("end") or 0) > now_ms() - 30 * 60e3 else {k: v for k, v in r.items() if k != "log"}
+        # A run's full log is resent until every dashboard says it has stored it (runLogsHave in its reply),
+        # so a dashboard that was restarting or offline when the run finished still gets it.
+        "runLogs": [r if run_log_needed(s, r.get("id")) else {k: v for k, v in r.items() if k != "log"}
                     for r in (s.get("runLogs") or [])[-10:]],
         "logs": log_tail(300),
         "usage": usage_report(s),
@@ -922,11 +925,20 @@ def cmd_report(send=True):
         print(json.dumps(report, indent=2))
         return
     replies = []
+    have = {}
     for url in CFG["site_urls"]:
         try:
-            replies.append(post(url, report))
+            r = post(url, report)
+            replies.append(r)
+            if isinstance(r.get("runLogsHave"), list):
+                have[url] = [str(x) for x in r["runLogsHave"]][:200]
         except (urllib.error.URLError, OSError, ValueError) as e:
             log(f"report to {url} failed: {e}")
+    with state() as s:
+        if have:
+            s.setdefault("runLogsHave", {}).update(have)
+        if len(replies) == len(CFG["site_urls"]):  # every dashboard got this report's events
+            s["reportedUpTo"] = report["generatedAt"]
     handle_replies(replies)
 
 
@@ -1658,6 +1670,12 @@ def progress_end(level=None, summary=""):
     OWN_RUN = None
     sync_now()
     return lines
+
+
+def run_log_needed(s, run_id):
+    """Does any dashboard still lack this run's full log? (Unknown = yes: send it.)"""
+    acks = s.get("runLogsHave") or {}
+    return any(run_id not in (acks.get(url) or []) for url in CFG["site_urls"])
 
 
 def fmt_log(lines):

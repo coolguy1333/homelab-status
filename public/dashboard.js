@@ -77,6 +77,7 @@ const Dash = (() => {
     askChat: null, askTo: '_all',       // open chat ('new' or an id) and who a new chat goes to
     askFilter: '', askQ: '', askPane: 'list', stickBottom: false,
     logf: { agent: '', level: '', q: '' }, logLines: {}, logsAt: 0, logsLoading: false, logErr: null,
+    evLines: {}, evAt: 0, evLoading: false, actLimit: 300,
     filters: { host: '', status: '', q: '', level: '', ahost: '', upd: '' },
   };
 
@@ -990,6 +991,16 @@ const Dash = (() => {
     } catch (err) { st.logErr = err.message; st.logsAt = Date.now(); } finally { st.logsLoading = false; }
   }
 
+  // Activity history kept by the dashboard (survives restarts; reports only carry the newest events).
+  async function loadEvents() {
+    if (st.evLoading) return;
+    st.evLoading = true;
+    try {
+      const ag = agents().filter(a => a.report);
+      await Promise.all(ag.map(async a => { st.evLines[a.name] = (await api(`api/infra/${encodeURIComponent(a.name)}/events`)).events || []; }));
+    } catch { /* older server: Activity falls back to the events in the reports */ } finally { st.evAt = Date.now(); st.evLoading = false; }
+  }
+
   function runRows(list) {
     return list.map(({ a, r }) => `<tr><td>${esc(fmtDate(r.t))}</td><td>${esc(hostOf(a))}</td><td class="wrap"><b>${esc(r.title)}</b>${r.summary ? `<div class="muted small">${esc(r.summary)}</div>` : ''}</td>
       <td>${runTag(r.level)}</td><td class="num">${r.kind === 'run' ? `${r.done}/${r.total}` : ''}</td><td class="num">${r.end && r.t ? esc(duration((r.end - r.t) / 1000)) : '—'}</td>
@@ -1008,7 +1019,7 @@ const Dash = (() => {
     const total = lines.length;
     if (f.level) lines = lines.filter(l => l.l !== 'info');
     if (f.q) { const q = f.q.toLowerCase(); lines = lines.filter(l => `${l.m} ${l.p}`.toLowerCase().includes(q)); }
-    lines = lines.slice(-800);
+    lines = lines.slice(-1500);
     const old = sel.filter(a => !verGte(a.report.agentVersion, '1.9.0'));
     const runs = [];
     for (const a of sel) for (const r of (a.runs || [])) runs.push({ a, r });
@@ -1060,19 +1071,27 @@ const Dash = (() => {
   function viewActivity() {
     const f = st.filters;
     const items = [];
+    if (!st.evAt && !st.evLoading) loadEvents().then(rerender);
     for (const a of agents()) {
       const r = a.report || {};
-      for (const e of (r.events || [])) items.push({ t: e.t, level: e.level, host: hostOf(a), msg: e.msg });
+      const seen = new Set();
+      for (const e of [...(st.evLines[a.name] || []), ...(r.events || [])]) {
+        if (e.id && seen.has(e.id)) continue;
+        if (e.id) seen.add(e.id);
+        items.push({ t: e.t, level: e.level, host: hostOf(a), msg: e.msg });
+      }
       for (const u of (r.updateRuns || [])) items.push({ t: u.t, level: u.level, host: hostOf(a), msg: `Update run: ${u.summary}` });
     }
     let list = items.sort((x, y) => y.t - x.t);
     if (f.ahost) list = list.filter(i => i.host === f.ahost);
     if (f.level) list = list.filter(i => (f.level === 'problems' ? i.level !== 'info' : true));
-    const li = list.slice(0, 300).map(i => `<li><time>${esc(fmtDate(i.t))}</time>${levelTag(i.level)}<span><b>${esc(i.host)}</b> <span class="pre-line">${esc(i.msg)}</span></span></li>`).join('');
+    const shown = list.slice(0, st.actLimit);
+    const li = shown.map(i => `<li><time>${esc(fmtDate(i.t))}</time>${levelTag(i.level)}<span><b>${esc(i.host)}</b> <span class="pre-line">${esc(i.msg)}</span></span></li>`).join('');
     return `${pageHead('Activity', 'Everything the agents did or noticed: restarts, updates, rollbacks, approvals, backup failures.')}
       <div class="toolbar">${hostFilter('ahost')}
         <div class="seg" data-filter="level">${[['', 'Everything'], ['problems', 'Warnings & errors']].map(([v, l]) => `<button class="${f.level === v ? 'on' : ''}" data-val="${v}">${l}</button>`).join('')}</div></div>
-      <div class="card pad">${li ? `<ul class="events">${li}</ul>` : '<p class="muted">Nothing yet.</p>'}</div>`;
+      <div class="card pad">${li ? `<ul class="events">${li}</ul>` : '<p class="muted">Nothing yet.</p>'}
+        ${list.length > shown.length ? `<div class="center more-row"><button class="btn small" data-actmore>Show older (${list.length - shown.length} more)</button></div>` : list.length ? `<p class="muted center small">${list.length} entries · kept for 30 days</p>` : ''}</div>`;
   }
 
   // ------------------------------------------------------------ navigation & render
@@ -1153,9 +1172,10 @@ const Dash = (() => {
   // The Logs page tails the agent logs.
   setInterval(async () => {
     const d = typeof state !== 'undefined' && state.data;
-    if (!enabled(d) || document.hidden || currentView(d) !== 'logs' || document.querySelector('dialog[open]') || Date.now() - st.logsAt < 4500) return;
-    await loadLogs();
-    rerender();
+    if (!enabled(d) || document.hidden || document.querySelector('dialog[open]')) return;
+    const v = currentView(d);
+    if (v === 'logs' && Date.now() - st.logsAt >= 4500) { await loadLogs(); rerender(); }
+    if (v === 'activity' && Date.now() - st.evAt >= 20000) { await loadEvents(); rerender(); }
   }, 5000);
 
   document.addEventListener('toggle', e => {
@@ -1291,6 +1311,7 @@ const Dash = (() => {
       openLogDialog(vo.dataset.title || 'Output', '', `<pre class="ld-pre">${esc(text)}</pre>`, text, `action-${vo.dataset.viewout}.log`);
       return;
     }
+    if (e.target.closest('[data-actmore]')) { st.actLimit += 300; rerender(); return; }
     if (e.target.closest('[data-logcopy], [data-logdl]')) {
       const sel = st.logf.agent ? agents().filter(a => a.name === st.logf.agent) : agents();
       const lines = [];

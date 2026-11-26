@@ -755,3 +755,4 @@ a.head-status:hover { filter: brightness(.95); }
 @media (max-width: 760px) { .ct-updates .sub-host, .ct-backups .sub-host { display: block; padding-left: 16px; } }
 /* "nothing here" rows span the table: let them wrap */
 .ctable td[colspan] { white-space: normal; }
+.more-row { margin-top: 10px; }

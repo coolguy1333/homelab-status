@@ -748,10 +748,11 @@ async function handleApi(req, res, url) {
     return send(res, 405, { error: 'Method not allowed' });
   }
   // Agent logs and update-run logs (read only).
-  const lm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(logs|runs\/([a-f0-9]{6,32}))$/);
+  const lm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(logs|events|runs\/([a-f0-9]{6,32}))$/);
   if (lm && method === 'GET') {
     if (needAuth()) return;
     if (lm[3]) return send(res, 200, infra.runLog(lm[1], lm[3]));
+    if (lm[2] === 'events') return send(res, 200, { agent: lm[1], events: infra.agentEvents(lm[1]) });
     return send(res, 200, { agent: lm[1], lines: infra.agentLogs(lm[1]) });
   }
   const gm = p.match(/^\/api\/infra\/_all\/groups\/(g[a-f0-9]{10})$/);
