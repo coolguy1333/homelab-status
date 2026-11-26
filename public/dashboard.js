@@ -90,7 +90,14 @@ const Dash = (() => {
     await srv;
   }
   async function loadServers() {
-    try { st.servers = await api('api/servers'); } catch (err) { st.servers = { available: false, error: err.message }; }
+    let next;
+    try { next = await api('api/servers'); } catch (err) { next = { available: false, error: err.message }; }
+    // An update restarts the app and um-ha for a second or two: keep showing the last good data meanwhile
+    // instead of flashing "not running on the um-ha pair".
+    const prev = st.servers;
+    if (!next.available && prev && prev.available && Date.now() - (st.serversOkAt || 0) < 60e3) { st.serversAt = Date.now(); return; }
+    st.servers = next;
+    if (next.available) st.serversOkAt = Date.now();
     st.serversAt = Date.now();
   }
   const enabled = d => Boolean(d && d.authed && d.infra && !d.locked);
@@ -106,6 +113,9 @@ const Dash = (() => {
   const svcFor = (agent, vmid) => services().filter(s => s.agent === agent && s.vmid === vmid);
   const HOUR = 3600e3;
   const backupAge = c => (c.backup && c.backup.last ? Date.now() - c.backup.last.t : null);
+  // A vzdump run that finished with "WARNINGS: n" did back everything up (e.g. a VM without an efidisk): it is a
+  // warning, not a failed run.
+  const runState = t => (t.status === 'OK' ? 'ok' : t.status === 'running' ? 'running' : /^WARNINGS?:/i.test(t.status || '') ? 'warn' : 'failed');
   const backupState = c => {
     const b = c.backup || {};
     if (!b.covered) return b.last ? 'uncovered' : 'none';
@@ -129,8 +139,11 @@ const Dash = (() => {
       if (a.progress) push(progStale(a.progress) ? 'warn' : 'info', progStale(a.progress) ? `Update run on ${hostOf(a)} has not reported progress for a while` : `Updating on ${hostOf(a)}: ${a.progress.kind === 'run' ? `${a.progress.done}/${a.progress.total} containers · ` : ''}${progNow(a.progress)}`, 'updates');
       if (r.host && r.host.rebootRequired) push('info', `${hostOf(a)} needs a reboot to finish updates`, 'updates');
       for (const s of (r.host && r.host.storage) || []) if (s.total && s.used / s.total >= 0.9) push('warn', `${hostOf(a)} storage ${s.name} is ${Math.round(s.used / s.total * 100)}% full`, 'overview');
-      const failed = ((r.backups && r.backups.tasks) || []).filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR);
+      const recent = ((r.backups && r.backups.tasks) || []).filter(t => Date.now() - t.t < 24 * HOUR);
+      const failed = recent.filter(t => runState(t) === 'failed');
+      const warned = recent.filter(t => runState(t) === 'warn');
       if (failed.length) push('err', `${failed.length} backup run${failed.length > 1 ? 's' : ''} failed on ${hostOf(a)} in the last 24 h`, 'backups');
+      if (warned.length) push('warn', `${warned.length} backup run${warned.length > 1 ? 's' : ''} on ${hostOf(a)} finished with warnings in the last 24 h`, 'backups');
     }
     for (const it of serverProblems()) push(it.level, it.text, 'servers');
     for (const c of coreServers()) {
@@ -525,7 +538,7 @@ const Dash = (() => {
     if (x.role === 'primary') return `<span class="pill">primary</span> <span class="muted">${x.app ? 'serving this dashboard' : '<span class="pct-bad">app not answering</span>'}${x.epoch > 1 ? ` · since ${esc(ago(x.epoch))}` : ''}</span>`;
     if (x.role === 'draining') return '<span class="pill warn">handing over</span>';
     const age = x.syncedAt && x.time ? (x.time - x.syncedAt) / 1000 : null;
-    return `<span class="pill">replica</span> <span class="muted">${age == null ? 'not synced yet' : `data copied ${age < 10 ? 'just now' : `${duration(age)} ago`}`} · takes over after ${sv.failAfter || 60} s</span>`;
+    return `<span class="pill">replica</span> <span class="muted">${age == null ? 'not synced yet' : `data copied ${age < 10 ? 'just now' : `${duration(age)} ago`}`} · takes over after ${sv.failAfter || 60}&nbsp;s</span>`;
   }
 
   function updateLine(x, own) {
@@ -797,7 +810,7 @@ const Dash = (() => {
     const tasks = [];
     for (const a of agents()) for (const t of ((a.report && a.report.backups && a.report.backups.tasks) || [])) tasks.push({ ...t, host: hostOf(a) });
     tasks.sort((x, y) => y.t - x.t);
-    const failed24 = tasks.filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR).length;
+    const failed24 = tasks.filter(t => runState(t) === 'failed' && Date.now() - t.t < 24 * HOUR).length;
     const jobs = new Map();
     for (const a of agents()) for (const j of ((a.report && a.report.backups && a.report.backups.jobs) || [])) {
       const prev = jobs.get(j.id);
@@ -831,8 +844,8 @@ const Dash = (() => {
         <td class="num">${b.count || 0}</td><td class="num">${snaps || '<span class="muted">0</span>'}</td></tr>`;
     }).join('');
 
-    const taskRows = tasks.slice(0, 30).map(t => `<li><time>${esc(fmtDate(t.t))}</time>${t.status === 'OK' ? tag('up', 'ok') : t.status === 'running' ? tag('restart', 'running') : tag('down', 'failed')}
-      <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${t.status !== 'OK' && t.status !== 'running' ? ` — <span class="pct-bad">${esc(t.status)}</span>` : ''}</span></li>`).join('');
+    const taskRows = tasks.slice(0, 30).map(t => `<li><time>${esc(fmtDate(t.t))}</time>${{ ok: tag('up', 'ok'), running: tag('restart', 'running'), warn: tag('restart', 'warning') }[runState(t)] || tag('down', 'failed')}
+      <span><b>${esc(t.host)}</b> ${t.vmid ? `guest ${t.vmid}` : 'backup job'}${t.end ? ` · ${duration((t.end - t.t) / 1000)}` : ''}${runState(t) === 'failed' || runState(t) === 'warn' ? ` — <span class="${runState(t) === 'warn' ? 'pct-warn' : 'pct-bad'}">${esc(t.status)}</span>` : ''}</span></li>`).join('');
 
     const servers = pbsServers();
     const offline = [...new Set(agents().flatMap(a => (a.report && a.report.backups && a.report.backups.unreachableStorage) || []))];

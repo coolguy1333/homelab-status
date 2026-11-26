@@ -56,7 +56,7 @@ DEFAULTS = {
     "DATA_DIR": "/var/lib/uptime-monitor", "APP_USER": "uptime",
     "GATEWAY": "192.168.10.1",
     "FAIL_AFTER": "60", "MIN_FAILS": "5", "FAILBACK_AFTER": "120", "HANDOVER_TIMEOUT": "60",
-    "FAILBACK_BACKOFF": "1800", "SYNC_EVERY": "5", "CHECK_EVERY": "2", "KEEP_BACKUPS": "5",
+    "FAILBACK_BACKOFF": "1800", "SYNC_EVERY": "5", "CHECK_EVERY": "2", "KEEP_BACKUPS": "8",
     "LABEL": "",   # shown on the Servers page, e.g. "GOD · CT 214"
 }
 STATUS_EVERY = 10   # seconds between fetches of the peer's /status
@@ -213,7 +213,7 @@ def apply_snapshot(blob):
                 continue
             data = tar.extractfile(m).read()
             dst = os.path.join(DATA_DIR, n)
-            tmp = dst + ".ha-tmp"
+            tmp = dst + ".ha.tmp"   # ends in .tmp, so a leftover is never copied or backed up
             with open(tmp, "wb") as f:
                 f.write(data)
             os.chown(tmp, pw.pw_uid, pw.pw_gid)
@@ -233,7 +233,7 @@ def backup_data(tag):
     path = os.path.join(BACKUP_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.tar.gz")
     with open(path, "wb") as f:
         f.write(make_snapshot())
-    keep = int(C["KEEP_BACKUPS"])
+    keep = int(C["KEEP_BACKUPS"])   # the folder is shared with um-update's before-update copies (also 8)
     old = sorted(os.listdir(BACKUP_DIR))[:-keep] if keep > 0 else []
     for n in old:
         os.unlink(os.path.join(BACKUP_DIR, n))
