@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.13.0
+
+**Servers** page: see and update both status servers from the one serving the dashboard, as in WebManager.
+
+- A card for each server (CT 214 UptimeMonitor, CT 215 UptimeMonitor2) shows its role (primary serving or
+  replica with the age of its copy), version and commit, update state, CPU, memory, disk and uptime.
+  Buttons: check for updates, install or "update to" the other server's version, automatic updates on/off, and
+  sync now (replica). The page also has **Check both** and **Update both**.
+- The updater (`um-update`, now Python) works like WebManager's: it tests the new version (scripts parse, and the
+  app boots on a spare port with a copy of the data and no webhooks), backs up the code and data, installs it, and
+  rolls back if the app doesn't come back. A failed version isn't retried automatically. Automatic installation can
+  be switched off per server.
+- um-ha has new endpoints: `/status`, `/cluster` (localhost) and `/control` (localhost, or the peer with the token).
+  Requests for the other server are forwarded to it. The peer's status is fetched in its own thread, so it never
+  slows failover checks.
+- Overview: a standby server that stops answering, a replica that stops copying data, or a failed update shows up
+  under "needs attention".
+
 ## 2.12.0
 
 The status site moved off WebManager onto its own pair of containers with automatic failover (agent 1.13.0).

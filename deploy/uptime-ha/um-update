@@ -1,42 +1,339 @@
-#!/usr/bin/env bash
-# Pulls github.com/coolguy1333/homelab-status (main) and installs it when it changed: the same
-# "deploy on push" WebManager did. A running app (primary) restarts for a few seconds, well under
-# um-ha's FAIL_AFTER, so updates don't fail over. Run by um-update.timer every 5 minutes.
-set -euo pipefail
-SRC=/opt/homelab-status-src
-cd "$SRC"
-git fetch -q origin main
-new=$(git rev-parse origin/main)
-old=$(cat /var/lib/um-ha/installed-rev 2>/dev/null || true)
-[ "$new" = "$old" ] && exit 0
-if ! git cat-file -e "$new:deploy/uptime-ha/um-ha" 2>/dev/null; then
-  echo "origin/main has no deploy/uptime-ha yet (not merged?): staying on ${old:0:7}"
-  exit 0
-fi
+#!/usr/bin/env python3
+"""um-update: installs new versions of Homelab Status from GitHub (main), like WebManager's updater.
 
-git reset -q --hard "$new"
-changed=$(git diff --name-only "${old:-$(git hash-object -t tree /dev/null)}" "$new" 2>/dev/null || echo all)
-echo "updating ${old:0:7} -> ${new:0:7}"
+  um-update              timer run (every 5 min): check GitHub; install the new version if automatic
+                         installation is on (the default) and that version hasn't already failed here
+  um-update --check      only check GitHub and record what's available
+  um-update --install C  install commit C, but only if C is the newest commit on main (so a request can't
+                         pick arbitrary code), even if automatic installation is off or C failed before
 
-if [ "$changed" = all ] || echo "$changed" | grep -qE '^(server\.js|package\.json|lib/|public/)'; then
-  rm -rf /opt/uptime-monitor/lib /opt/uptime-monitor/public
-  cp -r server.js package.json lib public /opt/uptime-monitor/
-  systemctl try-restart uptime-monitor
-  echo "app updated to $(node -p "require('/opt/uptime-monitor/package.json').version")"
-fi
-if [ "$changed" = all ] || echo "$changed" | grep -qE '^deploy/(uptime-ha/|uptime-monitor\.service)'; then
-  cp deploy/uptime-monitor.service /etc/systemd/system/uptime-monitor.service
-  install -m 755 deploy/uptime-ha/um-update /usr/local/sbin/um-update
-  for u in um-ha.service um-update.service um-update.timer; do cp "deploy/uptime-ha/$u" "/etc/systemd/system/$u"; done
-  systemctl daemon-reload
-  if ! cmp -s deploy/uptime-ha/um-ha /usr/local/sbin/um-ha; then
-    if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" deploy/uptime-ha/um-ha; then
-      install -m 755 deploy/uptime-ha/um-ha /usr/local/sbin/um-ha
-      systemctl restart um-ha
-      echo "um-ha updated and restarted"
-    else
-      echo "new um-ha does not parse: keeping the old one" >&2
-    fi
-  fi
-fi
-echo "$new" > /var/lib/um-ha/installed-rev
+An install is tested first: every script must parse, and the new app must start and answer /api/health on a
+spare port with a copy of the data (webhooks removed, so a test can't send alerts). Then the current code and
+data are backed up, and the new code is installed. If the app was running (primary) it restarts, and if it
+doesn't answer /api/health within 40 s the old code is put back. A running app restarts for about 2 s, well
+under um-ha's FAIL_AFTER, so an update never causes a failover. um-ha shows the result (update.json) to the
+dashboard's Servers page, and it starts this with --check/--install when someone clicks there.
+"""
+import fcntl
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+
+SRC = "/opt/homelab-status-src"
+APP = "/opt/uptime-monitor"
+PREV = "/opt/uptime-monitor.prev"
+DATA = "/var/lib/uptime-monitor"
+STATE_DIR = "/var/lib/um-ha"
+STATUS = os.path.join(STATE_DIR, "update.json")
+REV = os.path.join(STATE_DIR, "installed-rev")
+AUTO = os.path.join(STATE_DIR, "auto-install")       # "0" = off; missing or anything else = on
+LOCK = os.path.join(STATE_DIR, "update.lock")
+BACKUPS = os.path.join(STATE_DIR, "backups")
+APP_FILES = ("server.js", "package.json", "lib", "public")
+UNITS = ("um-ha.service", "um-update.service", "um-update.timer")
+ATTEMPT = {"commit": None}   # set once an install starts: a failure after that marks this commit as failed
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def run(cmd, timeout=120, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+def git(*args, timeout=60):
+    r = run(["git", "-C", SRC, *args], timeout=timeout)
+    if r.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout.strip()
+
+
+def read_status():
+    try:
+        with open(STATUS) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_status(**kw):
+    d = read_status()
+    d.update(kw)
+    d["installed_commit"] = installed()
+    d["version"] = app_version()
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, STATUS)
+    return d
+
+
+def installed():
+    try:
+        return open(REV).read().strip() or None
+    except OSError:
+        return None
+
+
+def app_version():
+    try:
+        return json.load(open(os.path.join(APP, "package.json"))).get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def auto_install():
+    try:
+        return open(AUTO).read().strip() != "0"
+    except OSError:
+        return True
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def app_active():
+    return run(["systemctl", "is-active", "--quiet", "uptime-monitor"]).returncode == 0
+
+
+def healthy(port, seconds, proc=None):
+    end = time.time() + seconds
+    while time.time() < end:
+        if proc is not None and proc.poll() is not None:
+            return False   # it exited: no point waiting
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def env_file():
+    env = {}
+    try:
+        for line in open("/etc/uptime-monitor.env"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                env[k.strip()] = v
+    except OSError:
+        pass
+    return env
+
+
+def app_port():
+    try:
+        return int(env_file().get("PORT") or 3000)
+    except ValueError:
+        return 3000
+
+
+# ------------------------------------------------------------------ check
+
+def check():
+    git("fetch", "-q", "origin", "main", timeout=90)
+    latest = git("rev-parse", "origin/main")
+    cur = installed()
+    st = read_status()
+    if latest == cur:
+        return write_status(state="current", available_commit=latest, checked_at=now_ms(),
+                            message="Up to date.", detail=None)
+    if st.get("state") == "error" and st.get("failed_commit") == latest:
+        return write_status(available_commit=latest, checked_at=now_ms())   # keep showing the failure
+    return write_status(state="available", available_commit=latest, checked_at=now_ms(),
+                        message=f"Version {latest[:12]} is available.", detail=None)
+
+
+# ------------------------------------------------------------------ test
+
+def test_version(tree):
+    """Parse every script, then boot the new app on a spare port with a copy of the data."""
+    for root, _, files in os.walk(tree):
+        if "/node_modules" in root or "/.git" in root:
+            continue
+        for n in files:
+            p = os.path.join(root, n)
+            if n.endswith(".js") and ("/lib" in root or "/public" in root or root == tree):
+                r = run(["node", "--check", p])
+                if r.returncode:
+                    raise RuntimeError(f"{os.path.relpath(p, tree)} does not parse:\n{r.stderr.strip()[-800:]}")
+    for p in ("deploy/uptime-ha/um-ha", "deploy/uptime-ha/um-update"):
+        r = run(["python3", "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())", os.path.join(tree, p)])
+        if r.returncode:
+            raise RuntimeError(f"{p} does not parse:\n{r.stderr.strip()[-800:]}")
+
+    test_data = "/var/lib/uptime-monitor-test"
+    shutil.rmtree(test_data, ignore_errors=True)
+    shutil.copytree(DATA, test_data) if os.path.isdir(DATA) else os.makedirs(test_data)
+    sf = os.path.join(test_data, "settings.json")
+    try:
+        s = json.load(open(sf))
+        s["webhooks"] = []
+        json.dump(s, open(sf, "w"))
+    except (OSError, ValueError):
+        pass
+    shutil.chown(test_data, "uptime", "uptime")
+    for n in os.listdir(test_data):
+        shutil.chown(os.path.join(test_data, n), "uptime", "uptime")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = {**env_file(), "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "NODE_ENV": "production",
+           "PORT": str(port), "HOST": "127.0.0.1", "DATA_DIR": test_data, "NOTIFY_WEBHOOK_URL": "", "PEERS": ""}
+    try:
+        p = subprocess.Popen(["/usr/sbin/runuser", "-u", "uptime", "--", "node", os.path.join(tree, "server.js")],
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=tree)
+        try:
+            ok = healthy(port, 25, p)
+        finally:
+            p.terminate()
+            try:
+                out = p.communicate(timeout=10)[0]
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out = p.communicate()[0]
+    finally:
+        shutil.rmtree(test_data, ignore_errors=True)
+    if not ok:
+        raise RuntimeError(f"the new version did not start (no answer on /api/health):\n{out[-1500:]}")
+
+
+# ------------------------------------------------------------------ install
+
+def copy_app(tree, dst):
+    os.makedirs(dst, exist_ok=True)
+    for n in APP_FILES:
+        s, d = os.path.join(tree, n), os.path.join(dst, n)
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        (shutil.copytree if os.path.isdir(s) else shutil.copy2)(s, d)
+
+
+def backup_data(commit):
+    os.makedirs(BACKUPS, exist_ok=True)
+    path = os.path.join(BACKUPS, f"{time.strftime('%Y%m%d-%H%M%S')}-before-update-{commit[:7]}.tar.gz")
+    with tarfile.open(path, "w:gz", compresslevel=1) as tar:
+        for n in sorted(os.listdir(DATA)):
+            if not n.endswith(".tmp"):
+                tar.add(os.path.join(DATA, n), arcname=n)
+    for n in sorted(os.listdir(BACKUPS))[:-8]:
+        os.unlink(os.path.join(BACKUPS, n))
+
+
+def install(commit, manual):
+    latest = git("rev-parse", "origin/main")
+    if commit != latest:
+        raise RuntimeError(f"only the newest version of main ({latest[:12]}) can be installed, not {commit[:12]}")
+    if commit == installed():
+        write_status(state="current", message="Already up to date.", detail=None)
+        return
+    if not git("cat-file", "-t", f"{commit}:deploy/uptime-ha/um-ha"):
+        raise RuntimeError("that version has no deploy/uptime-ha")
+    old = installed()
+    ATTEMPT["commit"] = commit
+    write_status(state="installing", target_commit=commit, started_at=now_ms(),
+                 message=f"Testing {commit[:12]}…", detail=None)
+    git("reset", "-q", "--hard", commit)
+    try:
+        test_version(SRC)
+    except Exception as e:
+        if old:
+            git("reset", "-q", "--hard", old)
+        raise RuntimeError(f"Test failed, nothing was changed. {e}")
+
+    write_status(message=f"Backing up and installing {commit[:12]}…")
+    if os.path.isdir(DATA):
+        backup_data(commit)
+    shutil.rmtree(PREV, ignore_errors=True)
+    if os.path.isdir(APP):
+        shutil.copytree(APP, PREV)
+    copy_app(SRC, APP)
+    was_running = app_active()
+    if was_running:
+        run(["systemctl", "restart", "uptime-monitor"], timeout=90)
+        if not healthy(app_port(), 40):
+            journal = run(["journalctl", "-u", "uptime-monitor", "-n", "30", "--no-pager", "-o", "cat"]).stdout
+            if os.path.isdir(PREV):
+                shutil.rmtree(APP)
+                shutil.copytree(PREV, APP)
+            run(["systemctl", "restart", "uptime-monitor"], timeout=90)
+            if old:
+                git("reset", "-q", "--hard", old)
+            raise RuntimeError(f"The app did not come back after the update, so the previous version was put back.\n{journal[-1500:]}")
+
+    with open(REV, "w") as f:
+        f.write(commit + "\n")
+    # System files last: units, the updater itself, and um-ha (restarting um-ha never interrupts the app).
+    changed = run(["git", "-C", SRC, "diff", "--name-only", old or "HEAD~1", commit]).stdout if old else "deploy/"
+    if "deploy/" in changed:
+        shutil.copy2(os.path.join(SRC, "deploy/uptime-monitor.service"), "/etc/systemd/system/uptime-monitor.service")
+        for u in UNITS:
+            shutil.copy2(os.path.join(SRC, "deploy/uptime-ha", u), f"/etc/systemd/system/{u}")
+        run(["systemctl", "daemon-reload"])
+        for n in ("um-update", "um-ha"):
+            src, dst = os.path.join(SRC, "deploy/uptime-ha", n), f"/usr/local/sbin/{n}"
+            if run(["cmp", "-s", src, dst]).returncode:
+                shutil.copy2(src, dst + ".new")
+                os.chmod(dst + ".new", 0o755)
+                os.replace(dst + ".new", dst)
+                log(f"{n} updated")
+    write_status(state="current", available_commit=commit, installed_at=now_ms(), checked_at=now_ms(),
+                 message=f"Version {app_version()} ({commit[:12]}) installed{' by request' if manual else ''}.",
+                 detail=None, failed_commit=None)
+    log(f"installed {commit[:12]} (app {app_version()}){', app restarted' if was_running else ''}")
+    if "deploy/uptime-ha/um-ha" in changed:
+        run(["systemctl", "restart", "um-ha"])
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    args = sys.argv[1:]
+    lockf = open(LOCK, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another update is already running")
+        return 0
+    try:
+        st = check()
+        if args[:1] == ["--check"]:
+            log(st.get("message", ""))
+            return 0
+        if args[:1] == ["--install"] and len(args) > 1:
+            install(args[1], manual=True)
+            return 0
+        if st.get("state") == "available" and auto_install():
+            install(st["available_commit"], manual=False)
+        else:
+            log(st.get("message", ""))
+        return 0
+    except Exception as e:
+        msg = str(e)
+        first, _, rest = msg.partition("\n")
+        if ATTEMPT["commit"]:
+            write_status(state="error", message=first, detail=rest or None, failed_commit=ATTEMPT["commit"])
+        elif args[:1] == ["--install"]:   # refused before anything changed
+            write_status(message=f"Update not started: {first}", detail=rest or None)
+        else:   # couldn't even check (GitHub unreachable...): say so, but don't mark any version as failed
+            write_status(state="error", message=f"Could not check for updates: {first}", detail=rest or None)
+        log(f"update failed: {msg}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

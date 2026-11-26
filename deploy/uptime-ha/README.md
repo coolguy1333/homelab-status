@@ -28,9 +28,26 @@ Cloudflare ──tunnel──▶ cloudflared (connector1 / connector2)
   settings in `/etc/uptime-monitor.env`, which is identical on both). It is **not** enabled at boot:
   um-ha starts it only on the primary.
 - `um-ha.service` (`/usr/local/sbin/um-ha`, config `/etc/um-ha.conf`, state `/var/lib/um-ha/state.json`).
-- `um-update.timer`: every 5 minutes it pulls `main` from GitHub and installs it when something changed.
-  This replaces WebManager's deploy on push. A running app restarts for about 2 seconds, so an update
-  doesn't trigger a failover.
+- `um-update.timer` (`/usr/local/sbin/um-update`): every 5 minutes it checks `main` on GitHub and installs a
+  new version, the way WebManager's updater does. It **tests** first (every script must parse, and the new app
+  must start and answer `/api/health` on a spare port with a copy of the data and no webhooks), **backs up** the
+  code (`/opt/uptime-monitor.prev`) and data (`/var/lib/um-ha/backups`), **installs**, and restarts the app if
+  it was running. If the app doesn't answer within 40 s, it **rolls back**. A version that failed isn't retried
+  automatically, so click Install to try it again. The result is in `/var/lib/um-ha/update.json`. Automatic
+  installation can be turned off per server (`/var/lib/um-ha/auto-install` = `0`); new versions then wait for
+  Install. A running app restarts for about 2 seconds, so an update never triggers a failover.
+
+## Servers page (dashboard → Servers)
+
+As in WebManager, you see and update **both** servers from the one that serves the dashboard. Each card shows
+its role, when the replica last copied the data, its version and update state, CPU, memory and disk, and
+uptime. Buttons: **Check for updates**, **Install** / **Update to** (the version the other one runs), **Stop
+/ start automatic updates**, and **Sync now** on the replica. The page also has **Check both** and **Update both**.
+A standby that stops answering, a stale copy, or a failed update also shows on the Overview.
+
+The app asks its local um-ha (`127.0.0.1:8099`, `/cluster` and `/control`; localhost only). um-ha forwards
+anything for the other server to that server's `/control` with the shared token. That server starts
+`um-update` itself, in its own transient unit.
 
 ## um-ha
 
@@ -59,8 +76,8 @@ Cloudflare ──tunnel──▶ cloudflared (connector1 / connector2)
 As root in each container, from a checkout of this repo, with the same token on both:
 
 ```bash
-UM_HA_TOKEN=<shared secret> bash deploy/uptime-ha/install.sh 192.168.10.213 192.168.10.110 preferred --primary   # CT 214
-UM_HA_TOKEN=<shared secret> bash deploy/uptime-ha/install.sh 192.168.10.110 192.168.10.213                     # CT 215
+UM_HA_TOKEN=<shared secret> UM_HA_LABEL="GOD · CT 214" bash deploy/uptime-ha/install.sh 192.168.10.213 192.168.10.110 preferred --primary   # CT 214
+UM_HA_TOKEN=<shared secret> UM_HA_LABEL="HELP · CT 215" bash deploy/uptime-ha/install.sh 192.168.10.110 192.168.10.213                     # CT 215
 ```
 
 `--primary` only matters on the very first install. Re-running the installer keeps the data, the
@@ -72,7 +89,9 @@ settings, the token, and the current role.
 curl -s 127.0.0.1:8099/role                 # role, epoch, last sync
 journalctl -u um-ha -f                      # failover decisions
 journalctl -u uptime-monitor -f             # the app
-systemctl start um-update                   # update from GitHub now
+um-update --check                           # check GitHub now (or the Servers page)
+um-update                                   # check and install if automatic installation is on
+cat /var/lib/um-ha/update.json              # last check / install result
 ```
 
 **Manual switchover** (for example before maintenance on GOD): on CT 214, run

@@ -779,3 +779,12 @@ a.head-status:hover { filter: brightness(.95); }
 .pbs .pbs-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 @container (max-width: 470px) { .pbs .pbs-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .pj-state { white-space: normal; text-align: right; overflow: visible; }
+
+/* Servers page (status site um-ha pair) */
+.srv-lines { display: grid; gap: 6px; font-size: 13px; margin: 2px 0 12px; }
+.srv-lines .pill .spin { width: 9px; height: 9px; vertical-align: -1px; }
+.srv-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.srv-summary { display: grid; gap: 6px; font-size: 13px; }
+.att-line { font-size: 13px; padding: 10px 14px; border-left: 3px solid var(--muted); }
+.att-line.err { border-left-color: var(--down); }
+.att-line.warn { border-left-color: var(--pending); }

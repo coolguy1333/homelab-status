@@ -21,6 +21,11 @@ HTTP on HA_PORT (default 8099):
   GET  /active    200 only on the primary whose app is healthy (HAProxy on the connectors tracks this)
   GET  /snapshot  tar.gz of the data folder (peer IP + token only; primary or draining only)
   POST /handover  stop the app and answer with the final data (peer IP + token only; primary only)
+  GET  /status    this server's details: role, version, update state, CPU/memory/disk (localhost, or peer + token)
+  GET  /cluster   this server's /status plus the last one from the peer (localhost only: the app's Servers page)
+  POST /control   {"action", "target": "self"|"peer", "commit"} from the app (localhost) or the peer (token):
+                  check | install | auto_on | auto_off | sync_now. "peer" is forwarded to the other server,
+                  so both can be seen and updated from the one that serves the dashboard (as in WebManager)
 
 Config: /etc/um-ha.conf. State: /var/lib/um-ha/state.json. Logs: journalctl -u um-ha.
 """
@@ -30,6 +35,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import socketserver
 import subprocess
 import sys
@@ -51,7 +57,9 @@ DEFAULTS = {
     "GATEWAY": "192.168.10.1",
     "FAIL_AFTER": "60", "MIN_FAILS": "5", "FAILBACK_AFTER": "120", "HANDOVER_TIMEOUT": "60",
     "FAILBACK_BACKOFF": "1800", "SYNC_EVERY": "5", "CHECK_EVERY": "2", "KEEP_BACKUPS": "5",
+    "LABEL": "",   # shown on the Servers page, e.g. "GOD · CT 214"
 }
+STATUS_EVERY = 10   # seconds between fetches of the peer's /status
 
 
 def load_conf():
@@ -81,7 +89,9 @@ PEER = f"http://{C['PEER_IP']}:{HA_PORT}"
 lock = threading.RLock()       # guards S and role changes (the HTTP thread and the main loop both change roles)
 S = {"role": "replica", "epoch": 0}
 RT = {"app_ok": False, "synced_at": 0, "replica_ok_since": 0, "peer_bad_since": 0, "peer_fails": 0,
-      "failback_after": 0, "failback_promoted_at": 0, "draining_since": 0, "peer": None}
+      "failback_after": 0, "failback_promoted_at": 0, "draining_since": 0, "peer": None,
+      "cpu": None, "cpu_sample": None, "peer_status": None, "peer_status_at": 0, "peer_seen": 0,
+      "peer_error": None, "peer_status_fetched": 0}
 
 
 def log(msg):
@@ -269,6 +279,156 @@ def sync_from_peer():
     return n
 
 
+
+# ------------------------------------------------------------------ status (Servers page)
+
+def sample_cpu():
+    """CPU use since the previous sample (lxcfs gives the container its own /proc/stat)."""
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+    except (OSError, ValueError):
+        return
+    idle, total = v[3] + (v[4] if len(v) > 4 else 0), sum(v)
+    prev = RT["cpu_sample"]
+    RT["cpu_sample"] = (idle, total)
+    if prev and total > prev[1]:
+        RT["cpu"] = round(100 * (1 - (idle - prev[0]) / (total - prev[1])), 1)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def local_status():
+    mem = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0])
+    except (OSError, ValueError):
+        pass
+    memp = round(100 * (1 - mem["MemAvailable"] / mem["MemTotal"]), 1) if mem.get("MemTotal") and "MemAvailable" in mem else None
+    try:
+        sv = os.statvfs("/")
+        diskp = round(100 * (1 - sv.f_bavail / sv.f_blocks), 1) if sv.f_blocks else None
+    except OSError:
+        diskp = None
+    try:
+        boot = time.time() - float(open("/proc/uptime").read().split()[0])
+    except (OSError, ValueError):
+        boot = None
+    upd = read_json(os.path.join(STATE_DIR, "update.json"))
+    try:
+        rev = open(os.path.join(STATE_DIR, "installed-rev")).read().strip() or None
+    except OSError:
+        rev = None
+    try:
+        auto = open(os.path.join(STATE_DIR, "auto-install")).read().strip() != "0"
+    except OSError:
+        auto = True
+    app_ver = read_json("/opt/uptime-monitor/package.json").get("version")
+    return {
+        "hostname": socket.gethostname(), "label": C["LABEL"], "ip": C["SELF_IP"],
+        "role": S["role"], "epoch": S["epoch"], "preferred": PREFERRED, "app": RT["app_ok"],
+        "syncedAt": int(RT["synced_at"] * 1000) or None,
+        "version": app_ver, "commit": rev, "autoInstall": auto,
+        "update": {k: upd.get(k) for k in ("state", "message", "detail", "available_commit", "checked_at",
+                                            "installed_at", "failed_commit", "target_commit", "started_at")},
+        "cpu": RT["cpu"], "memory": memp, "disk": diskp,
+        "bootedAt": int(boot * 1000) if boot else None, "time": now_ms(),
+    }
+
+
+def status_loop():
+    """Own thread, so a peer that doesn't answer never slows down the failover checks."""
+    while True:
+        try:
+            if int(time.time()) % 5 == 0:   # CPU use over the last 5 s
+                sample_cpu()
+            if time.time() - RT["peer_status_fetched"] >= STATUS_EVERY:
+                refresh_peer_status()
+        except Exception as e:   # never die
+            log(f"status refresh failed: {e!r}")
+        time.sleep(1)
+
+
+def refresh_peer_status():
+    RT["peer_status_fetched"] = time.time()
+    try:
+        body, _ = peer_request("/status", timeout=4, auth=True)
+        d = json.loads(body)
+        if not isinstance(d, dict):
+            raise ValueError("not a status")
+        RT["peer_status"], RT["peer_seen"], RT["peer_error"] = d, time.time(), None
+    except urllib.error.HTTPError as e:
+        RT["peer_error"] = f"HTTP {e.code}" + (" (token mismatch?)" if e.code == 403 else "")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        RT["peer_error"] = str(getattr(e, "reason", e))[:200]
+
+
+def cluster():
+    peer = dict(RT["peer_status"] or {})
+    fresh = RT["peer_seen"] and time.time() - RT["peer_seen"] < STATUS_EVERY * 3 + 5
+    peer.update({"ip": C["PEER_IP"], "reachable": bool(fresh), "lastSeen": int(RT["peer_seen"] * 1000) or None,
+                 "error": None if fresh else (RT["peer_error"] or "not checked yet")})
+    return {"self": local_status(), "peer": peer, "failAfter": FAIL_AFTER, "failbackAfter": FAILBACK_AFTER,
+            "syncEvery": SYNC_EVERY}
+
+
+def start_update(*args):
+    """Run um-update in its own transient unit, so it survives um-ha restarts (an update can restart um-ha)."""
+    r = subprocess.run(["systemd-run", "--no-block", "--collect", f"--unit=um-update-req-{int(time.time())}",
+                        "--description=Homelab Status update (requested from the dashboard)",
+                        "/usr/local/sbin/um-update", *args], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip() or "systemd-run failed")
+
+
+def control_local(action, commit=None):
+    if action == "check":
+        start_update("--check")
+        return "Checking GitHub now."
+    if action == "install":
+        if not isinstance(commit, str) or len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+            raise ValueError("send the 40-character commit to install")
+        start_update("--install", commit)
+        return f"Testing, backing up and installing {commit[:12]} (about a minute)."
+    if action in ("auto_on", "auto_off"):
+        with open(os.path.join(STATE_DIR, "auto-install"), "w") as f:
+            f.write("1\n" if action == "auto_on" else "0\n")
+        return "Automatic installation is " + ("on." if action == "auto_on" else "off: new versions wait for Install.")
+    if action == "sync_now":
+        if S["role"] != "replica":
+            raise ValueError("only the replica copies data")
+        RT["synced_at"] = 0   # the main loop syncs on its next check (within 2 s)
+        return "Copying the primary's data now."
+    raise ValueError(f"unknown action {action!r}")
+
+
+def control_peer(action, commit=None):
+    data = json.dumps({"action": action, "target": "self", "commit": commit}).encode()
+    req = urllib.request.Request(PEER + "/control", data=data, method="POST",
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + C["TOKEN"]})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read())
+        except ValueError:
+            d = {}
+        raise ValueError(d.get("error") or f"the other server answered HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise ValueError(f"the other server is not answering ({getattr(e, 'reason', e)})")
+    RT["peer_status_fetched"] = 0   # show the change on the next refresh
+    return d.get("message", "Sent.")
+
 # ------------------------------------------------------------------ HTTP
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -287,6 +447,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def local(self):
+        return self.client_address[0] == "127.0.0.1"
+
+    def json_reply(self, code, obj):
+        self.reply(code, json.dumps(obj), "application/json")
 
     def peer_authorized(self):
         if self.client_address[0] != C["PEER_IP"]:
@@ -307,6 +473,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/active":
             ok = S["role"] == "primary" and RT["app_ok"]
             return self.reply(200 if ok else 503, "active\n" if ok else f"{S['role']}\n")
+        if p == "/status":
+            if not (self.local() or self.peer_authorized()):
+                return self.reply(403, "forbidden\n")
+            return self.json_reply(200, local_status())
+        if p == "/cluster":
+            if not self.local():
+                return self.reply(403, "forbidden\n")
+            return self.json_reply(200, cluster())
         if p == "/snapshot":
             if not self.peer_authorized():
                 return self.reply(403, "forbidden\n")
@@ -317,6 +491,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0]
+        if p == "/control":
+            return self.do_control()
         if p != "/handover":
             return self.reply(404, "not found\n")
         if not self.peer_authorized():
@@ -330,6 +506,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log("handover requested by the preferred peer: stopping the app and sending it the final data")
             stop_app()
         self.reply(200, make_snapshot(), "application/gzip")
+
+
+    def do_control(self):
+        from_peer = not self.local()
+        if from_peer and not self.peer_authorized():
+            return self.reply(403, "forbidden\n")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(min(n, 4096)) or b"{}") if n else {}
+            action, target, commit = body.get("action"), body.get("target", "self"), body.get("commit")
+            if target == "peer" and not from_peer:
+                msg = control_peer(action, commit)
+            elif target == "self":
+                msg = control_local(action, commit)
+            else:
+                raise ValueError("target must be self or peer")
+            log(f"control: {action} on {'this server' if target == 'self' else 'the peer'}"
+                f"{' (asked by the peer)' if from_peer else ''}")
+            return self.json_reply(200, {"ok": True, "message": msg})
+        except (ValueError, RuntimeError, AttributeError) as e:
+            return self.json_reply(400, {"error": str(e)})
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -497,6 +694,7 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     srv = Server(("0.0.0.0", HA_PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=status_loop, daemon=True).start()
     startup()
     while True:
         t0 = time.time()
@@ -511,6 +709,7 @@ def main():
                     step_replica()
         except Exception as e:   # never die
             log(f"check failed: {e!r}")
+
         time.sleep(max(0.2, CHECK_EVERY - (time.time() - t0)))
 
 
