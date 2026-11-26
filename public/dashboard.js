@@ -776,8 +776,8 @@ const Dash = (() => {
       </div>`;
     }).join('');
     const down = sv.filter(s => s.status === 'down' && !s.stale).length;
-    return `${core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent, every 5 min</span></h3></div>${core}` : ''}
-      <div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every 5 min</span></h3>
+    return `${core ? `<div class="section-head"><h3>Core servers <span class="muted">· checked on the LAN by every agent, every minute</span></h3></div>${core}` : ''}
+      <div class="section-head"><h3>Internal services <span class="muted">· found automatically, checked on the LAN every minute</span></h3>
       <span class="${down ? 'pct-bad' : 'pct-good'}">${down ? `${down} down` : `all ${sv.length} answering`}</span></div>
       <div class="svc-grid">${cards}</div>`;
   }

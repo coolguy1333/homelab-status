@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.11.1"
+VERSION = "1.12.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -358,10 +358,46 @@ def job_covers(job, vmid, node):
     return str(vmid) in str(job.get("vmid", "")).split(",")
 
 
+DISCOVER_EVERY_MIN = 90  # config: discover_every_min (60-120)
+
+
+def discovery(s, containers, force=False):
+    """Find what to monitor: listening services in every container, tunnel hostnames and WebManager sites.
+    It looks inside every container (pct exec), so it runs every 1-2 hours (discover_every_min, default 90), and
+    right away when the set of running containers changes (a new or restarted container is picked up quickly).
+    Plain script, no Claude."""
+    d = s.get("discovery") or {}
+    running = sorted(c["vmid"] for c in containers if c.get("status") == "running")
+    every = min(120, max(60, int(CFG.get("discover_every_min", DISCOVER_EVERY_MIN)))) * 60e3
+    if not force and d.get("t") and now_ms() - d["t"] < every and d.get("running") == running:
+        return d
+    services = discover_services(containers)
+    web = discover_webmanager(containers)
+    for c in containers:
+        c.pop("_webmanager", None)
+    public = discover_public()
+    # Every running WebManager site becomes a public monitor too (main address only, not aliases).
+    for wm in web:
+        for site in wm["sites"]:
+            if site.get("hosts") and site.get("status") in (None, "running", "deployed", "ready", "live"):
+                h = site["hosts"][0]
+                public.append({"host": h, "name": site["name"], "url": f"{site.get('scheme', 'https')}://{h}/",
+                               "service": f"WebManager ({wm['container']})"})
+    why = "running containers changed" if d.get("t") and d.get("running") != running else "scheduled"
+    d = {"t": now_ms(), "running": running, "services": services, "public": public, "webmanager": web}
+    s["discovery"] = d
+    log(f"discovery ({why}): {len(services)} service check(s), {len(public)} public hostname(s)")
+    return d
+
+
 def collect_slow(s, node, host, containers, force=False):
-    """Backups, backup jobs/tasks and snapshots. Heavier, so refreshed every 30 minutes."""
+    """Backups, backup jobs/tasks and snapshots: refreshed every 30 minutes. What to monitor (services, public
+    hostnames, WebManager sites) comes from discovery(), which has its own schedule."""
+    disc = discovery(s, containers)
     slow = s.get("slow") or {}
     if not force and now_ms() - slow.get("t", 0) < 30 * 60e3:
+        slow.update(services=disc["services"], public=disc["public"], webmanager=disc["webmanager"])
+        s["slow"] = slow
         return slow
     vmids = {c["vmid"] for c in containers}
     jobs = []
@@ -454,17 +490,7 @@ def collect_slow(s, node, host, containers, force=False):
     slow = {"t": now_ms(), "jobs": jobs, "backups": {str(k): v for k, v in backups.items()}, "tasks": tasks[:40], "pbs": pbs,
             "backupStale": stale, "unreachableStorage": unreachable,
             "snapshots": {str(k): v for k, v in snaps.items()},
-            "services": discover_services(containers), "public": discover_public()}
-    slow["webmanager"] = discover_webmanager(containers)
-    for c in containers:
-        c.pop("_webmanager", None)
-    # Every running WebManager site becomes a public monitor too (main address only, not aliases).
-    for wm in slow["webmanager"]:
-        for site in wm["sites"]:
-            if site.get("hosts") and site.get("status") in (None, "running", "deployed", "ready", "live"):
-                h = site["hosts"][0]
-                slow["public"].append({"host": h, "name": site["name"], "url": f"{site.get('scheme', 'https')}://{h}/",
-                                       "service": f"WebManager ({wm['container']})"})
+            "services": disc["services"], "public": disc["public"], "webmanager": disc["webmanager"]}
     s["slow"] = slow
     return slow
 
@@ -798,7 +824,7 @@ def build_report(s, host, containers):
         "events": events, "updateRuns": s["updateRuns"][-20:],
         "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t", "pbs", "backupStale", "unreachableStorage")},
         "services": s.get("serviceChecks", []),
-        "core": check_core(),
+        "core": s.get("coreChecks") if checks_fresh(s) else check_core(),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
         "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300,
@@ -843,9 +869,49 @@ def sync_now():
             log(f"sync to {url} failed: {e}")
 
 
+CHECK_EVERY = 60  # seconds between service/core checks (like the dashboard's site monitors); config: check_every
+
+
+def fast_checks():
+    """Check the internal services and the core servers now and send the results to the dashboard(s)."""
+    with state() as s:
+        services = list((s.get("slow") or {}).get("services") or [])
+    results = check_services(services)
+    core = check_core()
+    now = now_ms()
+    with state() as s:
+        s["serviceChecks"], s["coreChecks"], s["checksAt"] = results, core, now
+    data = json.dumps({"checks": {"t": now, "services": results, "core": core}, "wait": 0}).encode()
+    for url in CFG["site_urls"]:
+        req = urllib.request.Request(url.rstrip("/") + "/api/agent/sync", data=data, method="POST", headers={
+            "Content-Type": "application/json", "Authorization": f"Bearer {CFG['token']}",
+            "User-Agent": f"homelab-agent/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log(f"sending checks to {url} failed: {e}")
+
+
+def checks_fresh(s):
+    """Did the hl-poll loop check services/core recently? (Then the 5-minute report reuses its results.)"""
+    return now_ms() - (s.get("checksAt") or 0) < 3 * 60e3
+
+
 def cmd_poll():
-    """Long-running: picks up dashboard requests within a second (systemd hl-poll.service)."""
+    """Long-running (systemd hl-poll.service): picks up dashboard requests within a second, and checks the
+    internal services and core servers every minute."""
     import threading
+
+    def checker():
+        every = max(20, int(CFG.get("check_every", CHECK_EVERY)))
+        while True:
+            t0 = time.time()
+            try:
+                fast_checks()
+            except Exception as e:  # never die
+                log(f"quick checks failed: {e!r}", "warn")
+            time.sleep(max(5, every - (time.time() - t0)))
 
     def loop(url):
         backoff = 5
@@ -867,6 +933,7 @@ def cmd_poll():
                 time.sleep(10)
 
     threads = [threading.Thread(target=loop, args=(u,), daemon=True) for u in CFG["site_urls"]]
+    threads.append(threading.Thread(target=checker, daemon=True))
     for t in threads:
         t.start()
     while True:
@@ -906,7 +973,8 @@ def cmd_report(send=True):
                     if v not in prev:
                         event("info", f"New container on this host: {n} ({v})", s)
             s["lastCollect"] = {"host": host, "containers": containers}
-            s["serviceChecks"] = check_services(slow.get("services") or [])
+            if not checks_fresh(s):  # hl-poll not running (or old install): check here as before
+                s["serviceChecks"] = check_services(slow.get("services") or [])
             if s.get("hostDownSince"):
                 event("info", f"Proxmox host {CFG['host']} reachable again", s)
                 s.pop("hostDownSince", None)
