@@ -2,7 +2,7 @@
 # Installs (or updates) Homelab Status with um-ha failover on one of the two status containers.
 # Run as root inside the container, from a checkout of this repo:
 #
-#   UM_HA_TOKEN=<shared secret> bash deploy/uptime-ha/install.sh <this server's IP> <the other server's IP> [preferred] [--primary]
+#   UM_HA_TOKEN=<shared secret> [UM_HA_LABEL="GOD · CT 214"] bash deploy/uptime-ha/install.sh <this server's IP> <the other server's IP> [preferred] [--primary]
 #     UptimeMonitor  (GOD):  ... install.sh 192.168.10.X 192.168.10.Y preferred --primary
 #     UptimeMonitor2 (HELP): ... install.sh 192.168.10.Y 192.168.10.X
 #
@@ -95,6 +95,10 @@ SYNC_EVERY=5
 CHECK_EVERY=2
 GATEWAY=192.168.10.1
 CONF
+fi
+if [ -n "${UM_HA_LABEL:-}" ]; then   # shown on the Servers page, e.g. "GOD · CT 214"
+  sed -i '/^LABEL=/d' /etc/um-ha.conf
+  echo "LABEL=$UM_HA_LABEL" >> /etc/um-ha.conf
 fi
 chmod 600 /etc/um-ha.conf
 

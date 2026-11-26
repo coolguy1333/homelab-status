@@ -48,6 +48,9 @@ if (PUBLIC_URL && !/^https?:\/\/[^\s/]+$/i.test(PUBLIC_URL)) {
   console.warn(`[config] PUBLIC_URL "${PUBLIC_URL}" should look like https://status.example.com (scheme and host, no path).`);
 }
 const PEER_TOKEN = (process.env.PEER_TOKEN || '').trim();
+// um-ha (deploy/uptime-ha) on this machine: the Servers page shows both status servers through it and asks it to
+// update either one. Not set up (e.g. running on WebManager or Docker): the page says so.
+const UM_HA_URL = (process.env.UM_HA_URL || 'http://127.0.0.1:8099').replace(/\/+$/, '');
 
 const settingsDefaults = {};
 if (process.env.SITE_TITLE) settingsDefaults.title = process.env.SITE_TITLE;
@@ -732,6 +735,34 @@ async function handleApi(req, res, url) {
   if (p === '/api/infra' && method === 'GET') {
     if (needAuth()) return;
     return send(res, 200, { agents: infra.summary(), services: infra.services(), core: infra.coreSummary(), chats: infra.chatList(), serverTime: Date.now() });
+  }
+
+  // ---- the status servers themselves (um-ha pair): see both, update either, from this one
+  if (p === '/api/servers' && method === 'GET') {
+    if (needAuth()) return;
+    try {
+      const r = await fetch(`${UM_HA_URL}/cluster`, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) throw new Error(`um-ha answered HTTP ${r.status}`);
+      return send(res, 200, { available: true, ...(await r.json()) });
+    } catch (err) {
+      return send(res, 200, { available: false, error: err.cause ? String(err.cause.code || err.cause.message || err.cause) : err.message });
+    }
+  }
+  if (p === '/api/servers/control' && method === 'POST') {
+    if (needAuth() || needJson()) return;
+    const body = await readBody(req, 4096);
+    const action = String(body.action || '');
+    if (!['check', 'install', 'auto_on', 'auto_off', 'sync_now'].includes(action)) return send(res, 400, { error: 'Unknown action' });
+    const payload = { action, target: body.target === 'peer' ? 'peer' : 'self', commit: body.commit ? String(body.commit).slice(0, 40) : undefined };
+    try {
+      const r = await fetch(`${UM_HA_URL}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(15000) });
+      const out = await r.json().catch(() => ({}));
+      if (!r.ok) return send(res, 400, { error: out.error || `um-ha answered HTTP ${r.status}` });
+      console.log(`[servers] ${user.email || user.name || 'admin'}: ${action} on ${payload.target === 'peer' ? 'the other server' : 'this server'}`);
+      return send(res, 200, out);
+    } catch (err) {
+      return send(res, 502, { error: `Could not reach um-ha on this server: ${err.message}` });
+    }
   }
 
   // ---- chats with the agents

@@ -69,7 +69,7 @@ function selectingIn(el) {
 }
 
 const Dash = (() => {
-  const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity', 'logs'];
+  const VIEWS = ['overview', 'containers', 'updates', 'backups', 'uptime', 'ask', 'activity', 'logs', 'servers'];
   const st = {
     data: null, error: null, loading: false,
     open: new Set(), expanded: new Set(), sel: new Map(),
@@ -78,13 +78,20 @@ const Dash = (() => {
     askFilter: '', askQ: '', askPane: 'list', stickBottom: false,
     logf: { agent: '', level: '', q: '' }, logLines: {}, logsAt: 0, logsLoading: false, logErr: null,
     evLines: {}, evAt: 0, evLoading: false, actLimit: 300,
+    servers: null, serversAt: 0,         // GET api/servers: the two status servers (um-ha)
     filters: { host: '', status: '', q: '', level: '', ahost: '', upd: '' },
   };
 
   // ------------------------------------------------------------ data
   async function load(d) {
     if (!d || !d.authed || !d.infra || d.locked) { st.data = null; return; }
+    const srv = loadServers();
     try { st.data = await api('api/infra'); st.error = null; } catch (err) { st.error = err.message; }
+    await srv;
+  }
+  async function loadServers() {
+    try { st.servers = await api('api/servers'); } catch (err) { st.servers = { available: false, error: err.message }; }
+    st.serversAt = Date.now();
   }
   const enabled = d => Boolean(d && d.authed && d.infra && !d.locked);
   const agents = () => (st.data ? st.data.agents : []);
@@ -125,6 +132,7 @@ const Dash = (() => {
       const failed = ((r.backups && r.backups.tasks) || []).filter(t => t.status !== 'OK' && t.status !== 'running' && Date.now() - t.t < 24 * HOUR);
       if (failed.length) push('err', `${failed.length} backup run${failed.length > 1 ? 's' : ''} failed on ${hostOf(a)} in the last 24 h`, 'backups');
     }
+    for (const it of serverProblems()) push(it.level, it.text, 'servers');
     for (const c of coreServers()) {
       if (c.status === 'down') push('err', `${c.name} (${c.role || 'server'}) is DOWN — no ping, no ports — since ${ago(c.since).replace(' ago', '')}`, 'overview');
       else if (c.status === 'degraded') push('err', `${c.name}: answers ping but its main service (${/PBS|backup/i.test(c.role || '') ? 'PBS :8007' : 'Proxmox :8006'}) does not`, 'overview');
@@ -494,6 +502,99 @@ const Dash = (() => {
         ${r.schedule && r.schedule.updates ? `<span>Updates <b>nightly ${esc(r.schedule.updates)}${r.schedule.securityOnly ? ' · security only' : ''}</b></span>` : ''}
       </div>
     </div>`;
+  }
+
+  // ------------------------------------------------------------ Servers (the status site's own um-ha pair)
+  const UPDATING = ['installing'];
+  const srvName = x => x.hostname || x.ip || 'server';
+  const short = c => (c ? String(c).slice(0, 7) : '—');
+  function serverProblems() {
+    const sv = st.servers;
+    if (!sv || !sv.available) return [];
+    const out = [];
+    const me = sv.self || {}, peer = sv.peer || {};
+    if (!peer.reachable) out.push({ level: 'err', text: `Standby status server ${srvName(peer)} is not answering — no failover until it is back${peer.lastSeen ? ` (last seen ${ago(peer.lastSeen)})` : ''}` });
+    else if (peer.role === 'replica' && (!peer.syncedAt || peer.time - peer.syncedAt > 60e3)) out.push({ level: 'warn', text: `${srvName(peer)} has not copied this server's data for ${peer.syncedAt ? duration((peer.time - peer.syncedAt) / 1000) : 'a while'}` });
+    for (const x of [me, peer.reachable ? peer : null].filter(Boolean)) {
+      if (x.update && x.update.state === 'error') out.push({ level: 'warn', text: `Status site update on ${srvName(x)}: ${x.update.message || 'failed'}` });
+    }
+    return out;
+  }
+
+  function roleLine(x, sv) {
+    if (x.role === 'primary') return `<span class="pill">primary</span> <span class="muted">${x.app ? 'serving this dashboard' : '<span class="pct-bad">app not answering</span>'}${x.epoch > 1 ? ` · since ${esc(ago(x.epoch))}` : ''}</span>`;
+    if (x.role === 'draining') return '<span class="pill warn">handing over</span>';
+    const age = x.syncedAt && x.time ? (x.time - x.syncedAt) / 1000 : null;
+    return `<span class="pill">replica</span> <span class="muted">${age == null ? 'not synced yet' : `data copied ${age < 10 ? 'just now' : `${duration(age)} ago`}`} · takes over after ${sv.failAfter || 60} s</span>`;
+  }
+
+  function updateLine(x, own) {
+    const u = x.update || {};
+    if (UPDATING.includes(u.state)) return `<span class="pill warn"><span class="spin"></span> updating</span> <span class="muted">${esc(u.message || '')}</span>`;
+    if (u.state === 'error') return `<span class="pill bad">update failed</span> <span class="muted">${esc(u.message || '')}</span>`;
+    if (u.state === 'available') return `<span class="pill warn">update available</span> <span class="muted">${short(u.available_commit)}</span>`;
+    if (own && x.commit && own.commit && x.commit !== own.commit) return `<span class="pill warn">different version</span>`;
+    return u.state === 'current' ? '<span class="pill">up to date</span>' : '<span class="muted">not checked yet</span>';
+  }
+
+  function serverCard(x, { me, sv, own }) {
+    const reach = me || x.reachable;
+    const u = x.update || {};
+    const target = me ? 'self' : 'peer';
+    const name = esc(srvName(x));
+    const busy = UPDATING.includes(u.state);
+    const newer = !me && reach && own.commit && x.commit !== own.commit && !busy;
+    const btn = (action, label, cls = '', extra = '') => `<button class="btn small ${cls}" data-srv-act="${action}" data-target="${target}" data-name="${name}" ${extra}>${label}</button>`;
+    const manage = reach ? `<div class="cd-actions srv-actions">
+        ${newer ? btn('install', `⇩ Update to ${short(own.commit)}`, 'primary', `data-commit="${esc(own.commit)}" title="Install the version this server runs there (tested and backed up first; rolled back if it fails)"`) : ''}
+        ${!newer && u.state === 'available' && u.available_commit && !busy ? btn('install', `⇩ Install ${short(u.available_commit)}`, 'primary', `data-commit="${esc(u.available_commit)}"`) : ''}
+        ${!newer && u.state === 'error' && u.failed_commit && u.failed_commit === u.available_commit && !busy ? btn('install', '↻ Try the update again', '', `data-commit="${esc(u.available_commit)}"`) : ''}
+        ${btn('check', '⌕ Check for updates', 'ghost', busy ? 'disabled' : '')}
+        ${btn(x.autoInstall === false ? 'auto_on' : 'auto_off', x.autoInstall === false ? 'Install updates automatically' : 'Stop automatic updates', 'ghost')}
+        ${x.role === 'replica' ? btn('sync_now', '⟳ Sync now', 'ghost', 'title="It copies the primary\'s data every few seconds by itself"') : ''}
+      </div>` : `<p class="muted">It isn't answering, so it can't be changed from here right now.</p>`;
+    return `<div class="card host srv">
+      <div class="host-head">${dot(reach ? (x.role === 'primary' && !x.app ? 'down' : 'up') : 'down')}<div>
+        <h3>${name} <span class="muted">${esc(x.ip || '')}</span></h3>
+        <div class="muted">${me ? 'this server' : 'the other server'}${x.label ? ` · ${esc(x.label)}` : ''}${x.preferred ? ' · preferred primary' : ''}</div></div>
+        ${reach ? '' : '<span class="pill bad">unreachable</span>'}</div>
+      ${reach ? `<div class="srv-lines"><div>${roleLine(x, sv)}</div><div>${updateLine(x, own)}</div></div>
+      <div class="host-meters">
+        <div class="kv"><span>CPU</span>${x.cpu == null ? '<span class="muted">—</span>' : meter(x.cpu, 100)}</div>
+        <div class="kv"><span>Memory</span>${x.memory == null ? '<span class="muted">—</span>' : meter(x.memory, 100)}</div>
+        <div class="kv"><span>Disk</span>${x.disk == null ? '<span class="muted">—</span>' : meter(x.disk, 100)}</div>
+      </div>
+      <div class="meta">
+        <span>Version <b>${esc(x.version || '?')}</b> <span class="muted">${short(x.commit)}</span></span>
+        <span>Auto-install <b>${x.autoInstall === false ? 'off' : 'on'}</b></span>
+        <span>Checked <b>${u.checked_at ? esc(ago(u.checked_at)) : '—'}</b></span>
+        ${u.installed_at ? `<span>Installed <b>${esc(ago(u.installed_at))}</b></span>` : ''}
+        ${x.bootedAt ? `<span>Up <b>${esc(duration((Date.now() - x.bootedAt) / 1000).split(' ').slice(0, 2).join(' '))}</b></span>` : ''}
+      </div>
+      ${u.state === 'error' && u.detail ? details(`srverr:${target}`, 'What went wrong', `<pre>${esc(u.detail)}</pre>`) : ''}` :
+      `<p class="pct-bad">${esc(x.error || 'Not answering')}${x.lastSeen ? ` · last seen ${esc(ago(x.lastSeen))}` : ' · never reached since um-ha started'}</p>`}
+      ${manage}
+    </div>`;
+  }
+
+  function viewServers() {
+    const sv = st.servers;
+    const head = pageHead('Servers', 'The two containers that run this dashboard. The primary serves it; the replica copies its data every few seconds and takes over within a minute if the primary goes down. New versions on GitHub are tested, backed up and installed on each server by itself (unless you turn that off), and rolled back if the app doesn\'t come back. Both can be checked and updated from here.');
+    if (!sv) return `${head}<div class="card empty loading"><span class="spin"></span><p class="muted">Loading…</p></div>`;
+    if (!sv.available) return `${head}${empty(`This dashboard isn't running on the um-ha server pair (or um-ha isn't answering on this server: ${sv.error || 'unknown error'}). See deploy/uptime-ha/README.md.`)}`;
+    const me = sv.self || {}, peer = sv.peer || {};
+    const probs = serverProblems();
+    const latest = (me.update || {}).available_commit;
+    const behind = latest && me.commit && latest !== me.commit;
+    return `${head}
+      ${probs.length ? `<div class="stack">${probs.map(i => `<div class="card pad att-line ${i.level}">${esc(i.text)}</div>`).join('')}</div>` : ''}
+      <div class="card pad srv-summary">
+        <div><b>Status site updates</b> <span class="muted">· GitHub main ${latest ? `is at <b>${short(latest)}</b>` : 'not checked yet'}${me.update && me.update.checked_at ? `, checked ${esc(ago(me.update.checked_at))}` : ''}</span></div>
+        <div class="muted">${behind ? 'A new version is waiting. ' : ''}Each server checks every 5 minutes${me.autoInstall === false ? '; this one waits for you to click Install' : ' and installs new versions by itself'}. An update restarts the app for about 2 seconds and never triggers a failover.</div>
+        <div class="cd-actions"><button class="btn small" data-srv-act="check" data-target="both" data-name="both servers">⌕ Check both for updates</button>
+          ${behind && peer.reachable ? `<button class="btn small primary" data-srv-act="install" data-target="both" data-commit="${esc(latest)}" data-name="both servers">⇩ Update both to ${short(latest)}</button>` : ''}</div>
+      </div>
+      <div class="hosts">${serverCard(me, { me: true, sv, own: me })}${serverCard(peer, { me: false, sv, own: me })}</div>`;
   }
 
   // ------------------------------------------------------------ Containers
@@ -1145,6 +1246,8 @@ const Dash = (() => {
     set('updates', agents().reduce((n, a) => n + ((a.report && a.report.pending) || []).filter(p => !a.decisions[p.id]).length, 0), 'warn');
     set('backups', att.filter(i => i.view === 'backups').length, 'warn');
     set('uptime', ((d.monitors || []).filter(m => m.status === 'down').length) + services().filter(s => s.status === 'down' && !s.stale).length + coreServers().filter(c => c.status === 'down' || c.status === 'degraded').length, 'bad');
+    const sp = serverProblems();
+    set('servers', sp.filter(i => i.level !== 'info').length, sp.some(i => i.level === 'err') ? 'bad' : 'warn');
     const unread = unreadCount();
     set('ask', unread || agents().reduce((n, a) => n + (a.tasks || []).filter(t => !t.action && isBusy(t)).length, 0), unread ? 'new' : '');
     const errs = att.filter(i => i.level === 'err').length;
@@ -1173,7 +1276,7 @@ const Dash = (() => {
     badges(d);
     const target = view === 'uptime' ? $('#v-services') : $(`#v-${view}`);
     if (selectingIn(target)) return;
-    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices, logs: viewLogs }[view];
+    const fn = { overview: viewOverview, containers: viewContainers, updates: viewUpdates, backups: viewBackups, ask: viewAsk, activity: viewActivity, uptime: viewServices, logs: viewLogs, servers: viewServers }[view];
     // Log boxes stay scrolled to the newest line unless you scrolled up to read.
     const boxes = new Map($$('.logbox', target).map(b => [b.dataset.logbox, b.scrollHeight - b.scrollTop - b.clientHeight < 30]));
     // Chat: stay pinned to the newest message unless you scrolled up to read.
@@ -1211,6 +1314,7 @@ const Dash = (() => {
     const v = currentView(d);
     if (v === 'logs' && Date.now() - st.logsAt >= 4500) { await loadLogs(); rerender(); }
     if (v === 'activity' && Date.now() - st.evAt >= 20000) { await loadEvents(); rerender(); }
+    if (v === 'servers' && Date.now() - st.serversAt >= 4500) { await loadServers(); rerender(); }
   }, 5000);
 
   document.addEventListener('toggle', e => {
@@ -1406,6 +1510,29 @@ const Dash = (() => {
       const pk = (p && p.packages) || [];
       st.sel.set(key, new Set(pick.dataset.pick === 'all' ? pk.map(x => x.name) : pick.dataset.pick === 'security' ? pk.filter(x => x.security).map(x => x.name) : []));
       rerender();
+      return;
+    }
+
+    // ---- Servers page: check / install / auto-install / sync on one or both status servers
+    const sa = e.target.closest('[data-srv-act]');
+    if (sa) {
+      const { srvAct: action, target, commit, name } = sa.dataset;
+      const texts = {
+        install: [`Update ${name} to ${short(commit)}?`, 'It tests the new version first, backs up the data, installs it and restarts the app (about 2 seconds on the primary). If the app does not come back, the previous version is put back.'],
+        auto_off: [`Stop automatic updates on ${name}?`, 'New versions will wait here until you click Install.'],
+      };
+      if (texts[action] && !await uiConfirm(texts[action][0], texts[action][1], { ok: action === 'install' ? 'Update' : 'Yes' })) return;
+      sa.disabled = true;
+      try {
+        const targets = target === 'both' ? ['self', 'peer'] : [target];
+        const msgs = [];
+        for (const t of targets) {
+          const r = await api('api/servers/control', { method: 'POST', body: { action, target: t, commit } });
+          msgs.push(r.message);
+        }
+        toast(msgs[0] || 'Done');
+        setTimeout(async () => { await loadServers(); rerender(); }, 1500);
+      } catch (err) { toast(err.message, true); sa.disabled = false; }
       return;
     }
 

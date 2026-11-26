@@ -36,7 +36,8 @@ Some services run as a primary + replica pair across both hosts. The replica's a
   copies its data to the replica every 5 s. It fails over after 60 s and fails back to GOD 2 minutes after
   GOD is healthy again. Role: `pct exec <vmid> -- curl -s 127.0.0.1:8099/role`. Logs: `journalctl -u um-ha`.
   Starting `uptime-monitor` on the replica does nothing (um-ha stops it again within seconds). Restarting
-  `um-ha` is safe. The app updates itself from GitHub (`um-update.timer`). Settings are in
+  `um-ha` is safe. The app updates itself from GitHub (`um-update.timer`; it tests, backs up and rolls back by
+  itself; state in `/var/lib/um-ha/update.json`). The owner manages both servers on the dashboard's **Servers** page. Settings are in
   `/etc/uptime-monitor.env`, which must stay identical on both.
 - **WebManager**: CT 212 `WebManager` on GOD (preferred primary) and CT 213 `WebManager2` on HELP, run by
   `wm-ha.timer` (`journalctl -u wm-ha`). On the replica, its app containers stay stopped on purpose.
