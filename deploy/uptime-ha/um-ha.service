@@ -1,0 +1,15 @@
+[Unit]
+Description=Homelab Status failover (um-ha): runs the app on the primary, syncs data to the replica
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/sbin/um-ha
+Restart=always
+RestartSec=3
+# Stopping um-ha leaves the app as it is (a restart of um-ha doesn't interrupt the site).
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
