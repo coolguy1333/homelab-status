@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.11.0
+
+Internal services and core servers are checked every minute, like the public sites (agent 1.12.0).
+
+- The agent's always-running `hl-poll` service now pings and port-checks every internal service and the core servers
+  (GOD, HELP, HOLY) every 60 seconds and sends the results straight away. It used to happen only with the 5-minute
+  report. A service is marked down after 2 failed checks (2 minutes instead of 10). Plain script, no Claude.
+  Change the interval with `"check_every": 60` (seconds, at least 20) in `~/agent/config.json`.
+- The 5-minute report reuses those results instead of checking again, and the dashboard doesn't count them twice.
+  Agents older than 1.12 keep working as before (checks with the report).
+- Discovery (listening services in every container, tunnel hostnames, WebManager sites) has its own schedule: every
+  90 minutes (`"discover_every_min"`, 60–120), and right away when the set of running containers changes, so a new or
+  restarted container is picked up within 5 minutes. It used to run every 30 minutes with the backup refresh.
+- Service and core-server history moved from `infra.json` to `checks.json` (saved at most once a minute), so the
+  main state file isn't rewritten with it on every agent sync. Existing history is moved over automatically.
+
 ## 2.10.3
 
 Backup server card redesigned (Overview and Backups).
