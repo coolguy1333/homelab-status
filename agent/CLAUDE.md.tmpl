@@ -21,11 +21,15 @@ dashboard ("Ask __NAME__"), through Claude Remote Control, or through another Cl
 - `~/agent/hl_agent.py` (systemd timers, run as root-owned units with `User=agent`):
   - `hl-report.timer`, every 5 minutes: collects status, restarts stopped containers that should be
     running, sends a report to the dashboard, and picks up approvals and tasks.
-  - `hl-update.timer`, nightly: for each container: snapshot (`hlauto<date>`), a risk review of pending
-    apt updates, install (security always; everything if low-risk), a health check, and automatic rollback
+  - `hl-update.timer`, nightly: for each container: snapshot (`hlauto<date>`), a rule-based risk check of
+    pending apt updates (no Claude), install (security always; everything if low-risk), a health check, and automatic rollback
     if services broke. Risky updates and anything on the host wait for approval on the dashboard.
     The dashboard can switch the nightly run to **security updates only** (stored as `policy` in
     `~/agent/state.json`); then only security updates go in and nothing else is held for approval.
+  - **One host updates at a time.** Update runs, single updates and approved host reboots take the
+    dashboard's update lease first, and a container in an HA pair (below) is only updated while its partner
+    is healthy. Never update or reboot both halves of a pair yourself, and never both hosts at once.
+  - All of this monitoring is plain script. You (Claude) only run when someone asks you something.
 - State: `~/agent/state.json`. Logs: `journalctl -u hl-report -u hl-update`, `~/agent/logs/`.
 
 ## High-availability pairs (don't fight them)

@@ -49,6 +49,7 @@ Read endpoints (`/api/status`, `GET /api/monitors/:id`) are public when *Public 
 | DELETE | `/api/infra/:agent/tasks/:id` | admin | Delete a message and its answer (`/api/infra/_all/groups/:group` for a datacenter message). |
 | POST / DELETE | `/api/infra/chats`, `/api/infra/chats/:id`, `/api/infra/chats/:id/rename` | admin | Create (`{"scope", "title"?}`), delete and rename (`{"title"}`) chats. |
 | POST | `/api/agent/report`, `/api/agent/sync` | agent token | Used by the agents (report every 5 min; quick sync / long-poll for new work and live progress). |
+| POST | `/api/agent/lease` | agent token | The datacenter-wide update lease: `{"op":"acquire","id","what","ttl"}` → `{granted, holder, what, until}`; `{"op":"release","id"}`. One agent updates or reboots at a time. |
 
 ## Monitor fields
 

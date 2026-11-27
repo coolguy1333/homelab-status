@@ -814,7 +814,11 @@ const Dash = (() => {
           ${u.count !== 0 ? `<button class="btn small primary" data-act="update" data-agent="${esc(c.agent)}" data-vmid="${c.vmid}" data-name="${esc(c.name)}" title="Snapshot, install everything, health-check, roll back if broken">Update all</button>` : ''}` : ''}</td></tr>`;
     }).join('');
     const running = agents().filter(a => a.progress);
-    return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the agent rates them low-risk, unless you switch a host to <b>security only</b>; the rest wait here. Every update is snapshotted first and rolled back if services break.')}
+    const lease = st.data && st.data.updateLease;
+    const leaseHost = lease ? (agents().find(a => a.name === lease.holder) || null) : null;
+    const leaseLine = lease ? `<p class="hint">🔒 <b>${esc(leaseHost ? hostOf(leaseHost) : lease.holder)}</b> has the update turn${lease.what ? ` (${esc(lease.what)})` : ''} since ${esc(ago(lease.since))}. The other host waits, so both halves of an HA pair are never down together.</p>` : '';
+    return `${pageHead('Updates', 'Security updates install every night automatically. Others install when the built-in rules rate them low-risk, unless you switch a host to <b>security only</b>; the rest wait here. Every update is snapshotted first and rolled back if services break. One host updates at a time.')}
+      ${leaseLine}
       ${running.length ? `<h3 class="sec-title">In progress</h3><div class="stack">${running.map(progressCard).join('')}</div>` : ''}
       <h3 class="sec-title">Waiting for approval</h3><div class="stack">${pendHtml}</div>
       <h3 class="sec-title">Schedule</h3><div class="hosts">${sched}${pbsCards}</div>
@@ -955,7 +959,8 @@ const Dash = (() => {
       last = Math.max(last, t.createdAt || 0, t.finishedAt || 0);
       if (t.output && t.finishedAt) lastAnswer = Math.max(lastAnswer, t.finishedAt);
       if (isBusy(t)) working = true;
-      if (!newest || t.createdAt > newest.createdAt || (t.createdAt === newest.createdAt && t.output && !newest.output)) newest = t;
+      const better = t.output && !t.notMine && !(newest && newest.output && !newest.notMine);
+      if (!newest || t.createdAt > newest.createdAt || (t.createdAt === newest.createdAt && better)) newest = t;
     }
     const preview = newest ? (newest.output && !isBusy(newest) ? plain(newest.output) : `You: ${plain(newest.text)}`) : 'No messages yet';
     const unread = Boolean(seen && lastAnswer > (seen[c.id] || 0) && !(st.askChat === c.id && currentView(state.data) === 'ask'));
@@ -1003,7 +1008,7 @@ const Dash = (() => {
     const scope = chat ? chat.scope : st.askTo;
     const target = scope === '_all' ? ag : ag.filter(a => a.name === scope);
     const offline = target.filter(a => !a.online).map(hostOf);
-    const sub = scope === '_all' ? `Datacenter · every agent answers for its own host (${ag.map(a => esc(hostOf(a))).join(', ')})` : `${esc(scopeLabel(scope))} · agent ${esc(scope)}`;
+    const sub = scope === '_all' ? `Datacenter · one answer covering every host (${ag.map(a => esc(hostOf(a))).join(', ')})` : `${esc(scopeLabel(scope))} · agent ${esc(scope)}`;
     const head = `<div class="chat-head">
         <button class="icon-btn back" data-askback aria-label="Back to chats">‹</button>
         <div class="ch-title"><h3>${chat ? esc(chat.title) : 'New chat'}</h3><div class="muted">${chat ? sub : 'Choose who answers below, then ask'}</div></div>
@@ -1039,7 +1044,7 @@ const Dash = (() => {
     for (const a of target) for (const t of ((a.report && a.report.autoTasks) || [])) auto.push({ ...t, host: hostOf(a) });
     auto.sort((x, y) => y.t - x.t);
     const u = usageSum(target, 'today');
-    return `${pageHead('Ask agents', 'Ask about your hosts and containers, or tell an agent what to fix. <b>Datacenter</b> chats go to every agent at once.')}
+    return `${pageHead('Ask agents', 'Ask about your hosts and containers, or tell an agent what to fix. <b>Datacenter</b> chats ask every host and give you one combined answer.')}
       <div class="ask-app card${st.askPane === 'chat' ? ' show-chat' : ''}">${side}${main}</div>
       ${details(`usage:${scope}`, `Claude usage${target.length === 1 ? ` · ${esc(scopeLabel(scope))}` : ''} — today ${kTok(usageTotal(u))} tokens · ≈ $${u.cost.toFixed(2)}`, usagePanel(target), 'card pad')}
       ${auto.length ? details(`auto:${scope}`, `Automatic fixes the agent${target.length > 1 ? 's' : ''} started (${auto.length})`, `<div class="convo">${auto.map(t => `<div class="msg">
@@ -1104,10 +1109,83 @@ const Dash = (() => {
       return `<div class="msg" data-key="m:${esc(g.id)}">
         <div class="q"><div class="q-text">${esc(g.text)}</div></div>
         <div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${tools}</div>
-        ${g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))).map(({ a, t }) => ansBlock(a, t, `${hostOf(a)}`)).join('')}
+        ${groupAnswer(g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))), g.id)}
       </div>`;
     }).join('');
   }
+
+  // A Datacenter message goes to every agent; their answers are folded into ONE reply here. Hosts that had nothing
+  // to do with it (the agent marks those notMine) are left out, the "answered by a script" note shows once, and
+  // answers that are each a single table with the same columns become one table with a Host column.
+  const SCRIPT_FOOT = /\s*\*⚡ Answered by a script[^\n]*\*\s*$/;
+  const isTableLine = l => /^\s*\|/.test(l);
+  function splitAnswer(a, text) {
+    const lines = String(text || '').replace(SCRIPT_FOOT, '').trim().split('\n');
+    const head = /^#{1,4}\s/.test(lines[0] || '') ? lines.shift() : '';
+    const body = lines.filter(l => l.trim());
+    const table = body.length >= 2 && body.every(isTableLine) ? body : null;
+    return { head, table, text: [head, ...lines].join('\n').trim() };
+  }
+  function mergedTable(items) {
+    const cols = items[0].s.table[0];
+    if (!items.every(x => x.s.table && x.s.table[0] === cols)) return null;
+    // "### Containers on GOD (12)" -> "### Containers on all hosts"
+    const a0 = items[0].a;
+    const names = [hostOf(a0), a0.report && a0.report.host && a0.report.host.node, a0.name].filter(Boolean);
+    let head = items[0].s.head;
+    for (const n of names) head = head.split(n).join('all hosts');
+    head = head.replace(/\s*\(\d+\)\s*$/, '');
+    const rows = items.flatMap(x => x.s.table.slice(2).map(r => `| ${hostOf(x.a)} ${r.trim()}`));
+    return [head, '', `| Host ${cols.trim()}`, `|---${items[0].s.table[1].trim()}`, ...rows].join('\n').trim();
+  }
+  function sumUsage(list) {
+    const us = list.map(p => p.t.usage).filter(Boolean);
+    if (!us.length) return null;
+    if (us.every(u => u.script)) return { script: true };
+    const o = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, ms: 0 };
+    for (const u of us) if (!u.script) for (const k in o) o[k] += Number(u[k]) || 0;
+    return o;
+  }
+  function groupAnswer(parts, gid) {
+    const live = parts.filter(p => p.t.status !== 'cancelled');
+    if (!live.length) return '<div class="ans pending">✦ Datacenter: cancelled</div>';
+    const busy = live.filter(p => isBusy(p.t));
+    const done = live.filter(p => !isBusy(p.t));
+    const relevant = done.filter(p => !p.t.notMine && (p.t.output || p.t.status === 'failed'));
+    const waitLine = busy.length
+      ? `<div class="ans-wait">${typing}<span class="muted"> ${esc(busy.map(p => hostOf(p.a)).join(', '))} · ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>` : '';
+    if (!relevant.length && busy.length) return `<div class="ans pending">${typing}<span><b>Datacenter</b> · ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>`;
+    let body, copy;
+    if (!relevant.length) {
+      const why = done.map(p => `- **${hostOf(p.a)}**: ${String(p.t.output || 'nothing to report').replace(SCRIPT_FOOT, '').trim()}`).join('\n');
+      copy = `None of the hosts had anything for this.\n\n${why}`;
+      body = md(copy);
+    } else {
+      for (const p of relevant) rememberPlan({ ...p.t, agentName: p.a.name });
+      const items = relevant.map(p => ({ ...p, s: splitAnswer(p.a, p.t.output) }));
+      const merged = items.length > 1 && items.every(x => x.s.table) ? mergedTable(items) : null;
+      if (merged) {
+        copy = merged;
+        body = md(merged);
+      } else if (items.length === 1) {
+        copy = items[0].s.text;
+        body = answer(items[0].s.text, items[0].t.id);
+      } else {
+        copy = items.map(x => `## ${hostOf(x.a)}\n${x.s.text}`).join('\n\n');
+        body = items.map(x => `<div class="dc-part${x.t.status === 'failed' ? ' failed' : ''}"><div class="dc-host">${esc(hostOf(x.a))}${x.t.status === 'failed' ? ` ${statusTag('failed')}` : ''}</div>${answer(x.s.text, x.t.id)}</div>`).join('');
+      }
+    }
+    copyables.set(`a:${gid}`, copy);
+    const anyScript = relevant.some(p => p.t.usage && p.t.usage.script);
+    const from = relevant.length && relevant.length < live.length ? ` · from ${relevant.map(p => hostOf(p.a)).join(', ')}` : '';
+    const last = Math.max(0, ...done.map(p => p.t.finishedAt || 0));
+    const failed = relevant.length === 1 && relevant[0].t.status === 'failed';
+    const meta = `<div class="ans-meta"><span class="who">✦ Datacenter</span>${esc(from)}${last && !busy.length ? ` · ${esc(ago(last))}` : ''}${failed ? ` ${statusTag('failed')}` : ''} ${usageLine(sumUsage(relevant))}
+      <button class="linkbtn copy" data-copy="a:${esc(gid)}">Copy</button></div>`;
+    const foot = anyScript && !busy.length ? md(SCRIPT_NOTE_MD) : '';
+    return `<div class="ans${failed ? ' failed' : ''}">${meta}${body}${foot}${waitLine}</div>`;
+  }
+  const SCRIPT_NOTE_MD = '*⚡ Answered by a script from live data — no Claude tokens used. Start a message with `/ai` to ask Claude instead.*';
 
   const statusTag = s => tag(s === 'done' ? 'up' : s === 'failed' ? 'down' : s === 'cancelled' ? '' : 'restart', s);
 
