@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.15.2
+
+Approved reboots wait for running backups (agent 1.14.1).
+
+- **Host reboot:** an approved Proxmox host reboot used to fire 60 s later no matter what. When that landed on the
+  even-hour backup schedule (`*/2:00`), the running backup was killed. The reboot now waits while a backup or
+  restore runs on the host (checked every 30 s, at most 1 h, then it reboots anyway as before). A scheduled backup
+  doesn't show up as a process named `vzdump`, because Proxmox renames its workers to `task UPID:…:vzdump:…`, so
+  the agent checks for both names.
+- **Backup server reboot:** same for HOLY. It waits while PBS has a running `backup` (a host writing to it) or
+  `reader` (restore) task. Verify and garbage collection don't hold it up.
+- A reboot that couldn't be scheduled now shows as an error event instead of nothing.
+- Check: `journalctl -u hl-host-reboot` on the host (`hl-pbs-reboot` on the backup server) shows whether it waited.
+
 ## 2.15.1
 
 Fixes from a bug check of 2.15.0.
