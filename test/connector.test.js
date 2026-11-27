@@ -275,8 +275,10 @@ test('authorize without an Access sign-in, or with an email not in ADMIN_EMAILS,
   let res = await authorize(app, browser(app.base), client.client_id, { challenge: pkce().challenge });
   assert.equal(res.status, 403);
   assert.match(res.html, /Cloudflare Access/);
+  assert.match(res.html, /did not get an Access sign-in/);
   res = await authorize(app, browser(app.base, access.jwt('stranger@example.com')), client.client_id, { challenge: pkce().challenge });
   assert.equal(res.status, 403);
+  assert.match(res.html, /did not accept that sign-in/);
   // An Approve form can't be submitted by someone else.
   const b = browser(app.base, access.jwt(OWNER));
   const q = new URLSearchParams({ response_type: 'code', client_id: client.client_id, redirect_uri: CB, code_challenge: pkce().challenge, code_challenge_method: 'S256' });

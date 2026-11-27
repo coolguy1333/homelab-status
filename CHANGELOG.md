@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.15.1
+
+Fixes from a bug check of 2.15.0.
+
+- **Dashboard after the Access sign-in runs out:** API calls then get Cloudflare's redirect to its login page, which
+  a fetch can't follow, so the page showed "Cannot reach the monitor server" until you reloaded it yourself. It now
+  notices the redirect and reloads (at most once a minute), and Access signs you in again.
+- **Approve page:** when Access signed someone in but the site refused it (not in `ADMIN_EMAILS`, or expired), the
+  page said Access wasn't set up. It now says which one it is.
+- `get_overview` rejects unknown arguments like the other tools.
+- Tests for the Cloudflare Access JWT check (signature, issuer, AUD, expiry, `alg` downgrades, edited claims,
+  service tokens, `ADMIN_EMAILS`, API token rate limit).
+
 ## 2.15.0
 
 **Claude connector** (read-only MCP server at `$PUBLIC_URL/mcp`) and **Cloudflare Access** replaces the site's own
