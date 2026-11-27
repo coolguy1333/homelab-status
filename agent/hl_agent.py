@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -2095,6 +2095,29 @@ def cmd_update(mode=None):
 
 # ------------------------------------------------------------------ approved actions
 
+# An approved reboot waits for running backups and restores (checked every 30 s, at most 1 h) so it can't kill one.
+# A scheduled backup doesn't run as a process named "vzdump": Proxmox renames its workers to
+# "task UPID:<node>:<pid>:<pstart>:<start>:<type>:<id>:<user>:" (PVE::RESTEnvironment::fork_worker). The pattern is
+# anchored, so it can't match this script's own /bin/sh, whose command line contains it.
+REBOOT_WAIT_MAX = 120   # x 30 s
+PVE_BUSY = ("pgrep -x vzdump >/dev/null || "
+            "pgrep -f '^task UPID:([^:]*:){4}(vzdump|vzrestore|qmrestore):' >/dev/null")
+# PBS: "task list" without --all lists running tasks only. backup = a host writing a backup, reader = a restore.
+PBS_BUSY = ("timeout 30 proxmox-backup-manager task list --output-format json 2>/dev/null"
+            " | grep -Eq '\"worker_type\":\"(backup|reader)\"'")
+
+
+def reboot_after_backups(unit, busy):
+    """systemd-run command: in 60 s, wait while `busy` succeeds (backups running), then reboot.
+    `journalctl -u <unit>` on the machine shows whether it waited."""
+    script = (f"i=0; while [ $i -lt {REBOOT_WAIT_MAX} ] && {{ {busy}; }}; do "
+              f"[ $i -eq 0 ] && echo 'A backup or restore is running: waiting for it to finish (at most 1 h)'; "
+              f"i=$((i+1)); sleep 30; done; "
+              f"[ $i -ge {REBOOT_WAIT_MAX} ] && echo 'Still busy after 1 h: rebooting anyway'; "
+              f"echo 'Rebooting'; exec /bin/systemctl reboot")
+    return f"systemd-run --on-active=60 --unit={unit} /bin/sh -c {shlex.quote(script)}"
+
+
 def cmd_action(pid):
     with state() as s:
         item = s["pending"].get(pid)
@@ -2118,11 +2141,14 @@ def cmd_action(pid):
                 s["lastCollect"] = {"host": host, "containers": containers}
             check_host_updates()
         elif kind == "host-reboot":
-            event("warn", "Rebooting the Proxmox host in 60 s (approved). This agent goes down with it.")
+            event("warn", "Rebooting the Proxmox host in 60 s, after any running backup finishes (approved). "
+                          "This agent goes down with it.")
             with state() as s:
                 s["pending"].pop(pid, None)
             cmd_report()
-            ssh("systemd-run --on-active=60 --unit=hl-host-reboot /bin/systemctl reboot")
+            rc, out = ssh(reboot_after_backups("hl-host-reboot", PVE_BUSY))
+            if rc:
+                event("error", f"Could not schedule the host reboot: {out[-300:]}")
             return
         elif kind == "pbs-update":
             sel = item.get("selected")
@@ -2139,10 +2165,12 @@ def cmd_action(pid):
                 s["pending"].pop(pid, None)
             check_pbs_updates()   # refreshes the count and the "reboot needed" flag
         elif kind == "pbs-reboot":
-            event("warn", "Rebooting the backup server in 60 s (approved)")
+            event("warn", "Rebooting the backup server in 60 s, after any running backup or restore finishes (approved)")
             with state() as s:
                 s["pending"].pop(pid, None)
-            pbs_ssh("systemd-run --on-active=60 --unit=hl-pbs-reboot /bin/systemctl reboot")
+            rc, out = pbs_ssh(reboot_after_backups("hl-pbs-reboot", PBS_BUSY))
+            if rc:
+                event("error", f"Could not schedule the backup server reboot: {out[-300:]}")
             with state() as s:
                 (s.get("pbsHost") or {}).update(rebootRequired=False, rebootingAt=now_ms())
         elif kind == "risky-update":
