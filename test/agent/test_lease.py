@@ -170,8 +170,21 @@ class HostRebootTests(unittest.TestCase):
         held = [p for p in self.st["pending"].values() if p["kind"] == "host-reboot"]
         self.assertEqual(len(held), 1)
         self.assertTrue(held[0]["id"].startswith("host-reboot-20261127-held"))
-        self.assertIn("Held back", held[0]["details"])
-        self.assertTrue(any("reboot held" in m for _, m in hl.events))
+        self.assertIn("Held back: the other host was still updating after 2 h", held[0]["details"])
+        self.assertTrue(any("reboot held: the other host was still updating" in m for _, m in hl.events))
+
+    def test_offline_lease_holds_the_reboot(self):
+        hl = self.hl
+        hl.lease_call = lambda op, lid, what="", ttl=0: None   # the dashboard doesn't answer
+        hl.cmd_action(self.item["id"])
+        self.assertFalse([c for c in self.ssh_calls if "reboot" in c], "must not reboot when the lease can't be checked")
+        self.assertNotIn(self.item["id"], self.st["pending"])
+        held = [p for p in self.st["pending"].values() if p["kind"] == "host-reboot"]
+        self.assertEqual(len(held), 1)
+        self.assertTrue(held[0]["id"].startswith("host-reboot-20261127-held"))
+        self.assertIn("the dashboard did not answer", held[0]["details"])
+        self.assertNotIn("still updating after 2 h", held[0]["details"])
+        self.assertTrue(any("reboot held: the dashboard did not answer" in m for _, m in hl.events))
 
     def test_granted_lease_reboots(self):
         hl = self.hl
@@ -179,6 +192,30 @@ class HostRebootTests(unittest.TestCase):
         hl.cmd_action(self.item["id"])
         self.assertTrue([c for c in self.ssh_calls if "hl-host-reboot" in c])
         self.assertFalse(self.st["pending"])
+
+
+class SnapshotCommandTests(unittest.TestCase):
+    SHELL = set("'\"`$();&|<>\\*?[]{}!#~ \t\n")
+
+    def test_description_is_one_safe_argument(self):
+        import shlex
+        hl = load()
+        long_email = "x" * 88 + "@example.com"
+        self.assertEqual(len(long_email), 100)
+        for by in ["o'brien@example.com", "a b", "$(id)", long_email, "", None]:
+            cmd = hl.snapshot_cmd(212, "hlmanual202611271700", by)
+            args = shlex.split(cmd)
+            self.assertEqual(args[:3], ["pct", "snapshot", "212"])
+            self.assertEqual(args[4], "--description", cmd)
+            self.assertEqual(len(args), 6, cmd)
+            desc = args[5]
+            self.assertTrue(desc.startswith("manual snapshot from the dashboard by "), desc)
+            who = desc[len("manual snapshot from the dashboard by "):]
+            self.assertFalse(set(who) & self.SHELL, (by, who))
+            self.assertLessEqual(len(who), 60)
+        self.assertTrue(shlex.split(hl.snapshot_cmd(1, "s", "o'brien@example.com"))[5].endswith("obrien@example.com"))
+        self.assertTrue(shlex.split(hl.snapshot_cmd(1, "s", "$(id)"))[5].endswith(" id"))
+        self.assertTrue(shlex.split(hl.snapshot_cmd(1, "s", None))[5].endswith(" admin"))
 
 
 if __name__ == "__main__":
