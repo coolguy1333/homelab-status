@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -2333,19 +2333,25 @@ def reboot_after_backups(unit, busy):
     return f"systemd-run --on-active=60 --unit={unit} /bin/sh -c {shlex.quote(script)}"
 
 
-def hold_host_reboot(item):
-    """The other host was still updating after the wait: rebooting now could take both halves of an HA pair down.
-    Put the reboot back as waiting for approval. It gets a new id: the old one is already decided on the
+REBOOT_HOLD_REASONS = {
+    "busy": "the other host was still updating after 2 h",
+    "offline": "the dashboard did not answer, so it was unknown whether the other host was updating",
+}
+
+
+def hold_host_reboot(item, reason):
+    """Rebooting now could take both halves of an HA pair down (the other host was busy, or its state couldn't be
+    checked): put the reboot back as waiting for approval. It gets a new id: the old one is already decided on the
     dashboard and handled here, so reusing it would never show up as waiting again."""
+    why = REBOOT_HOLD_REASONS.get(reason, reason)
     held = {k: v for k, v in item.items() if k not in ("t", "selected")}
     held["id"] = f"{str(item.get('id') or 'host-reboot')[:40]}-held{time.strftime('%H%M%S')}"
-    held["details"] = ("Held back: the other Proxmox host was still updating 2 h after this reboot was approved, and "
-                       "rebooting then could have taken both halves of an HA pair down. Approve again to retry.\n\n"
-                       + str(item.get("details") or ""))
+    held["details"] = (f"Held back: {why}, and rebooting then could have taken both halves of an HA pair down. "
+                       "Approve again to retry.\n\n" + str(item.get("details") or ""))
     with state() as s:
         add_pending(s, held)
-    event("warn", "Proxmox host reboot held: the other host was still updating after 2 h, and rebooting now could "
-                  "take both halves of an HA pair down. It is waiting for approval again.")
+    event("warn", f"Proxmox host reboot held: {why}, and rebooting now could take both halves of an HA pair down. "
+                  "It is waiting for approval again.")
     cmd_report()
 
 
@@ -2377,8 +2383,8 @@ def cmd_action(pid):
             # Every container on this host goes down: wait for the other host's update run first, and keep it
             # from starting until this host is back (the lease isn't released; it expires 25 min from now).
             with update_lease(f"{CFG['name']}: Proxmox host reboot", 2 * 3600, ttl=25 * 60, release=False) as ls:
-                if ls["state"] == "busy":
-                    hold_host_reboot(item)
+                if ls["state"] in ("busy", "offline"):
+                    hold_host_reboot(item, ls["state"])
                     return
                 event("warn", "Rebooting the Proxmox host in 60 s, after any running backup finishes (approved). "
                               "This agent goes down with it.")
@@ -2438,6 +2444,14 @@ def cmd_action(pid):
 
 # ------------------------------------------------------------------ direct actions from the dashboard
 
+def snapshot_cmd(vmid, snap, by):
+    """`pct snapshot` for a manual snapshot. `by` comes from the dashboard (a sign-in email): it is cut down to
+    safe characters first, then the whole description is quoted once."""
+    who = re.sub(r"[^A-Za-z0-9@._+-]", "", str(by or ""))[:60] or "admin"
+    desc = f"manual snapshot from the dashboard by {who}"
+    return f"pct snapshot {int(vmid)} {shlex.quote(snap)} --description {shlex.quote(desc)}"
+
+
 def cmd_ctaction(tid):
     with state() as s:
         t = s["tasks"].get(tid)
@@ -2468,7 +2482,7 @@ def cmd_ctaction(tid):
                 out = (o + "\n" if o else "") + stt
         elif typ == "snapshot":
             snap = "hlmanual" + time.strftime("%Y%m%d%H%M")
-            rc, o = ssh(f"pct snapshot {vmid} {snap} --description 'manual snapshot from the dashboard by {shlex.quote(str(by or 'admin'))[:60]}'", 600)
+            rc, o = ssh(snapshot_cmd(vmid, snap, by), 600)
             ok, out = rc == 0, (f"Snapshot {snap} created." if rc == 0 else o)
         elif typ == "backup":
             with state() as s:

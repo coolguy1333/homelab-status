@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.16.2
+
+Two agent fixes (agent 1.15.2).
+
+- **Host reboot when the lease can't be checked:** an approved Proxmox host reboot was only held when the other host
+  was still updating ("busy"). When the dashboard didn't answer ("offline"), it rebooted anyway, though the other
+  host could have been updating an HA partner right then. Offline is now held like busy and put back as waiting for
+  approval under a new id. The held item and the event say which it was: "the other host was still updating after
+  2 h", or "the dashboard did not answer, so it was unknown whether the other host was updating".
+- **Manual snapshot description:** the dashboard user was put through `shlex.quote` inside single quotes and cut
+  after quoting, so an email with an apostrophe broke the command, a space split it into extra arguments, and the
+  cut could leave a quote open. The user is now cut down to letters, digits and `@ . _ + -` (at most 60
+  characters), and the whole description is quoted once (`snapshot_cmd`). No other agent command had the pattern.
+- Tests: a host reboot with an offline lease is held with the offline reason and never sent; the snapshot command
+  splits into one clean description argument for `o'brien@example.com`, `a b`, `$(id)` and a 100-character email.
+
 ## 2.16.1
 
 A lost update lease now stops HA-sensitive work (agent 1.15.1).
