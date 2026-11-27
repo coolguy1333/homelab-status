@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -2162,7 +2162,9 @@ def cmd_update(mode=None):
 # On top of that, a container that is one half of a pair (it has /etc/um-ha.conf or /etc/wm-ha.conf) is only
 # updated while its partner is healthy, and never when the lease couldn't be taken (dashboard unreachable).
 LEASE_TTL = 15 * 60
-LEASE = {"state": "none", "id": None, "linger": 0}   # state: held | busy | offline | none
+LEASE = {"state": "none", "id": None, "linger": 0}   # state: held | lost | busy | offline | none
+# held: ours. lost: it was ours, but a renewal was refused (another agent holds it now) or went unanswered for
+# longer than its ttl (so it has expired on the dashboard): from then on HA containers are held, like busy/offline.
 
 
 def lease_call(op, lid, what="", ttl=LEASE_TTL):
@@ -2216,10 +2218,23 @@ def update_lease(what, wait_s, ttl=LEASE_TTL, release=True):
     stop = threading.Event()
 
     def renew():
+        last_ok = time.time()
         while not stop.wait(min(240, ttl / 3)):
+            if LEASE["state"] != "held" or LEASE.get("id") != lid:
+                return
             r = lease_call("acquire", lid, what, ttl)
-            if r is not None and not r.get("granted"):
-                log(f"update lease lost to {r.get('holder')}", "warn")
+            if r is not None and r.get("granted"):
+                last_ok = time.time()
+            elif r is not None:
+                LEASE["state"] = "lost"
+                event("warn", f"{what}: lost the update lease to {r.get('holder')} ({r.get('what') or 'updating'}). "
+                              "Containers in an HA pair are left alone for the rest of this run.")
+                return
+            elif time.time() - last_ok > ttl:
+                LEASE["state"] = "lost"
+                event("warn", f"{what}: the dashboard has not answered for {round((time.time() - last_ok) / 60)} min, so "
+                              "the update lease has expired there. Containers in an HA pair are left alone for the rest of this run.")
+                return
 
     th = None
     if LEASE["state"] == "held":
@@ -2229,7 +2244,7 @@ def update_lease(what, wait_s, ttl=LEASE_TTL, release=True):
         yield LEASE
     finally:
         stop.set()
-        if LEASE["state"] == "held":
+        if LEASE["state"] == "held":  # never release or extend a lost lease: it isn't ours any more
             if LEASE.get("linger"):   # our own container reboots in a moment: keep the other host waiting a bit
                 lease_call("acquire", lid, f"{what} (this agent's container is rebooting)", LEASE["linger"])
             elif release:
@@ -2280,6 +2295,9 @@ def ha_guard(vmid, label):
         return (f"one half of an HA pair ({kind}, partner {ip}) and the update lease couldn't be taken "
                 f"({LEASE['state']}), so the other host may be updating its partner")
     for i in range(30):   # up to ~10 min: the partner may still be coming back from the other host's run
+        if LEASE["state"] != "held":  # lost while waiting
+            return (f"one half of an HA pair ({kind}, partner {ip}) and the update lease was lost "
+                    f"({LEASE['state']}), so the other host may be updating its partner")
         ok, why = peer_healthy(kind, ip)
         if ok:
             plog(f"{label}: HA partner {ip} is healthy ({why})")
@@ -2315,6 +2333,22 @@ def reboot_after_backups(unit, busy):
     return f"systemd-run --on-active=60 --unit={unit} /bin/sh -c {shlex.quote(script)}"
 
 
+def hold_host_reboot(item):
+    """The other host was still updating after the wait: rebooting now could take both halves of an HA pair down.
+    Put the reboot back as waiting for approval. It gets a new id: the old one is already decided on the
+    dashboard and handled here, so reusing it would never show up as waiting again."""
+    held = {k: v for k, v in item.items() if k not in ("t", "selected")}
+    held["id"] = f"{str(item.get('id') or 'host-reboot')[:40]}-held{time.strftime('%H%M%S')}"
+    held["details"] = ("Held back: the other Proxmox host was still updating 2 h after this reboot was approved, and "
+                       "rebooting then could have taken both halves of an HA pair down. Approve again to retry.\n\n"
+                       + str(item.get("details") or ""))
+    with state() as s:
+        add_pending(s, held)
+    event("warn", "Proxmox host reboot held: the other host was still updating after 2 h, and rebooting now could "
+                  "take both halves of an HA pair down. It is waiting for approval again.")
+    cmd_report()
+
+
 def cmd_action(pid):
     with state() as s:
         item = s["pending"].get(pid)
@@ -2344,7 +2378,8 @@ def cmd_action(pid):
             # from starting until this host is back (the lease isn't released; it expires 25 min from now).
             with update_lease(f"{CFG['name']}: Proxmox host reboot", 2 * 3600, ttl=25 * 60, release=False) as ls:
                 if ls["state"] == "busy":
-                    event("warn", "The other host was still updating after 2 h; rebooting anyway (approved)")
+                    hold_host_reboot(item)
+                    return
                 event("warn", "Rebooting the Proxmox host in 60 s, after any running backup finishes (approved). "
                               "This agent goes down with it.")
                 cmd_report()
