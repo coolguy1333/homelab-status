@@ -74,7 +74,18 @@ async function api(path, opts = {}) {
     headers: opts.body !== undefined ? { 'Content-Type': 'application/json' } : {},
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
     credentials: 'same-origin',
+    // An expired Cloudflare Access sign-in answers API calls with a redirect to the Access login page, which a
+    // fetch can't follow (other origin, CSP connect-src 'self'). The app itself never redirects /api/*.
+    redirect: 'manual',
   });
+  if (res.type === 'opaqueredirect') {
+    // Reload so Access can sign you in again, at most once a minute (a stuck redirect would otherwise loop).
+    const last = Number(sessionStorage.getItem('accessReloadAt') || 0);
+    if (Date.now() - last > 60e3) { sessionStorage.setItem('accessReloadAt', String(Date.now())); location.reload(); }
+    const err = new Error('Your Cloudflare Access sign-in ran out: reload the page to sign in again');
+    err.status = 401;
+    throw err;
+  }
   let data = null;
   try { data = await res.json(); } catch { /* empty */ }
   if (!res.ok) {
