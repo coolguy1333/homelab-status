@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.16.1
+
+A lost update lease now stops HA-sensitive work (agent 1.15.1).
+
+- **Lost lease:** a renewal that was refused (the other agent took the lease) only logged a line, and the run kept
+  treating the lease as its own, so containers in an HA pair could still be updated while the other host updated
+  their partners. The same happened when renewals went unanswered for longer than the lease's ttl (it had expired
+  on the dashboard by then). Both now mark the lease **lost** with a warning event. From then on every HA container
+  in the run is held, including one that was waiting for its partner to get healthy. Other containers carry on.
+  A lost lease is never released or extended at the end, since it isn't this agent's any more.
+- **Host reboot:** when the other host was still updating after the 2 h wait, an approved Proxmox host reboot went
+  ahead anyway, which could take both halves of an HA pair down. It is now held and put back as waiting for
+  approval (under a new id, so the dashboard shows it again), with a warning event.
+- Agent tests: `npm run test:agent` (`python3 -m unittest discover -s test/agent`, standard library only).
+
 ## 2.16.0
 
 Scripts do the monitoring, one answer per Datacenter question, and HA pairs are never updated together (agent 1.15.0).
