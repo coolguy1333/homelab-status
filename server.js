@@ -705,11 +705,20 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, ...out });
   }
 
+  // One host updates at a time: agents take this lease before updating or rebooting (see Infra.lease).
+  if (p === '/api/agent/lease' && method === 'POST') {
+    const name = infra.agentFrom(req);
+    if (!name) return send(res, 401, { error: 'Invalid or missing agent token' });
+    if (needJson()) return;
+    const body = await readBody(req, 4096);
+    return send(res, 200, infra.lease(name, body));
+  }
+
   // Everything else about the infrastructure is for signed-in admins only, even on a public dashboard:
   // it names hosts, containers and IPs, and lets you send the agents work.
   if (p === '/api/infra' && method === 'GET') {
     if (needAuth()) return;
-    return send(res, 200, { agents: infra.summary(), services: infra.services(), core: infra.coreSummary(), chats: infra.chatList(), serverTime: Date.now() });
+    return send(res, 200, { agents: infra.summary(), services: infra.services(), core: infra.coreSummary(), chats: infra.chatList(), updateLease: infra.leaseInfo(), serverTime: Date.now() });
   }
 
   // ---- the status servers themselves (um-ha pair): see both, update either, from this one

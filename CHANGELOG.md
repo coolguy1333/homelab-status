@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.16.0
+
+Scripts do the monitoring, one answer per Datacenter question, and HA pairs are never updated together (agent 1.15.0).
+
+- **Monitoring is script-only.** Nothing automatic calls Claude any more. The nightly update risk check uses the
+  built-in rules (`claude_review` now defaults to `never`; set `"auto"` in the agent's config.json for the old
+  behaviour), and a container that won't start is reported as an error event instead of being handed to Claude
+  (`"autofix_claude": true` brings that back). Claude runs only when you ask it something in a chat.
+- **Datacenter chats give one answer.** Every host still checks its own side, but the dashboard folds the replies
+  into a single answer. A host whose side has nothing to do with the question (a container that lives on the other
+  host) answers "not mine" and is left out: by script for status/start/restart/ping/updates, and Claude is told to
+  reply `NOT_FOR_THIS_HOST`. Answers that are one table each (like "list containers") become one table with a
+  Host column, and the script note shows once.
+- **One host updates at a time.** Update runs, single container updates and approved host reboots take a
+  datacenter-wide lease from the dashboard (`POST /api/agent/lease`) first. The other agent waits (nightly: up to
+  3 h, `lease_wait_min`), so the two halves of an HA pair (WebManager 212/213, status site 214/215, the tunnel
+  connectors) are never updated or rebooted at the same time. A host reboot keeps the lease for 25 min so the
+  other host waits until it is back. A connector that reboots itself after updates keeps it 6 more minutes.
+- **HA partner check.** A container with `/etc/um-ha.conf` or `/etc/wm-ha.conf` is updated only while its partner
+  is healthy (um-ha `/role`: a primary with a healthy app, or a replica synced in the last 2 min; wm-ha
+  `/healthz`), waiting up to 10 min for it. If the lease couldn't be taken (dashboard unreachable, or the other
+  host still busy) it is held for that night instead.
+- `/api/infra` includes `updateLease` (who is updating now).
+
 ## 2.15.2
 
 Approved reboots wait for running backups (agent 1.14.1).

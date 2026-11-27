@@ -7,7 +7,10 @@ Runs on a connector container as user `agent`, reaching its Proxmox host as root
   hl_agent.py update        nightly: snapshot -> risk check -> update -> health check -> roll back if broken
                             (security updates only when the dashboard's nightly policy says so)
   hl_agent.py action <id>   carry out an approved pending item (started by `report`)
-  hl_agent.py task <id>     run a task sent from the dashboard through Claude (started by `report`)
+  hl_agent.py task <id>     answer a chat message from the dashboard: a script for simple requests, Claude otherwise
+
+Monitoring, auto-fixes and nightly updates are plain scripts: Claude only runs when someone asks in a chat
+(config "autofix_claude": true and "claude_review": "auto" turn the old automatic uses back on).
   hl_agent.py show          print the report that would be sent
 
 Config: ~/agent/config.json. State: ~/agent/state.json. Python standard library only.
@@ -30,7 +33,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.14.1"
+VERSION = "1.15.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -44,7 +47,7 @@ DRY = "--dry-run" in sys.argv
 
 APT_ENV = "DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a"
 APT_OPTS = "-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
-# Packages where a major-version jump is likely to need hand work. Only used when Claude can't be asked.
+# Packages where a major-version jump is likely to need hand work (the built-in update risk rules).
 RISKY_RE = re.compile(r"^(postgresql|mysql|mariadb|mongodb|redis|nginx|apache2|php\d|nodejs|docker|containerd|"
                       r"pihole|lighttpd|python3\.\d+$|openjdk|zfs|proxmox|pve-|libc6$|systemd$|openssh-server$)")
 
@@ -782,7 +785,7 @@ def check_core():
 
 
 def autofix(s, host, containers):
-    """Cheap, safe fixes done without Claude. Anything harder goes to Claude, at most every few hours."""
+    """Cheap, safe fixes done by the script. Anything harder is reported as an error event for a person to look at."""
     for c in containers:
         vmid = c["vmid"]
         if c["onboot"] and c["status"] != "running" and vmid not in CFG["exclude_vmids"]:
@@ -798,7 +801,8 @@ def autofix(s, host, containers):
                     c["status"] = "starting"
                 else:
                     event("error", f"{c['name']} ({vmid}) is {c['status']} and would not start: {out[-200:]}", s)
-                    if cooled(s, f"claudefix:{vmid}", int(CFG.get("autofix_claude_hours", 24)) * 3600):
+                    # Monitoring is script-only: handing a stuck container to Claude is opt-in ("autofix_claude").
+                    if CFG.get("autofix_claude") and cooled(s, f"claudefix:{vmid}", int(CFG.get("autofix_claude_hours", 24)) * 3600):
                         queue_internal_task(s, f"Container {c['name']} (vmid {vmid}) on this host is {c['status']} and "
                                                f"`pct start {vmid}` failed with:\n{out[-1500:]}\n\nFind out why and fix it "
                                                f"so it runs again. Take a snapshot first if you change anything inside it.")
@@ -825,9 +829,14 @@ def queue_internal_task(s, text):
 
 # ------------------------------------------------------------------ report
 
+def task_result(t):
+    """A chat/action task as the dashboard stores it. notMine: a Datacenter message this host had nothing for."""
+    return {"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage"),
+            **({"notMine": True} if t.get("notMine") else {})}
+
+
 def build_report(s, host, containers):
-    tasks = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage")}
-             for t in s["tasks"].values() if not t.get("internal")]
+    tasks = [task_result(t) for t in s["tasks"].values() if not t.get("internal")]
     pending = sorted(s["pending"].values(), key=lambda p: p["t"])
     internal = [t for t in s["tasks"].values() if t.get("internal")]
     # Every event since the last report all dashboards received (the dashboard keeps the history; this covers the gap).
@@ -863,8 +872,7 @@ def sync(url, wait=0):
     """Quick channel: send task progress, then wait up to `wait` s for new work from the dashboard."""
     with state() as s:
         cutoff = now_ms() - 15 * 60e3
-        results = [{"id": t["id"], "status": t["status"], "output": t.get("output", "")[-20000:], "usage": t.get("usage")}
-                   for t in s["tasks"].values() if not t.get("internal") and t.get("u", t["t"]) > cutoff]
+        results = [task_result(t) for t in s["tasks"].values() if not t.get("internal") and t.get("u", t["t"]) > cutoff]
         acked = list(s["handled"].keys())
         prog = s.get("progress")
     if prog:
@@ -1086,6 +1094,22 @@ def handle_replies(replies):
 DC_PREFIX = re.compile(r"^\[Datacenter-wide request:[^\]]*\]\s*", re.S)
 FORCE_AI = re.compile(r"^\s*(/ai|/claude|claude[:,])\s*", re.I)
 SCRIPT_NOTE = "\n\n*⚡ Answered by a script from live data — no Claude tokens used. Start a message with `/ai` to ask Claude instead.*"
+# A Datacenter message goes to every agent, and the dashboard merges the answers into one. An agent whose host has
+# nothing to do with the request (a container that lives on the other host) answers "not mine", and the dashboard
+# leaves that out. Claude is told to reply with exactly NOT_MINE_TOKEN in that case.
+NOT_MINE_TOKEN = "NOT_FOR_THIS_HOST"
+DC_REQ = False  # set by quick_answer: is the message a Datacenter-wide one?
+
+
+class NotHere(Exception):
+    """The request names something that is not on this host (Datacenter messages only)."""
+
+
+def _here(found, word):
+    """Raise NotHere when a Datacenter request names a container this host doesn't have."""
+    if DC_REQ and not found:
+        raise NotHere(f"No container called `{word}` on this host.")
+    return found
 
 
 def _bytes(n):
@@ -1157,17 +1181,21 @@ def q_ping(targets_text):
     if re.search(r"\b(all|everything|every container|all containers)\b", targets_text):
         targets = [(c["name"], _ip_of(c, services)) for c in cts if c["status"] == "running"]
     else:
-        targets = []
+        targets, missing = [], []
         for w in words:
             w = w.strip(" .,!?'\"`")
             if re.match(r"^\d+\.\d+\.\d+\.\d+$", w) or re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", w, re.I):
                 targets.append((w, w))
                 continue
             found = _find(cts, w)
+            if not found and DC_REQ:
+                missing.append(w)  # on the other host: its agent pings that one
+                continue
             if len(found) != 1:
                 return None  # not clearly a container or address: let Claude handle it
             targets.append((found[0]["name"], _ip_of(found[0], services)))
     if not targets:
+        _here([], " ".join(missing))
         return None
     rows = []
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -1181,7 +1209,7 @@ def q_ping(targets_text):
 
 def q_status(word):
     host, cts, services, _, _ = _snapshot()
-    found = _find(cts, word)
+    found = _here(_find(cts, word), word)
     if len(found) != 1:
         return None
     c = found[0]
@@ -1206,7 +1234,7 @@ def q_status(word):
 
 def q_power(verb, word):
     host, cts, _, _, _ = _snapshot()
-    found = _find(cts, word, exact_only=True)  # never guess which container to stop or restart
+    found = _here(_find(cts, word, exact_only=True), word)  # never guess which container to stop or restart
     if len(found) != 1:
         return None
     c = found[0]
@@ -1281,7 +1309,7 @@ def q_problems():
 def q_updates(word=None):
     host, cts, _, _, _ = _snapshot()
     if word:
-        found = _find(cts, word)
+        found = _here(_find(cts, word), word)
         if len(found) != 1:
             return None
         c = found[0]
@@ -1364,7 +1392,10 @@ QUICK = [
 
 
 def quick_answer(text):
-    """The script's answer to a simple request, or None when Claude should handle it."""
+    """The script's answer to a simple request, or None when Claude should handle it.
+    Raises NotHere when a Datacenter request is about something on the other host."""
+    global DC_REQ
+    DC_REQ = bool(DC_PREFIX.match(text))
     t = DC_PREFIX.sub("", text).strip().lower()
     t = re.sub(r"[?.!]+$", "", t).strip()
     if not t or len(t) > 160 or "\n" in t:
@@ -1374,6 +1405,8 @@ def quick_answer(text):
         if m:
             try:
                 ans = fn(m)
+            except NotHere:
+                raise
             except Exception as e:  # a script bug must not lose the question: fall back to Claude
                 log(f"quick answer failed ({e!r}); asking Claude", "warn")
                 return None
@@ -1397,12 +1430,17 @@ def cmd_task(tid):
     if forced:
         text = prefix + (text[len(prefix) + forced.end():] or text[len(prefix):])
     elif not internal and CFG.get("quick_answers", True):
-        ans = quick_answer(text)
+        not_mine = False
+        try:
+            ans = quick_answer(text)
+        except NotHere as e:
+            ans, not_mine = str(e), True
         if ans:
             with state() as s:
                 t = s["tasks"].get(tid)
                 if t:
-                    t.update(status="done", output=(ans + SCRIPT_NOTE)[-20000:], u=now_ms(), usage={"script": True})
+                    t.update(status="done", output=(ans if not_mine else ans + SCRIPT_NOTE)[-20000:], u=now_ms(),
+                             usage={"script": True}, **({"notMine": True} if not_mine else {}))
                 d = s.setdefault("usageDaily", {}).setdefault(time.strftime("%Y-%m-%d"),
                                                              {"runs": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0})
                 d["scripted"] = d.get("scripted", 0) + 1
@@ -1424,10 +1462,17 @@ def cmd_task(tid):
               "Proxmox hosts as root. Include: the problem and the evidence you found; numbered steps with the exact "
               "commands and which machine each runs on; risks, and how to undo each step; how to verify it worked. "
               "Never include passwords, tokens or keys. Leave the section out if you fixed everything.")
+    dc_rule = ""
+    if prefix:
+        dc_rule = ("\n\nThis is a Datacenter message: every host's agent gets it and the dashboard merges the answers "
+                   "into ONE reply. So answer only for your host, don't mention the other host or the merge, and don't "
+                   "repeat the question. If the request has nothing to do with your host (for example it names a "
+                   f"container or service that isn't on it), reply with exactly `{NOT_MINE_TOKEN}` and nothing else.")
+        prompt += dc_rule
     if session:  # follow-up in an existing chat: Claude already has the context and the rules
         prompt = (f"Follow-up from {who} in the same conversation:\n\n{text}\n\n"
                   "Same rules and format as before (Markdown; end with what you changed; add a "
-                  "`## Handoff plan for Claude Code` section only if you could not solve it).")
+                  "`## Handoff plan for Claude Code` section only if you could not solve it)." + dc_rule)
     rc, out = claude(prompt, kind="autofix" if internal else "task", label=text[:120], resume=session)
     usage = dict(LAST_USAGE)
     if chat and LAST_SESSION:
@@ -1437,12 +1482,17 @@ def cmd_task(tid):
             if len(cs) > 300:
                 for k in list(cs)[:-300]:
                     cs.pop(k)
+    not_mine = bool(prefix) and rc == 0 and out.strip().strip("`*. ") == NOT_MINE_TOKEN
+    if not_mine:
+        out = "Nothing on this host for that."
     with state() as s:
         t = s["tasks"].get(tid)
         if t:
             t["status"] = "done" if rc == 0 else "failed"
             t["output"] = out[-20000:] or "(no output)"
             t["u"] = now_ms()
+            if not_mine:
+                t["notMine"] = True
             if usage:
                 t["usage"] = {k: usage.get(k) for k in ("input", "output", "cacheRead", "cacheWrite", "cost", "model", "turns", "ms")}
         if internal:
@@ -1500,8 +1550,9 @@ def rules_risk(pkgs, removals):
 
 def risk_review(name, pkgs, removals):
     """Could these updates break the container? Returns (risk, reasons). The built-in rules decide the clear cases;
-    Claude is asked only about packages that jump a minor/major version, and its verdict is reused for 14 days."""
-    mode = CFG.get("claude_review", "auto")  # auto | always | never
+    By default ("claude_review": "never") the rules decide everything: nightly updates never wait on Claude. With
+    "auto", Claude is asked only about packages that jump a minor/major version, and its verdict is reused for 14 days."""
+    mode = CFG.get("claude_review", "never")  # never | auto | always
     risk, reasons, sure = rules_risk(pkgs, removals)
     if mode == "never" or (mode == "auto" and sure):
         return risk, reasons + ["(decided by the built-in rules; Claude was not needed)"]
@@ -1810,7 +1861,7 @@ def update_container(vmid, name, mode="auto", only=None):
     elif blocked:
         plan, reasons = ("security" if sec else "none"), [f"full updates paused: {blocked}"]
     else:
-        progress("review", f"{label}: asking Claude to review {len(pkgs)} update(s)", pkgs=len(pkgs))
+        progress("review", f"{label}: checking the risk of {len(pkgs)} update(s)", pkgs=len(pkgs))
         risk, reasons = risk_review(name, pkgs, removals)
         plog(f"{label}: review says {risk} risk" + (": " + "; ".join(reasons[:5]) if reasons else ""), "warn" if risk == "high" else "info")
         plan = "full" if risk == "low" else ("security" if sec else "none")
@@ -1840,6 +1891,14 @@ def update_container(vmid, name, mode="auto", only=None):
         if plan == "none":
             set_container(vmid, lastUpdate={"t": now_ms(), "result": "held", "msg": "; ".join(reasons)[:300]})
             return f"{label}: {len(pkgs)} update(s) held for approval"
+
+    # Never both halves of an HA pair at once (see "one host updates at a time").
+    why = ha_guard(vmid, label)
+    if why:
+        plog(f"{label}: not updating now: {why}", "warn")
+        event("warn", f"{label}: updates held this time: {why}")
+        set_container(vmid, lastUpdate={"t": now_ms(), "result": "held", "msg": why[:300]})
+        return f"{label}: held ({why})"
 
     # Snapshot first. Without one there is no rollback, so only security fixes go in.
     snap = "hlauto" + time.strftime("%Y%m%d%H%M")
@@ -1882,6 +1941,7 @@ def update_container(vmid, name, mode="auto", only=None):
         # Can't watch our own reboot or roll ourselves back from inside: hand those to the host.
         if needs_reboot:
             ssh(f"systemd-run --on-active=90 --unit=hl-selfreboot-{snap or 'x'} pct reboot {int(vmid)}")
+            LEASE["linger"] = 6 * 60  # the other connector carries the tunnels meanwhile: keep its run waiting
             event("info", f"{label}: updated ({what}); rebooting this agent's container in 90 s")
         result = "ok" if apt_ok else "failed"
         set_container(vmid, lastUpdate={"t": now_ms(), "result": result, "msg": f"{what}; {out[-200:] if not apt_ok else 'done'}"},
@@ -2053,14 +2113,15 @@ def cmd_update(mode=None):
         results = []
         progress_start("run", mode, targets, "Security-only update run" if mode == "security" else "Nightly update run")
         try:
-            for vmid, name in targets:
-                try:
-                    results.append(update_container(vmid, name, mode=mode))
-                except Exception as e:
-                    results.append(f"{name} ({vmid}): error {e}")
-                    event("error", f"{name} ({vmid}): update run crashed: {e}")
-                log(results[-1])
-                progress_result(vmid, name, results[-1])
+            with update_lease(f"{CFG['name']} update run", int(CFG.get("lease_wait_min", 180)) * 60):
+                for vmid, name in targets:
+                    try:
+                        results.append(update_container(vmid, name, mode=mode))
+                    except Exception as e:
+                        results.append(f"{name} ({vmid}): error {e}")
+                        event("error", f"{name} ({vmid}): update run crashed: {e}")
+                    log(results[-1])
+                    progress_result(vmid, name, results[-1])
             if DRY:
                 print("\n".join(results))
                 return
@@ -2091,6 +2152,142 @@ def cmd_update(mode=None):
                                     "summary": summary + "\n" + "\n".join(results)})
         event("error" if bad else "info", "Nightly update: " + summary)
     cmd_report()
+
+
+# ------------------------------------------------------------------ one host updates at a time
+# Both halves of an HA pair (WebManager 212/213, UptimeMonitor 214/215, the two tunnel connectors) live on different
+# Proxmox hosts. So that they are never updated or rebooted together, anything that can take containers down (an
+# update run, a single container update, an approved host reboot) first takes the datacenter-wide "updates" lease
+# from the dashboard: the other agent waits until it is released (or expires, LEASE_TTL after the last renewal).
+# On top of that, a container that is one half of a pair (it has /etc/um-ha.conf or /etc/wm-ha.conf) is only
+# updated while its partner is healthy, and never when the lease couldn't be taken (dashboard unreachable).
+LEASE_TTL = 15 * 60
+LEASE = {"state": "none", "id": None, "linger": 0}   # state: held | busy | offline | none
+
+
+def lease_call(op, lid, what="", ttl=LEASE_TTL):
+    """Ask the dashboard for the update lease. Returns its answer, or None when no dashboard answered."""
+    body = json.dumps({"op": op, "id": lid, "what": what[:200], "ttl": int(ttl * 1000)}).encode()
+    for url in CFG["site_urls"]:
+        req = urllib.request.Request(url.rstrip("/") + "/api/agent/lease", data=body, method="POST", headers={
+            "Content-Type": "application/json", "Authorization": f"Bearer {CFG['token']}",
+            "User-Agent": f"homelab-agent/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode() or "{}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log(f"update lease ({op}) via {url}: {e}", "warn")
+    return None
+
+
+@contextmanager
+def update_lease(what, wait_s, ttl=LEASE_TTL, release=True):
+    """Hold the datacenter-wide update lease while the block runs (renewed every few minutes). Waits up to wait_s
+    for another agent's run to finish. LEASE["state"] tells the block whether it got it."""
+    import threading
+    if DRY:
+        LEASE.update(state="held", id=None, linger=0)
+        yield LEASE
+        return
+    lid = secrets.token_hex(6)
+    LEASE.update(state="none", id=lid, linger=0)
+    deadline, told = time.time() + wait_s, False
+    while True:
+        r = lease_call("acquire", lid, what, ttl)
+        if r is None:
+            LEASE["state"] = "offline"
+            event("warn", f"{what}: the dashboard did not answer, so the other host's update state is unknown. "
+                          "Containers in an HA pair are left alone this time.")
+            break
+        if r.get("granted"):
+            LEASE["state"] = "held"
+            break
+        if time.time() >= deadline:
+            LEASE["state"] = "busy"
+            event("warn", f"{what}: {r.get('holder')} was still busy ({r.get('what') or 'updating'}) after "
+                          f"{round(wait_s / 60)} min. Containers in an HA pair are left alone this time.")
+            break
+        if not told:
+            told = True
+            msg = f"Waiting for {r.get('holder')} to finish ({r.get('what') or 'updating'}) — one host updates at a time"
+            log(msg)
+            progress("wait", msg)  # no-op unless an update run is showing progress
+        time.sleep(30)
+    stop = threading.Event()
+
+    def renew():
+        while not stop.wait(min(240, ttl / 3)):
+            r = lease_call("acquire", lid, what, ttl)
+            if r is not None and not r.get("granted"):
+                log(f"update lease lost to {r.get('holder')}", "warn")
+
+    th = None
+    if LEASE["state"] == "held":
+        th = threading.Thread(target=renew, daemon=True)
+        th.start()
+    try:
+        yield LEASE
+    finally:
+        stop.set()
+        if LEASE["state"] == "held":
+            if LEASE.get("linger"):   # our own container reboots in a moment: keep the other host waiting a bit
+                lease_call("acquire", lid, f"{what} (this agent's container is rebooting)", LEASE["linger"])
+            elif release:
+                lease_call("release", lid)
+        LEASE.update(state="none", id=None, linger=0)
+
+
+def ha_peer(vmid):
+    """(kind, peer ip) when the container is one half of an HA pair, else None. ("unknown", None) when the
+    container couldn't be looked into: treated as a pair, so a failed check never lets both halves go down."""
+    rc, out = cx(vmid, "for f in /etc/um-ha.conf /etc/wm-ha.conf; do [ -f $f ] && echo \"$f $(sed -n 's/^PEER_IP=//p' $f | head -1)\"; done; echo HA-CHECKED", 60)
+    if rc != 0 or "HA-CHECKED" not in out:
+        return "unknown", None
+    for line in out.splitlines():
+        m = re.match(r"^/etc/(um-ha|wm-ha)\.conf\s+(\d+\.\d+\.\d+\.\d+)\s*$", line.strip())
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def peer_healthy(kind, ip):
+    """Is the other half of the pair up and able to carry the service on its own? Returns (ok, why)."""
+    try:
+        if kind == "um-ha":
+            with urllib.request.urlopen(f"http://{ip}:8099/role", timeout=5) as r:
+                d = json.loads(r.read().decode() or "{}")
+            if d.get("role") == "primary":
+                return (bool(d.get("app")), "primary" + ("" if d.get("app") else ", app not healthy"))
+            synced = d.get("syncedAt") or 0
+            fresh = now_ms() - synced < 120e3
+            return (d.get("role") == "replica" and fresh, f"{d.get('role')}, last sync {_ago(synced) if synced else 'never'}")
+        req = urllib.request.Request(f"http://{ip}:8080/healthz", headers={"Host": "127.0.0.1"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status == 200, f"healthz {r.status}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return False, f"not answering ({getattr(e, 'reason', e)})"
+
+
+def ha_guard(vmid, label):
+    """None when the container may be updated now; otherwise why not (it's held for this run)."""
+    pair = ha_peer(vmid)
+    if not pair:
+        return None
+    kind, ip = pair
+    if not ip:
+        return "couldn't check inside the container whether it is one half of an HA pair"
+    if LEASE["state"] != "held":
+        return (f"one half of an HA pair ({kind}, partner {ip}) and the update lease couldn't be taken "
+                f"({LEASE['state']}), so the other host may be updating its partner")
+    for i in range(30):   # up to ~10 min: the partner may still be coming back from the other host's run
+        ok, why = peer_healthy(kind, ip)
+        if ok:
+            plog(f"{label}: HA partner {ip} is healthy ({why})")
+            return None
+        if i == 0:
+            progress("wait", f"{label}: waiting for its HA partner {ip} to be healthy ({why})")
+        time.sleep(20)
+    return f"its HA partner {ip} ({kind}) is not healthy ({why}); updating it now would take the service down"
 
 
 # ------------------------------------------------------------------ approved actions
@@ -2141,14 +2338,20 @@ def cmd_action(pid):
                 s["lastCollect"] = {"host": host, "containers": containers}
             check_host_updates()
         elif kind == "host-reboot":
-            event("warn", "Rebooting the Proxmox host in 60 s, after any running backup finishes (approved). "
-                          "This agent goes down with it.")
             with state() as s:
                 s["pending"].pop(pid, None)
-            cmd_report()
-            rc, out = ssh(reboot_after_backups("hl-host-reboot", PVE_BUSY))
-            if rc:
-                event("error", f"Could not schedule the host reboot: {out[-300:]}")
+            # Every container on this host goes down: wait for the other host's update run first, and keep it
+            # from starting until this host is back (the lease isn't released; it expires 25 min from now).
+            with update_lease(f"{CFG['name']}: Proxmox host reboot", 2 * 3600, ttl=25 * 60, release=False) as ls:
+                if ls["state"] == "busy":
+                    event("warn", "The other host was still updating after 2 h; rebooting anyway (approved)")
+                event("warn", "Rebooting the Proxmox host in 60 s, after any running backup finishes (approved). "
+                              "This agent goes down with it.")
+                cmd_report()
+                rc, out = ssh(reboot_after_backups("hl-host-reboot", PVE_BUSY))
+                if rc:
+                    event("error", f"Could not schedule the host reboot: {out[-300:]}")
+                    lease_call("release", ls["id"])
             return
         elif kind == "pbs-update":
             sel = item.get("selected")
@@ -2186,7 +2389,8 @@ def cmd_action(pid):
                 progress_start("single", "selected" if item.get("selected") else "full", [vmid], f"Approved update: {name} ({vmid})")
                 r = "crashed"
                 try:
-                    r = update_container(vmid, name, mode="full", only=item.get("selected"))
+                    with update_lease(f"{CFG['name']}: approved update of {name}", 30 * 60):
+                        r = update_container(vmid, name, mode="full", only=item.get("selected"))
                 finally:
                     progress_end(summary=r)
             event("info", f"Approved update: {r}")
@@ -2248,7 +2452,8 @@ def cmd_ctaction(tid):
                 progress_start("single", mode, [vmid], f"{'Security updates' if mode == 'security' else 'Update'}: {label}")
                 lines = []
                 try:
-                    out = update_container(vmid, name, mode=mode)
+                    with update_lease(f"{CFG['name']}: update of {label}", 30 * 60):
+                        out = update_container(vmid, name, mode=mode)
                 finally:
                     lines = progress_end(summary=out or "crashed")
                 out = f"{out}\n\n--- log ---\n{fmt_log(lines)}" if lines else out
