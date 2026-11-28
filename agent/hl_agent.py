@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -861,7 +861,8 @@ def build_report(s, host, containers):
         "core": s.get("coreChecks") if checks_fresh(s) else check_core(),
         "public": (s.get("slow") or {}).get("public", []),
         "webmanager": (s.get("slow") or {}).get("webmanager", []),
-        "pbsHost": s.get("pbsHost") if pbs_owner() else None,
+        "pbsHost": ({**(s.get("pbsHost") or {}), "runs": (s.get("pbsRuns") or [])[-20:],
+                     "policy": (s.get("policy") or {}).get("pbs", "ask")} if pbs_owner() and s.get("pbsHost") else None),
         "schedule": {"updates": CFG.get("update_time"), "reportEvery": 300,
                      "securityOnly": bool((s.get("policy") or {}).get("securityOnly"))},
         "policy": s.get("policy"),
@@ -1063,9 +1064,13 @@ def handle_replies(replies):
             tasks[t["id"]] = t
     with state() as s:
         if policy is not None and (s.get("policy") or {}).get("at") != policy.get("at"):
-            s["policy"] = {"securityOnly": bool(policy.get("securityOnly")), "at": policy.get("at"), "by": policy.get("by")}
+            old_pbs = (s.get("policy") or {}).get("pbs", "ask")
+            s["policy"] = {"securityOnly": bool(policy.get("securityOnly")), "at": policy.get("at"), "by": policy.get("by"),
+                           "pbs": "security" if policy.get("pbs") == "security" else "ask"}
             event("info", f"Nightly updates set to {'security updates only' if s['policy']['securityOnly'] else 'full (risk-checked)'}"
-                          f" by {policy.get('by') or 'the dashboard'}", s)
+                          + (f"; backup server: {'security updates nightly' if s['policy']['pbs'] == 'security' else 'ask first'}"
+                             if pbs_owner() and old_pbs != s["policy"]["pbs"] else "")
+                          + f" by {policy.get('by') or 'the dashboard'}", s)
         for did, d in decisions.items():
             if did in s["handled"]:
                 continue
@@ -2144,6 +2149,60 @@ def check_pbs_updates():
     return len(pkgs)
 
 
+PBS_WAIT_MAX = 60   # x 30 s: how long an update waits for a running backup or restore on the backup server
+
+
+def pbs_install(mode, by):
+    """Install the backup server's updates now: mode "full" (apt full-upgrade) or "security" (security packages only).
+    Asked for on the dashboard (the click is the approval) or, with the backup server's nightly setting on "security",
+    by the nightly run. Waits (at most 30 min) for a running backup or restore so the update can't break it. Never
+    reboots: a needed reboot still waits for approval. Returns a one-line summary; the run is kept in pbsRuns."""
+    if not pbs_owner():
+        raise RuntimeError('this agent does not manage the backup server\'s updates ("pbs_updates" is off)')
+    started = now_ms()
+    rc, out = pbs_ssh("apt-get update -q >/dev/null 2>&1; apt list --upgradable 2>/dev/null", 900)
+    if rc != 0 and "Listing" not in out:
+        raise RuntimeError(f"apt on the backup server failed: {out[-200:]}")
+    pkgs = parse_upgradable(out)
+    pick = pkgs if mode == "full" else [p for p in pkgs if p["security"]]
+    what = "security update(s)" if mode == "security" else "update(s)"
+    level, log_out = "info", ""
+    if not pick:
+        summary = f"No {what} for the backup server."
+    else:
+        waited = 0
+        while waited < PBS_WAIT_MAX and pbs_ssh(PBS_BUSY, 60)[0] == 0:
+            if waited == 0:
+                event("info", "Backup server update: a backup or restore is running, waiting for it to finish (at most 30 min)")
+            waited += 1
+            time.sleep(30)
+        if waited >= PBS_WAIT_MAX:
+            level, summary = "warn", f"Held: a backup or restore was still running after 30 min, so {len(pick)} {what} were not installed."
+        else:
+            event("info", f"Installing {len(pick)} {what} on the backup server (requested by {by})")
+            if mode == "full":
+                rc, log_out = pbs_ssh(f"{APT_ENV} apt-get {APT_OPTS} dist-upgrade 2>&1 | tail -40", 3600)
+            else:
+                names = " ".join(shlex.quote(p["name"]) for p in pick)
+                rc, log_out = pbs_ssh(f"{APT_ENV} apt-get {APT_OPTS} install --only-upgrade {names} 2>&1 | tail -40", 3600)
+            ok = rc == 0 and "E: " not in log_out
+            level = "info" if ok else "error"
+            summary = (f"{len(pick)} {what} installed on the backup server" if ok
+                       else f"Installing {len(pick)} {what} on the backup server failed: "
+                            f"{log_out.strip().splitlines()[-1][:200] if log_out.strip() else 'no output'}")
+    n = check_pbs_updates()   # refreshes the count, the pending approval and the "reboot needed" flag
+    with state() as s:
+        reboot = bool((s.get("pbsHost") or {}).get("rebootRequired"))
+        tail = f"; {n} update(s) left" + ("; reboot needed (waiting for approval)" if reboot else "")
+        runs = s.setdefault("pbsRuns", [])
+        runs.append({"t": now_ms(), "level": level, "mode": mode, "by": by, "min": round((now_ms() - started) / 60000),
+                     "summary": summary + tail + ("\n" + "\n".join(f"{p['name']} {p['old']} -> {p['new']}" for p in pick[:100]) if pick else "")
+                                + (f"\n\n--- apt ---\n{log_out.strip()[-3000:]}" if log_out.strip() else "")})
+        del runs[:-20]
+        event(level, f"Backup server: {summary}{tail}", s)
+    return summary + tail
+
+
 def cmd_update(mode=None):
     """Nightly run. mode: None = follow the dashboard's policy, "security" = security updates only."""
     if mode is None:
@@ -2194,7 +2253,14 @@ def cmd_update(mode=None):
                 progress("host", "Checking the backup server for updates")
                 try:
                     n = check_pbs_updates()
-                    results.append(f"backup server: {n} update(s) waiting for approval" if n else "backup server: up to date")
+                    with state() as s:
+                        pbs_auto = (s.get("policy") or {}).get("pbs") == "security"
+                        sec = ((s.get("pbsHost") or {}).get("updates") or {}).get("security", 0)
+                    if pbs_auto and sec:
+                        progress("host", "Installing the backup server's security updates")
+                        results.append("backup server: " + pbs_install("security", "the nightly run"))
+                    else:
+                        results.append(f"backup server: {n} update(s) waiting for approval" if n else "backup server: up to date")
                 except Exception as e:
                     results.append(f"backup server: update check failed: {e}")
                 plog(results[-1])
@@ -2587,6 +2653,9 @@ def cmd_ctaction(tid):
         elif typ == "check-updates":
             n = check_host_updates()
             out = f"{n} host package update(s) available." if n else "The host is up to date."
+        elif typ in ("pbs-update-all", "pbs-update-security"):
+            out = pbs_install("security" if typ == "pbs-update-security" else "full", by or "the dashboard")
+            ok = "failed" not in out and not out.startswith("Held")
         elif typ == "check-pbs-updates":
             if not pbs_owner():
                 raise RuntimeError('this agent does not manage the backup server\'s updates ("pbs_updates" is off)')
