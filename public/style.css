@@ -94,7 +94,7 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, C
 .locked, .empty { padding: 32px; text-align: center; }
 /* View only (not in ADMIN_EMAILS): control buttons are hidden; the server refuses them anyway. */
 .ro-note { margin: 0 0 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 13px; }
-body.read-only :is([data-act], [data-decide], [data-srv-act], [data-policy], .pkg-pick, [data-ask], [data-retry], [data-cancel],
+body.read-only :is([data-act], [data-decide], [data-srv-act], [data-policy], [data-pbspolicy], .pkg-pick, [data-ask], [data-retry], [data-cancel],
   [data-cancelgroup], [data-delmsg], [data-delgroup], [data-delchat], [data-renamechat], [data-newchat], [data-revoke-client],
   #testNotifyBtn, #settingsForm .file-btn, #settingsForm button[type="submit"]) { display: none !important; }
 .locked p, .empty p { color: var(--muted); }
@@ -798,3 +798,4 @@ a.head-status:hover { filter: brightness(.95); }
 .att-line { font-size: 13px; padding: 10px 14px; border-left: 3px solid var(--muted); }
 .att-line.err { border-left-color: var(--down); }
 .att-line.warn { border-left-color: var(--pending); }
+.sched .cd-actions + .meta { margin-top: 10px; }

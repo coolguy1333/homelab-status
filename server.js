@@ -798,7 +798,7 @@ async function handleApi(req, res, url) {
       return send(res, 200, { ok: true });
     }
     if (im[3]) { if (im[2] !== 'tasks') return send(res, 404, { error: 'Not found' }); infra.cancelTask(im[1], im[3]); return send(res, 200, { ok: true }); }
-    if (im[2] === 'policy') return send(res, 200, infra.setPolicy(im[1], bool(body.securityOnly), who));
+    if (im[2] === 'policy') return send(res, 200, infra.setPolicy(im[1], { ...('securityOnly' in body ? { securityOnly: bool(body.securityOnly) } : {}), ...('pbs' in body ? { pbs: String(body.pbs) } : {}) }, who));
     if (im[2] === 'actions') return send(res, 201, infra.addAction(im[1], String(body.type || ''), body.vmid, who));
     if (!String(body.text || '').trim()) return send(res, 400, { error: 'Write a message first' });
     const chatId = body.chat ? String(body.chat).slice(0, 40) : null;

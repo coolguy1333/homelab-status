@@ -703,7 +703,7 @@ const Dash = (() => {
   }
 
   // Recent one-click actions for a container (or the host when vmid is null).
-  const PBS_ACTS = ['check-pbs-updates'];
+  const PBS_ACTS = ['check-pbs-updates', 'pbs-update-all', 'pbs-update-security'];
   function actionLog(agent, vmid, { pbs = false } = {}) {
     const a = agents().find(x => x.name === agent);
     // Host cards and the backup server card share vmid null: split them by action type.
@@ -780,12 +780,25 @@ const Dash = (() => {
     const pbsCards = ag.filter(a => a.report.pbsHost && a.report.pbsHost.name).map(a => {
       const ph = a.report.pbsHost;
       const pu = ph.updates || {};
+      const sch = a.report.schedule || {};
       const waiting = (a.report.pending || []).filter(p => (p.kind === 'pbs-update' || p.kind === 'pbs-reboot') && !a.decisions[p.id]).length;
+      const newAgent = verGte(a.report.agentVersion, '1.17.0');
+      const want = (a.policy && a.policy.pbs) || ph.policy || 'ask';
+      const syncing = newAgent && a.policy && a.policy.pbs && ph.policy && a.policy.pbs !== ph.policy;
+      const runs = ph.runs || [];
+      const last = runs[runs.length - 1];
+      const btn = (act, label, extra = '') => `<button class="btn small" data-act="${act}" data-agent="${esc(a.name)}" data-name="${esc(ph.name)}" ${extra}>${label}</button>`;
       return `<div class="card pad sched"><div class="host-head">${dot(a.online ? 'up' : 'down')}<div><h3>${esc(ph.name)} <span class="muted">${esc(ph.ip || '')}</span></h3>
-        <div class="muted">Backup server · checked nightly by ${esc(a.name)} at <b>${esc((a.report.schedule || {}).updates || '?')}</b> · packages: ${pu.count ?? '—'} waiting${pu.security ? ` (<span class="pct-bad">${pu.security} security</span>)` : ''}
+        <div class="muted">Nightly at <b>${esc(sch.updates || '?')}</b> (by ${esc(a.name)}) · packages: ${pu.count ?? '—'} waiting${pu.security ? ` (<span class="pct-bad">${pu.security} security</span>)` : ''}
           · <button class="linkbtn" data-act="check-pbs-updates" data-agent="${esc(a.name)}" data-name="${esc(ph.name)}">check now</button></div></div>
           ${ph.rebootRequired ? '<span class="pill warn">reboot needed</span>' : ''}</div>
-        <p class="muted">Updates and reboots of the backup server always wait for your approval${waiting ? ` — <b>${waiting}</b> waiting above` : ''}.</p>
+        ${newAgent ? `<div class="policy"><span class="pol-k">Nightly run installs</span>
+          <div class="seg small" data-pbspolicy="${esc(a.name)}"><button class="${want === 'ask' ? 'on' : ''}" data-val="ask" title="Nothing is installed by itself: updates wait for your approval">Ask me first</button><button class="${want === 'security' ? 'on' : ''}" data-val="security" title="The nightly run installs the backup server's security updates (after any running backup); everything else waits for approval">Security only</button></div>
+          ${syncing ? '<span class="muted pol-note">sending to the agent…</span>' : ''}</div>`
+          : `<p class="muted">Updates of the backup server wait for your approval (agent ${esc(a.report.agentVersion || '?')}: update it to 1.17 for the buttons).</p>`}
+        ${last ? `<p>${levelTag(last.level)} Last run ${esc(ago(last.t))}: ${esc(String(last.summary).split('\n')[0])}</p>` : `<p class="muted">No update run yet${waiting ? ` — <b>${waiting}</b> waiting for approval above` : ''}.</p>`}
+        ${newAgent ? `<div class="cd-actions">${btn('pbs-update-all', '⟳ Update the backup server now', pu.count === 0 ? 'title="Up to date at the last check"' : '')}
+          ${btn('pbs-update-security', `⛨ Security updates only${pu.security ? ` (${pu.security})` : ''}`, pu.security ? '' : 'title="No security updates at the last check"')}</div>` : ''}
         <div class="meta">
           ${ph.version ? `<span>PBS <b>${esc(String(ph.version).split(' ')[0])}</b></span>` : ''}
           ${ph.kernel ? `<span>Kernel <b>${esc(ph.kernel)}</b></span>` : ''}
@@ -793,6 +806,7 @@ const Dash = (() => {
           <span>Checked <b>${pu.checkedAt ? esc(ago(pu.checkedAt)) : 'tonight'}</b></span>
         </div>
         ${actionLog(a.name, null, { pbs: true })}
+        ${runs.length ? details(`pbsruns:${a.name}`, `Run history (${runs.length})`, `<ul class="events">${runs.slice().reverse().map(u => `<li><time>${esc(fmtDate(u.t))}</time>${levelTag(u.level)}<span><pre class="inline">${esc(u.summary)}</pre></span></li>`).join('')}</ul>`) : ''}
       </div>`;
     }).join('');
 
@@ -1533,14 +1547,29 @@ const Dash = (() => {
     'update-all-security': n => [`Install security updates on every container on ${n}?`, 'Each container is snapshotted, gets only its security updates, and is checked one by one.'],
     'check-updates': n => [`Check ${n} for host package updates?`, ''],
     'check-pbs-updates': n => [`Check backup server ${n} for package updates?`, 'Nothing is installed: updates wait for your approval.'],
+    'pbs-update-all': n => [`Install all updates on backup server ${n} now?`, 'Runs apt full-upgrade on the backup server (keeping config files), after any running backup or restore finishes. It does not reboot: a needed reboot waits for your approval.'],
+    'pbs-update-security': n => [`Install only the security updates on backup server ${n}?`, 'Waits for any running backup or restore to finish. Other updates stay pending; a needed reboot waits for your approval.'],
   };
-  const ACT_OK = { update: 'Update', 'update-security': 'Install', 'update-all': 'Run now', 'update-all-security': 'Install', shutdown: 'Shut down', reboot: 'Reboot' };
+  const ACT_OK = { update: 'Update', 'update-security': 'Install', 'update-all': 'Run now', 'update-all-security': 'Install', 'pbs-update-all': 'Update', 'pbs-update-security': 'Install', shutdown: 'Shut down', reboot: 'Reboot' };
 
   document.addEventListener('click', async e => {
     const seg = e.target.closest('.seg button');
     if (seg) {
       const wrap = seg.closest('.seg');
       const val = seg.dataset.val;
+      if (wrap.dataset.pbspolicy) {
+        const agent = wrap.dataset.pbspolicy;
+        const a = agents().find(x => x.name === agent);
+        const ph = (a && a.report && a.report.pbsHost) || {};
+        const cur = (a && a.policy && a.policy.pbs) || ph.policy || 'ask';
+        if (cur === val) return;
+        try {
+          await api(`api/infra/${encodeURIComponent(agent)}/policy`, { method: 'POST', body: { pbs: val } });
+          toast(val === 'security' ? `${ph.name || 'Backup server'}: nightly run installs security updates` : `${ph.name || 'Backup server'}: updates wait for your approval`);
+          await load(state.data); rerender();
+        } catch (err) { toast(err.message, true); }
+        return;
+      }
       if (wrap.dataset.policy) {
         const agent = wrap.dataset.policy;
         const securityOnly = val === 'security';

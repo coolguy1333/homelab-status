@@ -122,3 +122,30 @@ test('a failed part is still merged; an older or offline agent never gets a merg
   infra2.applyResults('connector1', { taskResults: [{ id: u1.id, status: 'done', output: 'a' }] });
   assert.strictEqual(merges(infra2).length, 0, 'falls back to the per-host answers');
 });
+
+// ---- the backup server card (agent 1.17+): its own nightly setting and update buttons
+test('policy: pbs and securityOnly are set independently and reach the agent', () => {
+  const infra = fresh();
+  infra.setPolicy('connector1', { securityOnly: true }, 'admin');
+  infra.setPolicy('connector1', { pbs: 'security' }, 'admin');
+  assert.deepStrictEqual([infra.data.policy.connector1.securityOnly, infra.data.policy.connector1.pbs], [true, 'security']);
+  infra.setPolicy('connector1', { securityOnly: false }, 'admin');
+  assert.strictEqual(infra.data.policy.connector1.pbs, 'security', 'kept');
+  assert.strictEqual(infra.outbox('connector1').policy.pbs, 'security');
+  assert.throws(() => infra.setPolicy('connector1', { pbs: 'everything' }, 'admin'), /pbs must be/);
+  infra.setPolicy('connector2', true, 'admin'); // old call shape
+  assert.deepStrictEqual([infra.data.policy.connector2.securityOnly, infra.data.policy.connector2.pbs], [true, 'ask']);
+});
+
+test('backup server update actions only go to the agent that manages it', () => {
+  const infra = fresh();
+  infra.data.agents = {
+    connector1: { receivedAt: Date.now(), report: { containers: [], pbsHost: { name: 'HOLY' } } },
+    connector2: { receivedAt: Date.now(), report: { containers: [] } },
+  };
+  const t = infra.addAction('connector1', 'pbs-update-security', null, 'admin');
+  assert.deepStrictEqual(t.action, { type: 'pbs-update-security', vmid: null });
+  assert.ok(infra.addAction('connector1', 'pbs-update-all', null, 'admin'));
+  assert.throws(() => infra.addAction('connector2', 'pbs-update-all', null, 'admin'), /does not manage the backup server/);
+  assert.throws(() => infra.addAction('connector1', 'pbs-update-all', null, 'admin'), /already queued/);
+});

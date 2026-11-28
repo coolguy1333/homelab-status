@@ -1,6 +1,6 @@
 {
   "name": "homelab-status",
-  "version": "2.18.2",
+  "version": "2.19.0",
   "description": "Homelab status: uptime monitors plus Proxmox hosts/containers reported by connector agents, with a read-only Claude connector (MCP).",
   "main": "server.js",
   "scripts": {

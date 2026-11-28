@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.19.0
+
+The backup server's card on the Updates page works like the Proxmox hosts' cards (agent 1.17.0).
+
+- **Same layout and buttons as GOD and HELP:** the nightly time and packages waiting with "check now", a
+  **Nightly run installs** switch, the last run, **⟳ Update the backup server now** and **⛨ Security updates only (n)**,
+  the action log, and **Run history**.
+- **Nightly run installs:** **Ask me first** (the default, same as before: updates wait for approval) or
+  **Security only** (the nightly run installs the backup server's security updates; everything else waits for
+  approval). It is stored as `pbs` next to the host's own setting (`POST /api/infra/:agent/policy {"pbs": "ask" |
+  "security"}`; whatever is left out keeps its value).
+- **The buttons** (actions `pbs-update-all` and `pbs-update-security`, only for the agent that manages the backup
+  server): clicking is the approval. The agent first waits for a running backup or restore to finish (checked every
+  30 s, at most 30 min, otherwise the run is held). Then it runs `apt full-upgrade`, or `install --only-upgrade` for
+  the security packages, and checks again. It **never reboots**: a needed reboot still waits for approval.
+- **Runs:** each install is kept in `pbsHost.runs` (the last 20, with the package list and apt's output) for
+  "Last run" and Run history.
+- In view-only mode (not in `ADMIN_EMAILS`) the switch and buttons are hidden like the hosts'.
+- With an agent older than 1.17, the card keeps the old "wait for approval" text and shows no buttons.
+- **Tests:**
+  - Site: the policy fields are set independently and reach the agent, and the backup server actions only go to the
+    agent that manages it.
+  - Agent: a security run installs only security packages, and a full run uses dist-upgrade.
+  - Agent: a run waits for a running backup, is held after 30 min, never reboots, and is refused when the agent
+    doesn't manage the backup server. The policy keeps `pbs`.
+
 ## 2.18.2
 
 Datacenter chats show nothing but a progress line until the one combined answer is there.
