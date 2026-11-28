@@ -1033,7 +1033,8 @@ const Dash = (() => {
     const draftKey = chat ? chat.id : 'new';
     const toSeg = chat ? '' : `<div class="to-row"><span class="muted">To</span><div class="seg small scroll" data-askto>${[['_all', 'Datacenter (all)'], ...ag.map(a => [a.name, hostOf(a)])]
       .map(([v, l]) => { const a = ag.find(x => x.name === v); return `<button type="button" class="${st.askTo === v ? 'on' : ''}" data-val="${esc(v)}">${a ? dot(a.online ? 'up' : 'down') : '◎ '}${esc(l)}</button>`; }).join('')}</div></div>`;
-    const form = `<form class="ask-form composer" data-agent="${esc(scope)}" data-chat="${chat ? esc(chat.id) : ''}" data-draft="${esc(draftKey)}">
+    const readOnly = !(state.data && state.data.canControl);
+    const form = readOnly ? '<p class="composer-hint muted ro-composer">View only: only the emails in ADMIN_EMAILS can send the agents messages.</p>' : `<form class="ask-form composer" data-agent="${esc(scope)}" data-chat="${chat ? esc(chat.id) : ''}" data-draft="${esc(draftKey)}">
         ${toSeg}
         <div class="composer-box"><textarea name="text" rows="1" maxlength="4000" aria-label="Message" placeholder="${chat ? 'Reply — the agent remembers this conversation…' : 'Ask a question or describe what to fix…'}">${esc(st.drafts[draftKey] || '')}</textarea>
           <button class="btn primary send" type="submit">Send</button></div>
