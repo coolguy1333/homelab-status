@@ -21,8 +21,9 @@ Set them in your shell, in Docker/Compose, in `/etc/uptime-monitor.env` (systemd
 | `HOST` | `0.0.0.0` | Address to bind to. `127.0.0.1` = only reachable from the same machine (e.g. via a reverse proxy). |
 | `CF_ACCESS_TEAM_DOMAIN` | | Your Cloudflare Zero Trust team domain, e.g. `yourteam.cloudflareaccess.com`. Sign-in is Cloudflare Access: see [CLOUDFLARE_ACCESS.md](CLOUDFLARE_ACCESS.md). |
 | `CF_ACCESS_AUD` | | The Access application's *Application Audience (AUD) Tag* (several, comma-separated). Without both variables nobody is signed in. |
-| `ADMIN_EMAILS` | | Optional. Comma-separated emails (`@example.com` = a whole domain) that count as admins, checked on top of the Access policy. Empty = whoever Access lets in. |
-| `ADMIN_PASSWORD` | *(generated)* | API token for scripts (`Authorization: Bearer ...`). When unset, the one in `DATA_DIR/admin-password.txt` is used; that file is created with a random token on first start. |
+| `ADMIN_EMAILS` | | **Needed to control anything.** Comma-separated emails (`@example.com` = a whole domain). Only these Access users can send agents work, approve updates, run container and server actions, and change settings (see [Viewing and controlling](#viewing-and-controlling)). When set, it is also a second check on top of the Access policy: other emails are not signed in at all. Empty = whoever Access lets in can view, and nobody can control. |
+| `ADMIN_PASSWORD` | *(generated)* | API token for scripts (`Authorization: Bearer ...`). It can view and manage monitors, but is read-only for agents, servers and settings unless `CONTROL_API_TOKEN=1`. When unset, the one in `DATA_DIR/admin-password.txt` is used; that file is created with a random token on first start. |
+| `CONTROL_API_TOKEN` | `false` | `1` lets the `ADMIN_PASSWORD` token control too (agent work, approvals, container and server actions, settings), for scripts. The startup log warns while it is on. |
 | `PUBLIC_URL` | | Public base URL (e.g. `https://status.example.com`). Required for the [Claude connector](#claude-connector-mcp) (OAuth issuer, `/mcp` address). |
 | `MCP_ENABLED` | `true` | The Claude connector (`/mcp`, `/oauth/*`, `/.well-known/oauth-*`). `false` turns all of it off. |
 | `MCP_REDIRECT_ALLOWLIST` | Claude's callbacks | Comma-separated OAuth redirect URIs clients may register. Default: `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback`. |
@@ -37,6 +38,22 @@ Set them in your shell, in Docker/Compose, in `/etc/uptime-monitor.env` (systemd
 | `PEER_TOKEN` | | Shared secret sent as `Authorization: Bearer <PEER_TOKEN>` between peers. Recommended whenever `PEERS` is set; use the same value on every server in the group. |
 
 **Changing the API token:** set `ADMIN_PASSWORD` and restart, or edit `admin-password.txt` and restart.
+
+### Viewing and controlling
+
+Signing in lets you **view** everything and manage monitors (add, edit, delete, check now). **Controlling** needs
+more, because agent work runs as root on the Proxmox hosts:
+
+- sending the agents messages (chats, Datacenter messages), cancelling, deleting or renaming them,
+- approving or denying updates and reboots, the nightly update policy,
+- container and host actions (start, shut down, reboot, snapshot, back up, update, run the nightly update),
+- checking for and installing versions on the status servers (Servers page),
+- saving settings, sending a test notification, revoking a connected Claude client, importing monitors.
+
+Only a Cloudflare Access user whose email is in `ADMIN_EMAILS` can control. With `ADMIN_EMAILS` empty nobody can,
+and the startup log says `Nobody can send agents work until ADMIN_EMAILS is set.` The API token can control only
+with `CONTROL_API_TOKEN=1`. Everyone else gets `403` on those requests, and the dashboard hides those buttons and
+shows one line saying why. `/api/status` answers `canControl: true|false` for the current sign-in.
 
 ## Monitor types
 

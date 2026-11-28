@@ -9,6 +9,10 @@ Admin endpoints accept either:
 - a Cloudflare Access sign-in: the `Cf-Access-Jwt-Assertion` header (or `CF_Authorization` cookie) that Access adds to every request it lets through (what the browser uses; see [CLOUDFLARE_ACCESS.md](CLOUDFLARE_ACCESS.md)), or
 - an `Authorization: Bearer <ADMIN_PASSWORD>` header (handy for scripts).
 
+**admin** endpoints need either. **control** endpoints (they send agents work, approve, act on containers or the
+status servers, or change settings) need a Cloudflare Access user listed in `ADMIN_EMAILS`, or the API token with
+`CONTROL_API_TOKEN=1`. Anyone else signed in gets `403`. `/api/status` includes `canControl` for the current sign-in.
+
 The site has no login or logout endpoints: Cloudflare Access does that (`/cdn-cgi/access/logout`).
 
 Requests that change data must send `Content-Type: application/json` (this also protects against cross-site request forgery).
@@ -31,23 +35,25 @@ Read endpoints (`/api/status`, `GET /api/monitors/:id`) are public when *Public 
 | DELETE | `/api/monitors/:id` | admin | Delete a monitor and its history. |
 | POST | `/api/monitors/:id/check` | admin | Run a check now; returns the updated monitor. |
 | GET | `/api/settings` | admin | Current settings. |
-| PUT | `/api/settings` | admin | Update `title`, `webhooks` (array or newline-separated string), `publicDashboard`, `publicShowTargets`. |
-| POST | `/api/settings/test-notification` | admin | Send a test message to all webhooks. |
+| PUT | `/api/settings` | control | Update `title`, `webhooks` (array or newline-separated string), `publicDashboard`, `publicShowTargets`. |
+| POST | `/api/settings/test-notification` | control | Send a test message to all webhooks. |
 | GET | `/api/oauth/clients` | admin | Claude connector: `{ enabled, url, reason, clients: [{ id, name, redirectHost, accounts, connectedAt, lastUsedAt }] }`. |
-| DELETE | `/api/oauth/clients/:id` | admin | Revoke a connected client (all its tokens stop working). |
+| DELETE | `/api/oauth/clients/:id` | control | Revoke a connected client (all its tokens stop working). |
 | GET | `/api/export` | admin | Download monitors and settings as JSON. |
-| POST | `/api/import` | admin | `{"monitors": [...]}` — adds monitors (same fields as create). |
+| POST | `/api/import` | control | `{"monitors": [...]}` — adds monitors (same fields as create). |
 | GET | `/api/infra` | admin | Agents (reports, tasks, decisions, nightly `policy`, live update `progress`), internal services and chats. |
-| POST | `/api/infra/:agent/actions` | admin | `{"type", "vmid"}`. Container types: `start`, `shutdown`, `reboot`, `snapshot`, `backup`, `check`, `update`, `update-security`. Host types (no `vmid`): `update-all`, `update-all-security`, `check-updates`. |
+| POST | `/api/infra/:agent/actions` | control | `{"type", "vmid"}`. Container types: `start`, `shutdown`, `reboot`, `snapshot`, `backup`, `check`, `update`, `update-security`. Host types (no `vmid`): `update-all`, `update-all-security`, `check-updates`. |
 | GET | `/api/infra/:agent/logs` | admin | The newest lines (up to 1000) of that agent's `~/agent/logs/agent.log`: `{ "lines": [{ "t", "p" (process), "l" (info/warn/error), "m" }] }` (agent 1.9+). |
 | GET | `/api/infra/:agent/events` | admin | The agent's event history kept by the dashboard (what Activity shows): up to 3000 events, 30 days. |
 | GET | `/api/infra/:agent/runs/:id` | admin | One update run's full log (`/api/infra` lists the runs under each agent's `runs`). |
-| POST | `/api/infra/:agent/policy` | admin | `{"securityOnly": true}` makes that host's nightly run install security updates only (agent 1.9+). |
-| POST | `/api/infra/:agent/decision` | admin | `{"id", "decision": "approve" \| "deny", "packages"?: [...]}` for an item waiting for approval. |
-| POST | `/api/infra/:agent/tasks` | admin | `{"text", "chat"?}` asks one agent (`:agent` = `_all` asks every agent). |
-| POST | `/api/infra/:agent/tasks/:id/cancel` | admin | Cancel a message the agent has not picked up yet. |
-| DELETE | `/api/infra/:agent/tasks/:id` | admin | Delete a message and its answer (`/api/infra/_all/groups/:group` for a datacenter message). |
-| POST / DELETE | `/api/infra/chats`, `/api/infra/chats/:id`, `/api/infra/chats/:id/rename` | admin | Create (`{"scope", "title"?}`), delete and rename (`{"title"}`) chats. |
+| POST | `/api/infra/:agent/policy` | control | `{"securityOnly": true}` makes that host's nightly run install security updates only (agent 1.9+). |
+| POST | `/api/infra/:agent/decision` | control | `{"id", "decision": "approve" \| "deny", "packages"?: [...]}` for an item waiting for approval. |
+| POST | `/api/infra/:agent/tasks` | control | `{"text", "chat"?}` asks one agent (`:agent` = `_all` asks every agent). |
+| POST | `/api/infra/:agent/tasks/:id/cancel` | control | Cancel a message the agent has not picked up yet. |
+| DELETE | `/api/infra/:agent/tasks/:id` | control | Delete a message and its answer (`/api/infra/_all/groups/:group` for a datacenter message). |
+| POST / DELETE | `/api/infra/chats`, `/api/infra/chats/:id`, `/api/infra/chats/:id/rename` | control | Create (`{"scope", "title"?}`), delete and rename (`{"title"}`) chats. |
+| GET | `/api/servers` | admin | The two status servers (um-ha pair): versions, roles, auto-install. |
+| POST | `/api/servers/control` | control | `{"action": "check" \| "install" \| "auto_on" \| "auto_off" \| "sync_now", "target": "self" \| "peer", "commit"?}`. |
 | POST | `/api/agent/report`, `/api/agent/sync` | agent token | Used by the agents (report every 5 min; quick sync / long-poll for new work and live progress). |
 | POST | `/api/agent/lease` | agent token | The datacenter-wide update lease: `{"op":"acquire","id","what","ttl"}` → `{granted, holder, what, until}`; `{"op":"release","id"}`. One agent updates or reboots at a time. |
 
@@ -83,7 +89,7 @@ URL=http://localhost:3000
 # health
 curl -s $URL/api/health
 
-# add a ping monitor
+# add a ping monitor (monitors only need the token; agent and server actions need CONTROL_API_TOKEN=1)
 curl -s -X POST $URL/api/monitors \
   -H "Authorization: Bearer $PW" -H 'Content-Type: application/json' \
   -d '{"name":"Router","type":"ping","target":"192.168.1.1","interval":30}'

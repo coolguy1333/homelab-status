@@ -348,7 +348,11 @@ test('Settings lists connected clients and revoking one cuts it off', async () =
   assert.equal(mine.redirectHost, 'claude.ai');
   assert.ok(!JSON.stringify(body).includes('hs_'), 'no token material');
   assert.equal((await fetch(`${app.base}/api/oauth/clients`)).status, 401);
+  // Revoking is control: the API token is read-only for it (no CONTROL_API_TOKEN), the owner in ADMIN_EMAILS can.
   r = await fetch(`${app.base}/api/oauth/clients/${client.client_id}`, { method: 'DELETE', headers: admin });
+  assert.equal(r.status, 403);
+  assert.equal((await rpc(app.base, tokens.access_token, 'tools/list', {})).status, 200, 'still connected');
+  r = await fetch(`${app.base}/api/oauth/clients/${client.client_id}`, { method: 'DELETE', headers: { 'Cf-Access-Jwt-Assertion': access.jwt(OWNER) } });
   assert.equal(r.status, 200);
   assert.equal((await rpc(app.base, tokens.access_token, 'tools/list', {})).status, 401);
   r = await form(app.base, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: client.client_id });

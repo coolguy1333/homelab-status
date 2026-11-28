@@ -370,6 +370,14 @@ function render() {
   renderUser(d);
   $('#addBtn').hidden = !d.authed;
   $('#settingsBtn').hidden = !d.authed;
+  // View only: signed in, but not allowed to send agents work or change the servers (ADMIN_EMAILS / CONTROL_API_TOKEN).
+  // The server refuses those requests anyway (403); this just hides the buttons and says why.
+  const readOnly = Boolean(d.authed && !d.canControl);
+  document.body.classList.toggle('read-only', readOnly);
+  $('#readOnlyNote').hidden = !readOnly;
+  $('#readOnlyNote').textContent = !readOnly ? '' : d.user && d.user.method === 'token'
+    ? 'View only: the API token can’t send agents work or change the servers (set CONTROL_API_TOKEN=1 on the server to allow it).'
+    : 'View only: only the emails in ADMIN_EMAILS can send agents work, approve updates, run container or server actions, or change settings.';
   $('#footerInfo').textContent = `Homelab Status v${d.version}`;
   $('#locked').hidden = !d.locked;
   $('#overall').hidden = !!d.locked;
@@ -562,6 +570,7 @@ async function openSettings() {
       who ? `<div>Signed in as <b>${esc(who.email || who.name)}</b>${who.method === 'cloudflare' ? ' (Cloudflare Access)' : who.method === 'token' ? ' (API token)' : ''}</div>` : '',
       `<div>Sign-in: <b>${a.cloudflare ? `Cloudflare Access (${esc(a.team)})` : 'not set up'}</b>${a.cloudflare ? ` — ${(a.adminEmails || []).length ? `limited to ${esc(a.adminEmails.join(', '))}` : 'whoever your Access policy lets in'}` : ' — set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD'}</div>`,
       `<div>API token (ADMIN_PASSWORD) from ${esc(a.tokenSource || '')}</div>`,
+      state.data && !state.data.canControl ? '<div><b>View only:</b> you can see these settings but not change them (only the emails in ADMIN_EMAILS can).</div>' : '',
       peers.count
         ? `<div>Other servers: <b>${peers.count}</b> · monitor sync: <b>${peers.sync ? 'on' : 'off'}</b>${peers.sync ? '' : ' — set the same PEER_TOKEN on every server to turn it on'}</div>`
         : '<div>Other servers: <b>none</b> — set PEERS (and PEER_TOKEN) to show and sync other servers</div>',

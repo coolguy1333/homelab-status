@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.17.0
+
+Only named admins can send work to the agents or change the servers. **Set `ADMIN_EMAILS` before updating**, or
+the dashboard becomes view-only for everyone.
+
+- **The problem:** every control route only checked that someone was signed in. With `ADMIN_EMAILS` empty (it was
+  optional), that was anyone Cloudflare Access let in, plus anyone holding the `ADMIN_PASSWORD` token. Any of them
+  could send agent tasks that run as root on the Proxmox hosts over SSH, approve updates and reboots, start, stop
+  or snapshot containers, and install versions on the status servers.
+- **Viewing vs controlling:** `Auth.canControl(user)` is true only for a Cloudflare Access user whose email is in
+  `ADMIN_EMAILS` (an exact address or an `@domain` entry, matched like `isAllowedEmail`). With `ADMIN_EMAILS` empty
+  nobody can control. Viewing works as before.
+- **API token:** `ADMIN_PASSWORD` is now read-only for these routes. `CONTROL_API_TOKEN=1` (off by default) lets it
+  control too, for scripts, and the startup log warns while it is on. The token can still manage monitors.
+- **Routes that now need control** (`needControl()` in `server.js`: 401 when not signed in, otherwise 403
+  "Only the emails in ADMIN_EMAILS can do this. Set ADMIN_EMAILS on the server.", or a token-specific message):
+  - `POST /api/infra/:agent/tasks` (including `_all`), `/decision`, `/actions`, `/policy`, and `/tasks/:id/cancel`
+  - `POST /api/infra/chats`, `POST /api/infra/chats/:id/rename`, `DELETE /api/infra/chats/:id`
+  - `DELETE /api/infra/:agent/tasks/:id`, `DELETE /api/infra/_all/groups/:id`
+  - `POST /api/servers/control` (check, install, auto-install on/off, sync now)
+  - `PUT /api/settings`, `POST /api/settings/test-notification`, `DELETE /api/oauth/clients/:id`
+  - `POST /api/import`
+- **Reviewed and left as they were:**
+  - Monitor create, edit, delete and "check now" still only need a sign-in.
+  - All GET routes are read-only.
+  - `/api/agent/*` takes agent tokens, and `/api/peer-status` takes the peer token.
+  - In `lib/connector.js`: `/oauth/register` and `/oauth/token` are the OAuth protocol itself (registering only
+    creates an unapproved client). Approving on `/oauth/authorize` still needs only an Access sign-in, because it
+    grants read-only access to what that person can already see. `/mcp` has only read-only tools.
+- **`/api/status`** answers `canControl`. When it is false, the dashboard hides the control buttons and shows one
+  line saying why. The buttons it hides:
+  - sending agents messages, plus retry, cancel, delete, rename and new chat
+  - approve/deny, the package picker and the nightly policy
+  - container and host actions, and "Ask about"
+  - server check/install
+  - settings Save, test notification, import, and revoking a client
+- **Startup log:** warns when Cloudflare Access is set up but `ADMIN_EMAILS` is empty ("Nobody can send agents work
+  until ADMIN_EMAILS is set."), and says whether the API token can control.
+- **Docs:** README, `docs/CONFIGURATION.md` (new "Viewing and controlling" section), `docs/CLOUDFLARE_ACCESS.md`, and
+  `docs/API.md` (an "admin" vs "control" column).
+- **Tests** (`test/control.test.js`) run the real server with a test key pair signing the Access JWTs:
+  - Every route above gives 403 to a signed-in user when `ADMIN_EMAILS` is empty, and 401 to an email outside a
+    set `ADMIN_EMAILS` (that was never a sign-in).
+  - Listed emails and `@domain` entries get through.
+  - The token gets 403 unless `CONTROL_API_TOKEN=1`.
+  - With `ADMIN_EMAILS` empty, `GET /api/infra` and `GET /api/settings` still work and nothing is queued.
+  - The connector test now revokes as the owner (the token gets 403).
+
 ## 2.16.2
 
 Two agent fixes (agent 1.15.2).
