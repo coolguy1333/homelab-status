@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.18.2
+
+Datacenter chats show nothing but a progress line until the one combined answer is there.
+
+- **While waiting** ("GOD answered · waiting for HELP") **and while combining** ("Combining the answers…"), the
+  dashboard no longer offers each host's answer under "Each host's answer". It appears only folded under the finished
+  combined answer. The token/cost line also waits for that answer.
+- Unchanged fallbacks: if a host is offline, or no agent can combine, or combining fails, the answers that arrived are
+  shown per host as before.
+
 ## 2.18.1
 
 The agents' Claude no longer loads the account's claude.ai connectors (agent 1.16.1).

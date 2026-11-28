@@ -1175,12 +1175,13 @@ const Dash = (() => {
       for (const p of relevant) rememberPlan({ ...p.t, agentName: p.a.name });
       const detail = details(`dc:${gid}`, `Each host's answer (${esc(hosts.join(', '))})`, relevant.map(x => `<div class="dc-part${x.t.status === 'failed' ? ' failed' : ''}"><div class="dc-host">${esc(hostOf(x.a))}${x.t.status === 'failed' ? ` ${statusTag('failed')}` : ''}</div>${answer(String(x.t.output || '').replace(SCRIPT_FOOT, '').trim(), x.t.id)}</div>`).join(''), 'dc-detail');
       const used = sumUsage(mt ? [...relevant, merge] : relevant);
-      const meta = m => `<div class="ans-meta"><span class="who">✦ Datacenter</span>${m} ${usageLine(used)}${mergeOk ? `<button class="linkbtn copy" data-copy="a:${esc(gid)}">Copy</button>` : ''}</div>`;
+      const meta = m => `<div class="ans-meta"><span class="who">✦ Datacenter</span>${m} ${mergeOk ? usageLine(used) : ''}${mergeOk ? `<button class="linkbtn copy" data-copy="a:${esc(gid)}">Copy</button>` : ''}</div>`;
+      // Until the one combined answer is there, only a progress line: no host's answer is shown on its own.
       if (waiting && !mergeOk) {
-        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> ${esc(hosts.join(', '))} answered · waiting for ${esc(busy.map(p => hostOf(p.a)).join(', '))} — ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>${detail}</div>`;
+        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> ${esc(hosts.join(', '))} answered · waiting for ${esc(busy.map(p => hostOf(p.a)).join(', '))} — ${esc(pendingText(busy[0].a, busy[0].t))}</span></div></div>`;
       }
       if (merging) {
-        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> Combining the answers from ${esc(hosts.join(' and '))} into one…</span></div>${detail}</div>`;
+        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> Combining the answers from ${esc(hosts.join(' and '))} into one…</span></div></div>`;
       }
       rememberPlan({ ...mt, agentName: 'Datacenter' });
       copyables.set(`a:${gid}`, mt.output);
