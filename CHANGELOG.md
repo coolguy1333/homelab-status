@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.17.0
+
+Datacenter chats get ONE answer (agent 1.16.0).
+
+- **One answer:** a Datacenter message still goes to every host's agent, and each answers for its own host. Once
+  they have all answered, the dashboard gives the parts to one agent (1.16+, online, preferably one that answered),
+  and its Claude writes a single reply from them. It runs with no tools and no MCP servers, so it only rewrites what
+  the hosts said (about $0.04 a merge at API prices). Problems, changes, snapshots and handoff plans are kept; a host
+  that failed gets one line. Nothing is merged when only one host had something to say (the other said "not mine").
+- **Dashboard:** shows that one reply, with each host's own answer folded away under "Each host's answer". While a
+  host is still working it shows one "GOD answered · waiting for HELP" line instead of half an answer, then
+  "Combining the answers…". The chat list preview no longer shows one host's part as the answer. If no agent can
+  merge (offline or older than 1.16) or the merge fails, it falls back to the per-host answers as before.
+- **Composer hint:** says "every message is answered by Claude" when the agents have `"quick_answers": false`
+  (reported as `quickAnswers`), instead of promising free script answers.
+- Merge tasks don't count as chat messages and carry no chat id, so they never resume a host's Claude session.
+- Tests: merge task created only after every host answered, to one agent with both parts; none with a notMine host;
+  a failed part is merged; an older or offline agent never gets one. Agent: the prompt carries the question (without
+  `/ai`) and every part; a merge task skips the scripts and runs Claude with `tools=""`; a failed merge is failed.
+
 ## 2.16.2
 
 Two agent fixes (agent 1.15.2).

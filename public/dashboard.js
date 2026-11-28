@@ -962,7 +962,9 @@ const Dash = (() => {
       const better = t.output && !t.notMine && !(newest && newest.output && !newest.notMine);
       if (!newest || t.createdAt > newest.createdAt || (t.createdAt === newest.createdAt && better)) newest = t;
     }
-    const preview = newest ? (newest.output && !isBusy(newest) ? plain(newest.output) : `You: ${plain(newest.text)}`) : 'No messages yet';
+    // A Datacenter host's part is not the answer while another host (or the combined answer) is still on its way.
+    const partial = newest && newest.group && !newest.merge && working;
+    const preview = newest ? (newest.output && !isBusy(newest) && !partial ? plain(newest.output) : `You: ${plain(newest.text)}`) : 'No messages yet';
     const unread = Boolean(seen && lastAnswer > (seen[c.id] || 0) && !(st.askChat === c.id && currentView(state.data) === 'ask'));
     return { last, lastAnswer, working, preview, unread };
   }
@@ -1035,7 +1037,7 @@ const Dash = (() => {
         ${toSeg}
         <div class="composer-box"><textarea name="text" rows="1" maxlength="4000" aria-label="Message" placeholder="${chat ? 'Reply — the agent remembers this conversation…' : 'Ask a question or describe what to fix…'}">${esc(st.drafts[draftKey] || '')}</textarea>
           <button class="btn primary send" type="submit">Send</button></div>
-        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'} · simple requests (ping, status, restart, disk, updates…) are answered by a script for free; start with <code>/ai</code> to always ask Claude${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
+        <div class="composer-hint muted">${coarse() ? 'Tap Send to send' : 'Enter to send · Shift+Enter for a new line'} ${ag.some(a => !a.report || a.report.quickAnswers !== false) ? '· simple requests (ping, status, restart, disk, updates…) are answered by a script for free; start with <code>/ai</code> to always ask Claude' : '· every message is answered by Claude'}${offline.length ? ` · <span class="pct-bad">${esc(offline.join(', '))} offline — runs when back</span>` : ''}</div>
       </form>`;
     const main = `<section class="ask-main">${head}<div class="convo" data-convo="${esc(draftKey)}">${msgs || welcome}</div>${form}</section>`;
 
@@ -1094,9 +1096,13 @@ const Dash = (() => {
     const groups = new Map();
     for (const a of ag) for (const t of (a.tasks || [])) {
       if (t.chat !== chatId || !t.group) continue;
-      if (!groups.has(t.group)) groups.set(t.group, { id: t.group, text: t.text, by: t.by, t: t.createdAt, parts: [] });
-      groups.get(t.group).parts.push({ a, t });
+      if (!groups.has(t.group)) groups.set(t.group, { id: t.group, text: t.text, by: t.by, t: t.createdAt, parts: [], merge: null });
+      const g = groups.get(t.group);
+      if (t.merge) { g.merge = { a, t }; continue; } // the one combined answer (agent 1.16+), not a host's part
+      g.t = Math.min(g.t, t.createdAt);
+      g.parts.push({ a, t });
     }
+    for (const [id, g] of groups) if (!g.parts.length) groups.delete(id);
     return [...groups.values()].sort((x, y) => x.t - y.t).map(g => {
       copyables.set(`q:${g.id}`, g.text);
       const queued = g.parts.filter(p => p.t.status === 'queued');
@@ -1109,14 +1115,16 @@ const Dash = (() => {
       return `<div class="msg" data-key="m:${esc(g.id)}">
         <div class="q"><div class="q-text">${esc(g.text)}</div></div>
         <div class="q-meta">◎ all hosts · ${esc(g.by || '')} · ${esc(ago(g.t))} ${tools}</div>
-        ${groupAnswer(g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))), g.id)}
+        ${groupAnswer(g.parts.sort((x, y) => hostOf(x.a).localeCompare(hostOf(y.a))), g.id, g.merge)}
       </div>`;
     }).join('');
   }
 
   // A Datacenter message goes to every agent; their answers are folded into ONE reply here. Hosts that had nothing
   // to do with it (the agent marks those notMine) are left out, the "answered by a script" note shows once, and
-  // answers that are each a single table with the same columns become one table with a Host column.
+  // answers that are each a single table with the same columns become one table with a Host column. When more than
+  // one host had something to say, one agent's Claude then rewrites the parts as ONE reply (the merge task): that is
+  // what is shown, with each host's own answer folded away under it.
   const SCRIPT_FOOT = /\s*\*⚡ Answered by a script[^\n]*\*\s*$/;
   const isTableLine = l => /^\s*\|/.test(l);
   function splitAnswer(a, text) {
@@ -1146,7 +1154,7 @@ const Dash = (() => {
     for (const u of us) if (!u.script) for (const k in o) o[k] += Number(u[k]) || 0;
     return o;
   }
-  function groupAnswer(parts, gid) {
+  function groupAnswer(parts, gid, merge = null) {
     const live = parts.filter(p => p.t.status !== 'cancelled');
     if (!live.length) return '<div class="ans pending">✦ Datacenter: cancelled</div>';
     const busy = live.filter(p => isBusy(p.t));
@@ -1155,6 +1163,28 @@ const Dash = (() => {
     const waitLine = busy.length
       ? `<div class="ans-wait">${typing}<span class="muted"> ${esc(busy.map(p => hostOf(p.a)).join(', '))} · ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>` : '';
     if (!relevant.length && busy.length) return `<div class="ans pending">${typing}<span><b>Datacenter</b> · ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>`;
+    const mt = merge && merge.t.status !== 'cancelled' ? merge.t : null;
+    const mergeOk = mt && mt.status === 'done' && mt.output;
+    const merging = mt && isBusy(mt);
+    // Still waiting on a host that is online: show one "working" line, not half an answer (an offline host's
+    // part runs when it is back, so then what has arrived is shown as before).
+    const waiting = busy.some(p => p.a.online) && relevant.length;
+    if (merging || mergeOk || waiting) {
+      const hosts = relevant.map(p => hostOf(p.a));
+      for (const p of relevant) rememberPlan({ ...p.t, agentName: p.a.name });
+      const detail = details(`dc:${gid}`, `Each host's answer (${esc(hosts.join(', '))})`, relevant.map(x => `<div class="dc-part${x.t.status === 'failed' ? ' failed' : ''}"><div class="dc-host">${esc(hostOf(x.a))}${x.t.status === 'failed' ? ` ${statusTag('failed')}` : ''}</div>${answer(String(x.t.output || '').replace(SCRIPT_FOOT, '').trim(), x.t.id)}</div>`).join(''), 'dc-detail');
+      const used = sumUsage(mt ? [...relevant, merge] : relevant);
+      const meta = m => `<div class="ans-meta"><span class="who">✦ Datacenter</span>${m} ${usageLine(used)}${mergeOk ? `<button class="linkbtn copy" data-copy="a:${esc(gid)}">Copy</button>` : ''}</div>`;
+      if (waiting && !mergeOk) {
+        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> ${esc(hosts.join(', '))} answered · waiting for ${esc(busy.map(p => hostOf(p.a)).join(', '))} — ${esc(pendingText(busy[0].a, busy[0].t))}</span></div>${detail}</div>`;
+      }
+      if (merging) {
+        return `<div class="ans">${meta('')}<div class="ans-wait">${typing}<span class="muted"> Combining the answers from ${esc(hosts.join(' and '))} into one…</span></div>${detail}</div>`;
+      }
+      rememberPlan({ ...mt, agentName: 'Datacenter' });
+      copyables.set(`a:${gid}`, mt.output);
+      return `<div class="ans">${meta(mt.finishedAt ? ` · ${esc(ago(mt.finishedAt))}` : '')}${answer(mt.output, mt.id)}${detail}</div>`;
+    }
     let body, copy;
     if (!relevant.length) {
       const why = done.map(p => `- **${hostOf(p.a)}**: ${String(p.t.output || 'nothing to report').replace(SCRIPT_FOOT, '').trim()}`).join('\n');

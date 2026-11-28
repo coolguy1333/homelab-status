@@ -8,6 +8,8 @@ Runs on a connector container as user `agent`, reaching its Proxmox host as root
                             (security updates only when the dashboard's nightly policy says so)
   hl_agent.py action <id>   carry out an approved pending item (started by `report`)
   hl_agent.py task <id>     answer a chat message from the dashboard: a script for simple requests, Claude otherwise
+                            (config "quick_answers": false = always Claude). A Datacenter message that more than one
+                            host answered comes back to one agent as a merge task: Claude turns the parts into ONE reply.
 
 Monitoring, auto-fixes and nightly updates are plain scripts: Claude only runs when someone asks in a chat
 (config "autofix_claude": true and "claude_review": "auto" turn the old automatic uses back on).
@@ -33,7 +35,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.15.2"
+VERSION = "1.16.0"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -220,12 +222,14 @@ LAST_USAGE = {}
 LAST_SESSION = None
 
 
-def claude(prompt, timeout=1800, kind="task", label="", resume=None):
+def claude(prompt, timeout=1800, kind="task", label="", resume=None, tools=None):
     """Run Claude non-interactively in ~/agent (where CLAUDE.md describes the setup).
     Returns (rc, text). Token usage of the run is recorded (see record_usage) and left in LAST_USAGE."""
     global LAST_USAGE, LAST_SESSION
     LAST_USAGE, LAST_SESSION = {}, None
     args = [CLAUDE, "-p", prompt, "--output-format", "json"] + (["--resume", resume] if resume else [])
+    if tools is not None:  # "" = no tools at all: no built-in tools and no MCP servers (claude.ai connectors included)
+        args += ["--tools", tools] + (["--strict-mcp-config"] if tools == "" else [])
     try:
         p = subprocess.run(args, cwd=BASE, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -239,7 +243,7 @@ def claude(prompt, timeout=1800, kind="task", label="", resume=None):
         d = {}
     if not d:
         if resume:  # the old session is gone (pruned, reinstalled…): start fresh instead of failing
-            return claude(prompt, timeout, kind, label, resume=None)
+            return claude(prompt, timeout, kind, label, resume=None, tools=tools)
         return p.returncode or 1, (raw + "\n" + (p.stderr or "")).strip() or "no output"
     LAST_SESSION = d.get("session_id")
     u = d.get("usage") or {}
@@ -844,6 +848,7 @@ def build_report(s, host, containers):
     events = [e for e in s["events"] if e["t"] > since][-500:] or list(s["events"][-50:])
     return {
         "agent": CFG["name"], "agentVersion": VERSION, "generatedAt": now_ms(),
+        "quickAnswers": bool(CFG.get("quick_answers", True)),
         "host": host, "containers": containers, "pending": pending,
         "events": events, "updateRuns": s["updateRuns"][-20:],
         "backups": {k: (s.get("slow") or {}).get(k) for k in ("jobs", "tasks", "t", "pbs", "backupStale", "unreachableStorage")},
@@ -1080,7 +1085,8 @@ def handle_replies(replies):
                 continue
             s["tasks"][tid] = {"id": tid, "text": t["text"], "by": t.get("by"), "status": "running", "output": "",
                                "t": now_ms(), "u": now_ms(), **({"action": t["action"]} if t.get("action") else {}),
-                               **({"chat": t["chat"]} if t.get("chat") else {})}
+                               **({"chat": t["chat"]} if t.get("chat") else {}),
+                               **({"merge": t["merge"]} if isinstance(t.get("merge"), list) else {})}
             spawn("ctaction" if t.get("action") else "task", tid)
 
 
@@ -1415,6 +1421,50 @@ def quick_answer(text):
     return None
 
 
+MERGE_PROMPT = """Someone asked the homelab's agents this Datacenter question (it went to the agent on every Proxmox host):
+
+{question}
+
+Each host's agent answered for its own host:
+
+{parts}
+
+Write ONE reply to the question, as if a single assistant looked after the whole datacenter.
+- Use only what is in these answers. Don't run commands or look anything up.
+- Combine overlapping sections instead of repeating them per host. Name a host only where it matters (which host a
+  container or problem is on), or use a table with a Host column.
+- Keep every problem, warning, change made, snapshot taken and approval needed. If a host's agent failed, say so in one line.
+- If any answer has a `## Handoff plan for Claude Code` section, end with ONE section with exactly that heading that
+  combines them, keeping the commands and which machine each runs on exactly as written.
+- The dashboard renders Markdown: short headings, bullet lists, **bold** for key facts, tables where they help. Be concise.
+- Don't mention that the answer was combined, and don't repeat the question."""
+
+
+def merge_prompt(question, parts):
+    q = DC_PREFIX.sub("", question or "").strip()
+    q = FORCE_AI.sub("", q, count=1).strip() or q
+    blocks = []
+    for p in parts:
+        host = str(p.get("host") or p.get("agent") or "host")[:60]
+        body = str(p.get("output") or "").strip()[-20000:] or "(no output)"
+        blocks.append(f"### {host}" + (" — this agent FAILED" if p.get("failed") else "") + f"\n\n{body}")
+    return MERGE_PROMPT.format(question=q, parts="\n\n".join(blocks))
+
+
+def merge_answer(tid, question, parts):
+    """The one Datacenter reply, written from each host's answer (no tools: nothing is looked up or changed)."""
+    rc, out = claude(merge_prompt(question, parts), timeout=600, kind="merge", label=question[:120], tools="")
+    usage = dict(LAST_USAGE)
+    with state() as s:
+        t = s["tasks"].get(tid)
+        if t:
+            t.update(status="done" if rc == 0 and out.strip() else "failed", output=out[-20000:] or "(no output)", u=now_ms())
+            if usage:
+                t["usage"] = {k: usage.get(k) for k in ("input", "output", "cacheRead", "cacheWrite", "cost", "model", "turns", "ms")}
+    log(f"Datacenter answer combined from {len(parts)} hosts ({'ok' if rc == 0 else 'failed'})")
+    sync_now()
+
+
 def cmd_task(tid):
     with state() as s:
         t = s["tasks"].get(tid)
@@ -1423,6 +1473,9 @@ def cmd_task(tid):
         text, by, internal = t["text"], t.get("by"), t.get("internal")
         chat = t.get("chat")
         session = (s.get("chatSessions") or {}).get(chat) if chat else None
+        merge = t.get("merge")
+    if merge:
+        return merge_answer(tid, text, merge)
     # Simple requests get a scripted answer (no Claude). "/ai ..." skips that and always asks Claude.
     pre = DC_PREFIX.match(text)
     prefix = pre.group(0) if pre else ""
