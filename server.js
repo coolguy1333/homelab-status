@@ -479,6 +479,17 @@ async function handleApi(req, res, url) {
   const user = p === '/api/peer-status' || p.startsWith('/api/agent/') ? null : auth.user(req, clientIp(req));
   const authed = Boolean(user);
   const needAuth = () => { if (!authed) { send(res, 401, { error: 'Login required' }); return true; } return false; };
+  // Anything that changes more than the monitors: agent work (runs as root on the Proxmox hosts), approvals,
+  // container and server actions, settings. Signed in is not enough (see Auth.canControl).
+  const canControl = auth.canControl(user);
+  const needControl = () => {
+    if (needAuth()) return true;
+    if (canControl) return false;
+    send(res, 403, { error: user.method === 'token'
+      ? 'The API token is read-only for this. Set CONTROL_API_TOKEN=1 on the server to let it control agents and servers.'
+      : 'Only the emails in ADMIN_EMAILS can do this. Set ADMIN_EMAILS on the server.' });
+    return true;
+  };
   const needJson = () => {
     // Cheap CSRF protection: browsers cannot send application/json cross-site without a CORS preflight.
     if (!/^application\/json/i.test(req.headers['content-type'] || '')) { send(res, 415, { error: 'Content-Type must be application/json' }); return true; }
@@ -506,6 +517,7 @@ async function handleApi(req, res, url) {
     const base = {
       title: store.settings.title,
       authed,
+      canControl,
       user: user ? { name: user.name, email: user.email || null, picture: user.picture || null, method: user.method } : null,
       auth: auth.methods(),
       publicDashboard: store.settings.publicDashboard,
@@ -533,7 +545,7 @@ async function handleApi(req, res, url) {
       });
     }
     if (method === 'PUT') {
-      if (needJson()) return;
+      if (needControl() || needJson()) return;
       const body = await readBody(req);
       const s = store.settings;
       if ('webhooks' in body) {
@@ -562,14 +574,14 @@ async function handleApi(req, res, url) {
   }
   const oc = p.match(/^\/api\/oauth\/clients\/(hsc_[a-f0-9]{32})$/);
   if (oc && method === 'DELETE') {
-    if (needAuth()) return;
+    if (needControl()) return;
     if (!oauth || !oauth.revokeClient(oc[1])) return send(res, 404, { error: 'Client not found' });
     console.log(`[oauth] ${user.email || user.name || 'admin'} revoked client ${oc[1].slice(0, 12)}…`);
     return send(res, 200, { ok: true });
   }
 
   if (p === '/api/settings/test-notification' && method === 'POST') {
-    if (needAuth() || needJson()) return;
+    if (needControl() || needJson()) return;
     if (!notifier.urls().length) return send(res, 400, { error: 'No webhooks configured' });
     return send(res, 200, { results: await notifier.test() });
   }
@@ -581,7 +593,7 @@ async function handleApi(req, res, url) {
   }
 
   if (p === '/api/import' && method === 'POST') {
-    if (needAuth() || needJson()) return;
+    if (needControl() || needJson()) return;
     const body = await readBody(req, 2 * 1024 * 1024);
     const list = Array.isArray(body) ? body : body.monitors;
     if (!Array.isArray(list)) return send(res, 400, { error: 'Expected { "monitors": [...] }' });
@@ -733,7 +745,7 @@ async function handleApi(req, res, url) {
     }
   }
   if (p === '/api/servers/control' && method === 'POST') {
-    if (needAuth() || needJson()) return;
+    if (needControl() || needJson()) return;
     const body = await readBody(req, 4096);
     const action = String(body.action || '');
     if (!['check', 'install', 'auto_on', 'auto_off', 'sync_now'].includes(action)) return send(res, 400, { error: 'Unknown action' });
@@ -751,13 +763,13 @@ async function handleApi(req, res, url) {
 
   // ---- chats with the agents
   if (p === '/api/infra/chats' && method === 'POST') {
-    if (needAuth() || needJson()) return;
+    if (needControl() || needJson()) return;
     const body = await readBody(req, 16 * 1024);
     return send(res, 201, infra.createChat(String(body.scope || ''), body.title, user.email || user.name || 'admin'));
   }
   const cm = p.match(/^\/api\/infra\/chats\/([a-z0-9_-]{1,40})(\/rename)?$/i);
   if (cm) {
-    if (needAuth()) return;
+    if (needControl()) return;
     if (method === 'DELETE' && !cm[2]) { infra.deleteChat(cm[1]); return send(res, 200, { ok: true }); }
     if (method === 'POST' && cm[2]) { if (needJson()) return; const body = await readBody(req, 16 * 1024); return send(res, 200, infra.renameChat(cm[1], body.title)); }
     return send(res, 405, { error: 'Method not allowed' });
@@ -771,14 +783,14 @@ async function handleApi(req, res, url) {
     return send(res, 200, { agent: lm[1], lines: infra.agentLogs(lm[1]) });
   }
   const gm = p.match(/^\/api\/infra\/_all\/groups\/(g[a-f0-9]{10})$/);
-  if (gm && method === 'DELETE') { if (needAuth()) return; infra.deleteGroup(gm[1]); return send(res, 200, { ok: true }); }
+  if (gm && method === 'DELETE') { if (needControl()) return; infra.deleteGroup(gm[1]); return send(res, 200, { ok: true }); }
   const dm = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/tasks\/([a-f0-9]{12})$/);
-  if (dm && method === 'DELETE') { if (needAuth()) return; infra.deleteMessage(dm[1], dm[2]); return send(res, 200, { ok: true }); }
+  if (dm && method === 'DELETE') { if (needControl()) return; infra.deleteMessage(dm[1], dm[2]); return send(res, 200, { ok: true }); }
 
   const im = p.match(/^\/api\/infra\/([A-Za-z0-9_-]{1,40})\/(decision|tasks|actions|policy)(?:\/([a-f0-9]{12})\/cancel)?$/);
   if (im) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
-    if (needAuth() || needJson()) return;
+    if (needControl() || needJson()) return;
     const who = user.email || user.name || 'admin';
     const body = await readBody(req, 64 * 1024);
     if (im[2] === 'decision') {
@@ -843,7 +855,8 @@ server.listen(PORT, HOST, () => {
   console.log(infra.enabled ? `Infrastructure agents: ${[...infra.tokens.keys()].join(', ')}` : 'Infrastructure agents: none (set AGENT_TOKENS)');
   if (PEER_URLS.length) console.log(`Federated with ${PEER_URLS.length} peer server(s): ${PEER_URLS.join(', ')} (monitor sync ${SYNC_MONITORS ? 'on' : 'off - set PEER_TOKEN'})`);
   const m = auth.methods();
-  console.log(m.cloudflare ? `Sign-in: Cloudflare Access (${m.team})${auth.admins.length ? `, limited to ${auth.admins.join(', ')}` : ''}` : 'Sign-in: none - set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD');
+  console.log(m.cloudflare ? `Sign-in: Cloudflare Access (${m.team})${auth.admins.length ? `, limited to ${auth.admins.join(', ')}, who can also control agents and servers` : ' - view only: nobody can control agents or servers until ADMIN_EMAILS is set'}` : 'Sign-in: none - set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD');
+  console.log(`API token: ${auth.controlToken ? 'can control agents and servers (CONTROL_API_TOKEN=1)' : 'read-only for agents and servers (set CONTROL_API_TOKEN=1 to change that)'}`);
   if (connector) console.log(`Claude connector: ${PUBLIC_URL}/mcp${m.cloudflare ? '' : ' (needs Cloudflare Access to connect)'}`);
   if (auth.generated) {
     console.log('');

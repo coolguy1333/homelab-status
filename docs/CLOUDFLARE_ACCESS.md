@@ -10,7 +10,13 @@ A request that did not come through Access (for example straight to `http://<con
 has no valid JWT, so it is **not** signed in: going around Cloudflare never gets anyone in. With *Public
 dashboard* on it still shows the public status, like for any visitor.
 
-`ADMIN_PASSWORD` remains an API token for scripts (`Authorization: Bearer ...`). There is no password form.
+`ADMIN_PASSWORD` remains an API token for scripts (`Authorization: Bearer ...`). There is no password form. It is
+read-only for agents, servers and settings unless `CONTROL_API_TOKEN=1`.
+
+**Set `ADMIN_EMAILS`.** The Access policy decides who can *view*. Only the emails in `ADMIN_EMAILS` can *control*:
+send the agents work (it runs as root on the Proxmox hosts), approve updates, run container and server actions, and
+change settings. Without it, everyone gets a view-only dashboard (see
+[Viewing and controlling](CONFIGURATION.md#viewing-and-controlling)).
 
 ## 1. Create the Access application
 
@@ -51,12 +57,14 @@ If agents reach the app on its LAN address (not through Cloudflare), they don't 
 CF_ACCESS_TEAM_DOMAIN=yourteam.cloudflareaccess.com
 CF_ACCESS_AUD=4714c1358e65fe4b408ad6d432a5f878f08194bdb4752441fd56faefa9b2b6f2
 PUBLIC_URL=https://upt.example.com
-# Optional second check, on top of the Access policy:
-#ADMIN_EMAILS=you@gmail.com
+# Needed to control anything (send agents work, approve, container/server actions, settings).
+# Also a second check on top of the Access policy: other emails are not signed in.
+ADMIN_EMAILS=you@gmail.com
 ```
 
 Restart. The startup log says `Sign-in: Cloudflare Access (https://yourteam.cloudflareaccess.com)`. Several AUD
-tags can be listed comma-separated (e.g. one Access application per hostname).
+tags can be listed comma-separated (e.g. one Access application per hostname). If it also warns
+`Nobody can send agents work until ADMIN_EMAILS is set`, set `ADMIN_EMAILS`.
 
 **Log out** in the dashboard goes to `/cdn-cgi/access/logout`, which ends the Access session.
 
@@ -72,6 +80,7 @@ WAF → Tools) that *Allow* Anthropic's outbound ranges **160.79.104.0/21** and 
 |---|---|
 | Dashboard says "Sign-in is not set up" | `CF_ACCESS_TEAM_DOMAIN` or `CF_ACCESS_AUD` is missing. |
 | Signed in at Cloudflare but the dashboard stays locked | Wrong AUD tag (copy it again from the application's Overview), the team domain doesn't match the JWT's issuer, your email isn't in `ADMIN_EMAILS` (when set; the log says so), or the request didn't go through Access. |
+| Signed in, but the dashboard says "View only" and actions answer 403 | Your email isn't in `ADMIN_EMAILS`, or `ADMIN_EMAILS` is empty (the startup log warns). Set it and restart. Scripts using the API token need `CONTROL_API_TOKEN=1`. |
 | Log: `Could not load Cloudflare Access keys` | The app can't reach `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. It needs outbound HTTPS. |
 | Agents stopped reporting after turning on Access | Add the `api/agent/` bypass (step 2). |
 | Claude: "couldn't connect" / 403 from Cloudflare | Missing bypass for `mcp`, `oauth/token`, `oauth/register` or `.well-known/`, or Bot Fight Mode / Block AI Bots (see above). |

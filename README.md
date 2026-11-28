@@ -37,8 +37,9 @@ Add this repository as a source, choose **Deploy as an app**, then set the varia
 |---|---|
 | `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` | Your Cloudflare Access team domain and the Access application's AUD tag ([docs/CLOUDFLARE_ACCESS.md](docs/CLOUDFLARE_ACCESS.md)) |
 | `PUBLIC_URL` | `https://<your-domain>`: also the address of the Claude connector (`/mcp`) |
-| `ADMIN_EMAILS` | optional: only these Access users count as admins |
-| `ADMIN_PASSWORD` | Long random string (API token for scripts) |
+| `ADMIN_EMAILS` | **needed to control anything**: the Access users (`you@gmail.com`, or `@example.com` for a domain) who may send agents work, approve updates, run container and server actions and change settings. Empty = everyone Access lets in can view, nobody can control |
+| `ADMIN_PASSWORD` | Long random string (API token for scripts: read-only for agents and servers) |
+| `CONTROL_API_TOKEN` | optional: `1` lets the API token control too, for scripts (off by default; logs a warning when on) |
 | `AGENT_TOKENS` | `connector1:<token>,connector2:<token>`. Each token is in `/home/agent/agent/config.json` on its connector |
 | `PUBLIC_DASHBOARD` | `false` (default): everything requires signing in |
 | `NOTIFY_WEBHOOK_URL` | optional Discord/Slack/ntfy for alerts (agent offline, rollbacks, approvals) |
