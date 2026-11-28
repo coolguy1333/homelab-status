@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.18.1
+
+The agents' Claude no longer loads the account's claude.ai connectors (agent 1.16.1).
+
+- **What was happening:** the Claude account on the connectors has the owner's claude.ai connectors (Gmail, Google
+  Drive, Docs, Sheets, Slides, Calendar, ClickUp, Spotify, Cloudflare, Daily Hub, the status site) and plugin MCP
+  servers. Every agent run loaded all of them. A one-word prompt cost about $1.12 at API prices instead of about $0.04,
+  and a chat answer could in principle read or send the owner's mail.
+- **Now:** every Claude run from `hl_agent.py` passes `--strict-mcp-config` (no `--mcp-config`), so it has no MCP
+  servers. That covers chat answers and follow-ups, auto-fixes, update risk reviews and Datacenter merges. Built-in
+  tools (Bash, Read, Edit, ...) are unchanged. The agent's `CLAUDE.md` says so. Config `"claude_mcp": true` in
+  `~/agent/config.json` turns the connectors back on.
+- Claude Remote Control sessions (`claude-agent` unit) are not changed.
+- Tests: `test/agent/test_claude_args.py` checks the command line for a chat, a resumed chat, a review, a merge
+  (`--tools ""`, one `--strict-mcp-config`), and `claude_mcp: true`.
+
 ## 2.18.0
 
 Datacenter chats get ONE answer (agent 1.16.0).

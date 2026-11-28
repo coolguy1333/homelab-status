@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "agent")
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -228,8 +228,13 @@ def claude(prompt, timeout=1800, kind="task", label="", resume=None, tools=None)
     global LAST_USAGE, LAST_SESSION
     LAST_USAGE, LAST_SESSION = {}, None
     args = [CLAUDE, "-p", prompt, "--output-format", "json"] + (["--resume", resume] if resume else [])
-    if tools is not None:  # "" = no tools at all: no built-in tools and no MCP servers (claude.ai connectors included)
-        args += ["--tools", tools] + (["--strict-mcp-config"] if tools == "" else [])
+    # No MCP servers: the account's claude.ai connectors (Gmail, Drive, Calendar, ClickUp, ...) and plugin servers
+    # would otherwise load into every run. The agent works through Bash/SSH and needs none of them, and they cost
+    # tokens on every run and could read or send the owner's mail. Config "claude_mcp": true turns them back on.
+    if not CFG.get("claude_mcp"):
+        args += ["--strict-mcp-config"]
+    if tools is not None:  # "" = no built-in tools at all
+        args += ["--tools", tools]
     try:
         p = subprocess.run(args, cwd=BASE, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
