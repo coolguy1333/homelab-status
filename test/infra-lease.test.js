@@ -60,3 +60,65 @@ test('a Datacenter answer marked notMine is stored on the task', () => {
   assert.strictEqual(get('connector1', t1.id).notMine, undefined);
   assert.strictEqual(get('connector2', t2.id).notMine, true);
 });
+
+// ---- Datacenter answers: ONE reply (agent 1.16+ writes it from every host's part)
+const online = (infra, versions = { connector1: '1.16.0', connector2: '1.16.0' }) => {
+  infra.data.agents = {};
+  for (const [name, v] of Object.entries(versions)) {
+    infra.data.agents[name] = { receivedAt: Date.now(), report: { agentVersion: v, host: { node: name === 'connector1' ? 'GOD' : 'HELP' } } };
+  }
+};
+const merges = infra => Object.entries(infra.data.tasks).flatMap(([agent, l]) => l.filter(t => t.merge).map(t => ({ agent, t })));
+
+test('when both hosts answered, one merge task goes to one agent with both parts', () => {
+  const infra = fresh();
+  online(infra);
+  const [t1, t2] = infra.addGroupTask('what needs updating?', 'admin');
+  infra.applyResults('connector2', { taskResults: [{ id: t2.id, status: 'done', output: 'HELP: 2 updates' }] });
+  assert.strictEqual(merges(infra).length, 0, 'waits for every host');
+  infra.applyResults('connector1', { taskResults: [{ id: t1.id, status: 'done', output: 'GOD: 1 update' }] });
+  const m = merges(infra);
+  assert.strictEqual(m.length, 1);
+  assert.strictEqual(m[0].agent, 'connector1');
+  assert.strictEqual(m[0].t.group, t1.group);
+  assert.strictEqual(m[0].t.chat, t1.chat);
+  assert.deepStrictEqual(m[0].t.merge.map(p => [p.host, p.output, p.failed]), [['GOD', 'GOD: 1 update', false], ['HELP', 'HELP: 2 updates', false]]);
+  // The agent gets the parts and the plain question, no chat (no session to resume).
+  const out = infra.outbox('connector1').tasks.find(t => t.id === m[0].t.id);
+  assert.strictEqual(out.text, 'what needs updating?');
+  assert.strictEqual(out.chat, undefined);
+  assert.strictEqual(out.merge.length, 2);
+  // A merge task finishing doesn't start another one, and it doesn't count as a chat message.
+  infra.applyResults('connector1', { taskResults: [{ id: m[0].t.id, status: 'done', output: 'One answer' }] });
+  assert.strictEqual(merges(infra).length, 1);
+  assert.strictEqual(infra.chatList().find(c => c.id === t1.chat).messages, 2);
+});
+
+test('no merge when only one host had something (the other said notMine)', () => {
+  const infra = fresh();
+  online(infra);
+  const [t1, t2] = infra.addGroupTask('restart nginx', 'admin');
+  infra.applyResults('connector1', { taskResults: [{ id: t1.id, status: 'done', output: 'restarted' }] });
+  infra.applyResults('connector2', { taskResults: [{ id: t2.id, status: 'done', output: 'Nothing on this host for that.', notMine: true }] });
+  assert.strictEqual(merges(infra).length, 0);
+});
+
+test('a failed part is still merged; an older or offline agent never gets a merge task', () => {
+  const infra = fresh();
+  online(infra, { connector1: '1.15.2', connector2: '1.16.0' });
+  const [t1, t2] = infra.addGroupTask('status', 'admin');
+  infra.applyResults('connector1', { taskResults: [{ id: t1.id, status: 'done', output: 'fine' }] });
+  infra.applyResults('connector2', { taskResults: [{ id: t2.id, status: 'failed', output: 'Claude stopped' }] });
+  const m = merges(infra);
+  assert.strictEqual(m.length, 1);
+  assert.strictEqual(m[0].agent, 'connector2', 'connector1 is too old');
+  assert.strictEqual(m[0].t.merge.find(p => p.host === 'HELP').failed, true);
+
+  const infra2 = fresh();
+  online(infra2, { connector1: '1.15.2', connector2: '1.16.0' });
+  const [u1, u2] = infra2.addGroupTask('status', 'admin');
+  infra2.applyResults('connector2', { taskResults: [{ id: u2.id, status: 'done', output: 'b' }] });
+  Object.assign(infra2.data.agents.connector2, { receivedAt: Date.now() - 60 * 60e3, lastSync: Date.now() - 60 * 60e3 }); // then went offline
+  infra2.applyResults('connector1', { taskResults: [{ id: u1.id, status: 'done', output: 'a' }] });
+  assert.strictEqual(merges(infra2).length, 0, 'falls back to the per-host answers');
+});
